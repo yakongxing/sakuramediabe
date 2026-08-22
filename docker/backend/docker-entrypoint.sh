@@ -74,6 +74,44 @@ bootstrap_data_dirs() {
     done
 }
 
+render_db_url_from_env() {
+    # 从环境变量 NF_MEDIA_POSTGRES_URI 渲染 [database].url 到 config.toml。
+    # 项目 Settings 的 source 优先级是 toml > env，所以纯注入 env 不生效，必须写盘。
+    # 每次 pod 启动都覆盖：Northflank addon 密码轮转 → 服务自动重启 → 这里拿到新 URL → 迁移/启动用新密码。
+    # 只更新 [database] 一节，保留 ensure_runtime_secrets() 写入的 [auth] 密钥及其他用户配置。
+    if [ -z "${NF_MEDIA_POSTGRES_URI:-}" ]; then
+        echo "[entrypoint] NF_MEDIA_POSTGRES_URI not set; skip DB URL sync (fallback to existing config.toml)."
+        return 0
+    fi
+
+    local cfg="${DATA_ROOT}/config/config.toml"
+    echo "[entrypoint] Syncing database.url from NF_MEDIA_POSTGRES_URI -> ${cfg}"
+
+    NF_MEDIA_POSTGRES_URI="${NF_MEDIA_POSTGRES_URI}" CFG_PATH="${cfg}" \
+        "${PYTHON_BIN}" - <<'PY'
+import os, pathlib
+try:
+    import tomllib                # py311+
+except ModuleNotFoundError:
+    import tomli as tomllib       # py310（本镜像是 3.10）
+import tomli_w
+
+path = pathlib.Path(os.environ["CFG_PATH"])
+url  = os.environ["NF_MEDIA_POSTGRES_URI"]
+
+data = tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+db   = data.setdefault("database", {})
+db["engine"] = "postgres"
+db["url"]    = url
+
+path.write_text(tomli_w.dumps(data), encoding="utf-8")
+print(f"[entrypoint] database.url written ({len(url)} chars).")
+PY
+
+    chown_if_mismatch "${PUID:-1000}" "${PGID:-1000}" "${cfg}"
+    chmod 600 "${cfg}" || true
+}
+
 wait_for_database() {
     echo "Waiting for database to become ready..."
     # 显式等待 PostgreSQL 可连接：宿主机重启时容器间无启动顺序保证，避免应用先于数据库就绪导致迁移失败。
@@ -95,6 +133,7 @@ bootstrap_default_data() {
 if [ "${1:-}" = "start" ]; then
     ensure_app_identity
     bootstrap_data_dirs
+    render_db_url_from_env
     wait_for_database
     run_database_migrations
     bootstrap_default_data

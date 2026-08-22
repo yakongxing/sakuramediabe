@@ -2,7 +2,8 @@
 FROM python:3.10-slim-bookworm AS builder
 WORKDIR /build
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt \
+ && pip install --no-cache-dir --prefix=/install tomli-w
 
 # ── Stage 2: 运行时镜像 ──
 FROM python:3.10-slim-bookworm AS runtime
