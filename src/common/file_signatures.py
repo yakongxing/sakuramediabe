@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 from src.api.exception.errors import ApiError
 from src.common.subtitle_paths import ensure_movie_subtitle_path
+from src.common.subtitle_paths import movie_subtitle_storage_key
 from src.config.config import settings
 
 IMAGE_FILE_ROUTE_PREFIX = "/files/images"
@@ -287,3 +288,11 @@ def resolve_subtitle_file_path(subtitle_id: int) -> Path:
         raise ApiError(404, "subtitle_not_found", "字幕不存在")
 
     return ensure_movie_subtitle_path(subtitle.movie, subtitle.file_path)
+
+
+def resolve_subtitle_storage_key(subtitle_id: int) -> str:
+    from src.model import Subtitle
+    subtitle = Subtitle.get_or_none(Subtitle.id == subtitle_id)
+    if subtitle is None:
+        raise ApiError(404, "subtitle_not_found", "字幕不存在")
+    return movie_subtitle_storage_key(subtitle.movie, subtitle.file_path)

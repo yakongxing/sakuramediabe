@@ -17,6 +17,7 @@ from src.schema.playback.clips import (
     MediaClipUpdateRequest,
 )
 from src.service.playback import MediaClipService
+from src.storage import StorageNotFound, clip_storage
 
 router = APIRouter(
     tags=["media-clips"],
@@ -105,7 +106,14 @@ def stream_media_clip(
     require_signed_params(expires, signature)
 
     verify_clip_signature(clip_id, expires, signature)
-    absolute_path = MediaClipService.stream_file_path(clip_id)
-    require_existing_file(absolute_path)
-
-    return stream_local_file_response(request, absolute_path, "video/mp4")
+    key = MediaClipService.stream_storage_key(clip_id)
+    storage = clip_storage()
+    local_path = storage.local_path(key)
+    if local_path is not None:
+        require_existing_file(local_path)
+        return stream_local_file_response(request, local_path, "video/mp4")
+    try:
+        return storage.range_response(key, request.headers.get("range"), "video/mp4")
+    except StorageNotFound as exc:
+        from src.api.exception.errors import ApiError
+        raise ApiError(404, "file_not_found", "文件不存在") from exc

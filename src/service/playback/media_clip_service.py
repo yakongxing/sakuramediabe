@@ -6,7 +6,6 @@
 
 from collections.abc import Sequence
 from pathlib import Path
-from shutil import move
 from tempfile import TemporaryDirectory
 
 from loguru import logger
@@ -48,6 +47,7 @@ from src.schema.playback.clips import (
 )
 from src.service.playback.media_metadata_probe_service import MediaMetadataProbeService
 from src.service.playback.provider_helpers import media_handle_for
+from src.storage import StorageNotFound, clip_storage, normalize_storage_key
 
 
 class MediaClipService:
@@ -189,27 +189,29 @@ class MediaClipService:
         return cls._clip_file_path(clip)
 
     @classmethod
+    def stream_storage_key(cls, clip_id: int) -> str:
+        clip = cls._require_clip(clip_id)
+        return normalize_storage_key(clip.file_path)
+
+    @classmethod
     def _has_valid_artifact(cls, clip: MediaClip) -> bool:
         if int(clip.file_size_bytes or 0) <= 0 or int(clip.duration_seconds or 0) <= 0:
             return False
-        path = cls._clip_file_path(clip)
-        if path is None:
+        try:
+            key = normalize_storage_key(clip.file_path)
+        except ValueError:
             return False
         try:
-            return path.is_file() and path.stat().st_size == int(clip.file_size_bytes)
-        except OSError:
+            stat = clip_storage().stat(key)
+            return stat.is_file and stat.size == int(clip.file_size_bytes)
+        except (StorageNotFound, OSError):
             return False
 
     @classmethod
     def _discard_invalid_clip(cls, clip: MediaClip) -> None:
-        target_path = cls._clip_file_path(clip)
-        if target_path is None:
-            target_path = media_clip_root_path() / cls._clip_relative_path(
-                clip.movie_number,
-                clip.id,
-            )
+        key = clip.file_path or cls._clip_relative_path(clip.movie_number, clip.id)
         clip.delete_instance()
-        cls._unlink_clip_file(target_path)
+        cls._delete_clip_key(key)
 
     @classmethod
     def valid_clips(cls, clips: Sequence[MediaClip]) -> list[MediaClip]:
@@ -326,8 +328,7 @@ class MediaClipService:
                 if file_size <= 0:
                     raise RuntimeError("clip_output_empty")
                 probe = MediaMetadataProbeService.probe_file(source_path)
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                move(str(source_path), str(target_path))
+                clip_storage().put_file(relative_path, source_path)
             clip.file_path = relative_path
             clip.file_size_bytes = file_size
             clip.duration_seconds = probe.duration_seconds or (end - start)
@@ -335,7 +336,7 @@ class MediaClipService:
         except Exception as exc:
             # 切片失败：清掉占位记录与半成品文件，保持数据与磁盘一致。
             clip.delete_instance()
-            cls._unlink_clip_file(target_path)
+            cls._delete_clip_key(relative_path)
             logger.warning("Media clip generation failed media_id={} detail={}", media.id, exc)
             if isinstance(exc, ApiError):
                 raise
@@ -490,16 +491,17 @@ class MediaClipService:
             error_message="Media clip not found",
             error_details_key="clip_id",
         )
-        target_path = cls._clip_file_path(clip)
-        if target_path is None:
-            target_path = media_clip_root_path() / cls._clip_relative_path(
-                clip.movie_number,
-                clip.id,
-            )
+        key = clip.file_path or cls._clip_relative_path(clip.movie_number, clip.id)
         # 单条删除本身原子，依赖 DB 外键 CASCADE 自动清 ClipCollectionItem，无需再包事务。
         clip.delete_instance()
-        if target_path is not None:
-            cls._unlink_clip_file(target_path)
+        cls._delete_clip_key(key)
+
+    @staticmethod
+    def _delete_clip_key(key: str) -> None:
+        try:
+            clip_storage().delete(normalize_storage_key(key))
+        except Exception as exc:
+            logger.warning("Delete media clip object failed key={} detail={}", key, exc)
 
     @staticmethod
     def _unlink_clip_file(target_path: Path) -> None:

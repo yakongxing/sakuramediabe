@@ -98,6 +98,32 @@ class Media(BaseModel):
     # 单次 ffmpeg 切片的墙钟超时（秒）：兜住坏文件/慢挂载导致的进程卡死，超时即杀进程。
     media_clip_ffmpeg_timeout_seconds: int = 120
 
+
+class Storage(BaseModel):
+    backend: str = "local"
+    webdav_base_url: str = ""
+    username: str = ""
+    password: str = ""
+    root_prefix: str = ""
+    verify_tls: bool = True
+    connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    read_timeout_seconds: float = Field(default=60.0, gt=0)
+    write_timeout_seconds: float = Field(default=120.0, gt=0)
+    pool_timeout_seconds: float = Field(default=10.0, gt=0)
+    upload_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
+    download_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
+
+    @model_validator(mode="after")
+    def _validate_storage(self):
+        self.backend = self.backend.strip().lower()
+        if self.backend not in {"local", "webdav"}:
+            raise ValueError("storage.backend must be local or webdav")
+        if self.backend == "webdav":
+            parsed = urlparse(self.webdav_base_url.strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("storage.webdav_base_url must be an http(s) URL")
+        return self
+
 class Metadata(BaseModel):
     # 不再提供显式代理配置：所有外部站点请求统一跟随容器环境变量
     # HTTP_PROXY / HTTPS_PROXY / NO_PROXY 分流（httpx trust_env 默认开启）。
@@ -262,6 +288,7 @@ class Settings(BaseSettings):
     database: Database = Field(default_factory=Database)
     auth: Auth = Field(default_factory=Auth)
     media: Media = Field(default_factory=Media)
+    storage: Storage = Field(default_factory=Storage)
     metadata: Metadata = Field(default_factory=Metadata)
     plugins: Plugins = Field(default_factory=Plugins)
     scheduler: Scheduler = Field(default_factory=Scheduler)
@@ -273,6 +300,9 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         toml_file=SETTINGS_TOML_PATH,
+        env_prefix="SAKURAMEDIA_",
+        env_nested_delimiter="__",
+        secrets_dir="/run/secrets",
         extra="ignore",
     )
 
@@ -297,10 +327,10 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (
             init_settings,
-            TomlConfigSettingsSource(settings_cls),
             env_settings,
             dotenv_settings,
             file_secret_settings,
+            TomlConfigSettingsSource(settings_cls),
         )
 
 
@@ -329,6 +359,8 @@ def refresh_runtime_settings(new_settings: Settings) -> None:
         setattr(settings, field_name, getattr(new_settings, field_name))
     # 运行时配置更新后，需要同时清理依赖配置的缓存单例。
     try:
+        from src.storage import reset_storage_backends
+        reset_storage_backends()
         from src.service.discovery import (
             get_image_search_service,
             get_movie_plot_image_search_service,

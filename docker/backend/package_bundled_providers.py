@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import re
+import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -18,6 +21,44 @@ PROVIDER_RELEASES = (
         "https://api.github.com/repos/tinypinglite/sakuramedia_115_provider/releases/latest",
     ),
 )
+
+_CONTRACTS_PATH = (
+    Path(__file__).resolve().parents[2] / "src" / "plugins" / "contracts.py"
+)
+_HOST_API_VERSION_PATTERN = re.compile(
+    r"^HOST_API_VERSION\s*=\s*(\d+)\s*$", re.MULTILINE
+)
+
+
+def host_api_version(contracts_path: Path | None = None) -> int:
+    """读取宿主支持的插件 Host API 版本。
+
+    这里用正则解析源码而不是 import：打包脚本在 CI 里于依赖安装之前运行，
+    而 src.plugins.contracts 会连带引入 pydantic 与 src.scheduler.contracts。
+    """
+    path = contracts_path or _CONTRACTS_PATH
+    match = _HOST_API_VERSION_PATTERN.search(path.read_text(encoding="utf-8"))
+    if match is None:
+        raise ValueError(f"cannot resolve HOST_API_VERSION from {path}")
+    return int(match.group(1))
+
+
+def _manifest_host_api_version(plugin_id: str, archive: bytes) -> int:
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        try:
+            raw_manifest = bundle.read("manifest.json")
+        except KeyError as exc:
+            raise ValueError(f"manifest.json missing in release: {plugin_id}") from exc
+    try:
+        manifest = json.loads(raw_manifest)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid manifest.json: {plugin_id}") from exc
+    if not isinstance(manifest, dict):
+        raise TypeError(f"invalid manifest.json: {plugin_id}")
+    declared_version = manifest.get("host_api_version")
+    if not isinstance(declared_version, int):
+        raise ValueError(f"manifest host_api_version missing: {plugin_id}")
+    return declared_version
 
 
 def _request_bytes(url: str) -> bytes:
@@ -77,6 +118,25 @@ def package_latest_releases(output: Path) -> list[dict[str, str]]:
         (plugin_id, *_release_asset(plugin_id, release_api_url))
         for plugin_id, release_api_url in PROVIDER_RELEASES
     ]
+
+    # 打包期就拒绝 Host API 不兼容的 provider：宿主在 entrypoint 的 upgrade-v053 阶段
+    # 会因 manifest 版本不匹配直接退出，容器起不来。把校验前移到构建期，
+    # 让发版在 CI 就失败，而不是把一个必然崩溃的镜像推到 Docker Hub。
+    expected_version = host_api_version()
+    incompatible = [
+        (plugin_id, tag_name, _manifest_host_api_version(plugin_id, content))
+        for plugin_id, tag_name, content, _ in downloaded
+    ]
+    mismatched = [
+        f"{plugin_id} tag={tag_name} manifest={declared} host={expected_version}"
+        for plugin_id, tag_name, declared in incompatible
+        if declared != expected_version
+    ]
+    if mismatched:
+        raise ValueError(
+            "bundled provider host_api_version mismatch: " + "; ".join(mismatched)
+        )
+
     output.mkdir(parents=True, exist_ok=True)
     plugins: list[dict[str, str]] = []
     for plugin_id, tag_name, content, sha256 in downloaded:

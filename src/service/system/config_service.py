@@ -26,7 +26,7 @@ from src.schema.system.config import (
 #   开发/排障时可通过 toml 或环境变量手动打开并重启，不通过接口暴露/修改。
 # - "plugins" 节包含可信代码启用清单及插件私有配置：
 #   API / APS 都在 import 阶段读取，且可能包含凭据，只允许手工改 toml 后重启整个服务。
-READONLY_KEYS: frozenset[str] = frozenset({"auth", "enable_docs", "plugins"})
+READONLY_KEYS: frozenset[str] = frozenset({"auth", "enable_docs", "plugins", "storage"})
 
 def _is_config_section(annotation: Any) -> bool:
     # 顶层字段是否为一个配置子节（Pydantic BaseModel 子类），用于区分子节 dict 与顶层标量。

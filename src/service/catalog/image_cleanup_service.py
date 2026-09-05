@@ -7,6 +7,7 @@ from pathlib import Path
 
 from src.config.config import settings
 from src.model import Actor, Image, MediaThumbnail, Movie, MoviePlotImage, get_database
+from src.storage import asset_storage
 
 
 class ImageCleanupService:
@@ -49,12 +50,8 @@ class ImageCleanupService:
     def delete_obsolete_image_files(cls, relative_paths: set[str]) -> None:
         if not relative_paths:
             return
-        image_root = cls.image_root_path()
+        storage = asset_storage()
         for relative_path in relative_paths:
             if not relative_path:
                 continue
-            target_path = image_root / relative_path
-            try:
-                target_path.unlink()
-            except FileNotFoundError:
-                continue
+            storage.delete(relative_path, missing_ok=True)

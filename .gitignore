@@ -5,6 +5,9 @@ src/config/telemetry.json
 server/lib
 *.db
 storage
+!src/storage/
+!src/storage/**
+src/storage/__pycache__/
 *.lock
 server/docs/plans
 docs/plans

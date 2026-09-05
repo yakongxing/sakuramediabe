@@ -8,50 +8,37 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import shutil
 from pathlib import Path
 
 from loguru import logger
 
 from src.common.media_paths import (
     MOVIE_SUBTITLE_EXTENSIONS,
-    allocate_next_movie_subtitle_path,
-    movie_subtitle_dir,
+    movie_asset_relative_dir,
+    normalize_asset_dir_name,
 )
 from src.common.service_helpers import find_movie_by_number
-from src.common.subtitle_paths import ensure_movie_subtitle_path
+from src.common.subtitle_paths import movie_subtitle_storage_key
 from src.model import Subtitle
 from src.schema.catalog.subtitles import (
     SubtitleImportResult,
     SubtitleImportStatus,
 )
+from src.storage import StorageNotFound, asset_storage
 
 
-def _prepare_movie_subtitle_target_path(movie_number: str, *, extension: str = ".srt") -> Path:
+def _prepare_movie_subtitle_target_path(movie_number: str, *, extension: str = ".srt") -> str:
     normalized_extension = extension.lower()
     if not normalized_extension.startswith(".") or len(normalized_extension) > 16:
         raise ValueError("invalid subtitle extension")
-    movie_subtitle_dir(movie_number).mkdir(parents=True, exist_ok=True)
-    return allocate_next_movie_subtitle_path(movie_number, extension=normalized_extension)
-
-
-def _copy_subtitle_file(
-    source_path: Path,
-    target_path: Path,
-    *,
-    transfer_mode: str = "auto",
-) -> str:
-    """Copy a host subtitle into its managed target, preferring a hard link."""
-    if transfer_mode == "cleanup-source":
-        shutil.copy2(source_path, target_path)
-        return "copy"
-    try:
-        os.link(source_path, target_path)
-    except OSError:
-        shutil.copy2(source_path, target_path)
-        return "copy"
-    return "hardlink"
+    prefix = movie_asset_relative_dir(normalize_asset_dir_name(movie_number)) / "subtitles"
+    maximum = 0
+    for item in asset_storage().list(prefix.as_posix()):
+        stem = Path(item.key).stem
+        head = f"{movie_number}-"
+        if stem.startswith(head) and stem[len(head):].isdigit():
+            maximum = max(maximum, int(stem[len(head):]))
+    return f"{prefix.as_posix()}/{movie_number}-{maximum + 1}{normalized_extension}"
 
 
 class SubtitleAssetService:
@@ -63,7 +50,7 @@ class SubtitleAssetService:
         hashes: set[str] = set()
         for subtitle in Subtitle.select().where(Subtitle.movie == movie):
             try:
-                absolute_path = ensure_movie_subtitle_path(movie, subtitle.file_path)
+                key = movie_subtitle_storage_key(movie, subtitle.file_path)
             except Exception as exc:
                 logger.warning(
                     "Subtitle path invalid movie_id={} subtitle_id={} detail={}",
@@ -72,8 +59,11 @@ class SubtitleAssetService:
                     exc,
                 )
                 continue
-            if absolute_path.is_file():
-                hashes.add(cls._sha256_file(absolute_path))
+            try:
+                with asset_storage().open(key) as handle:
+                    hashes.add(cls._sha256_stream(handle))
+            except StorageNotFound:
+                continue
         return hashes
 
     @classmethod
@@ -105,8 +95,8 @@ class SubtitleAssetService:
             return SubtitleImportResult(status=SubtitleImportStatus.DUPLICATE)
 
         target_path = _prepare_movie_subtitle_target_path(movie.movie_number, extension=suffix)
-        cls._write_atomic(target_path, content)
-        subtitle = Subtitle.create(movie=movie, file_path=str(target_path))
+        asset_storage().put_bytes(target_path, content, overwrite=False)
+        subtitle = Subtitle.create(movie=movie, file_path=target_path)
         return SubtitleImportResult(
             status=SubtitleImportStatus.IMPORTED,
             subtitle_id=subtitle.id,
@@ -135,18 +125,12 @@ class SubtitleAssetService:
             movie.movie_number,
             extension=source_path.suffix.lower(),
         )
-        _copy_subtitle_file(source_path, target_path, transfer_mode=transfer_mode)
-        Subtitle.create(movie=movie, file_path=str(target_path))
+        del transfer_mode
+        asset_storage().put_file(target_path, source_path, overwrite=False)
+        Subtitle.create(movie=movie, file_path=target_path)
 
         hashes.add(content_hash)
         return "imported", "", str(target_path)
-
-    @staticmethod
-    def _write_atomic(target_path: Path, content: bytes) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
-        tmp_path.write_bytes(content)
-        os.replace(tmp_path, target_path)
 
     @staticmethod
     def _sha256_file(file_path: Path) -> str:
@@ -154,6 +138,13 @@ class SubtitleAssetService:
         with open(file_path, "rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _sha256_stream(handle) -> str:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
         return digest.hexdigest()
 
     @staticmethod

@@ -4,14 +4,15 @@ from pathlib import Path
 
 from src.api.exception.errors import ApiError
 from src.common import build_signed_subtitle_url
-from src.common.media_paths import movie_subtitle_dir
+from src.common.media_paths import MOVIE_SUBTITLE_EXTENSIONS, movie_asset_relative_dir, normalize_asset_dir_name
 from src.common.service_helpers import require_record
-from src.common.subtitle_paths import ensure_movie_subtitle_path
+from src.common.subtitle_paths import movie_subtitle_storage_key
 from src.model import Movie, Subtitle
 from src.schema.catalog.subtitles import (
     MovieSubtitleItemResource,
     MovieSubtitleListResource,
 )
+from src.storage import StorageNotFound, asset_storage
 
 
 class MovieSubtitleService:
@@ -41,12 +42,12 @@ class MovieSubtitleService:
         # 先清理已经失效的字幕记录，避免后续列表继续暴露坏链接。
         for subtitle in existing_items:
             try:
-                normalized_path = str(ensure_movie_subtitle_path(movie, subtitle.file_path))
+                normalized_path = movie_subtitle_storage_key(movie, subtitle.file_path)
             except ApiError:
                 subtitle.delete_instance()
                 deleted_count += 1
                 continue
-            if not Path(normalized_path).exists():
+            if not asset_storage().exists(normalized_path):
                 subtitle.delete_instance()
                 deleted_count += 1
                 continue
@@ -79,33 +80,28 @@ class MovieSubtitleService:
         items: list[MovieSubtitleItemResource] = []
         for subtitle in cls._subtitle_query(movie):
             try:
-                absolute_path = ensure_movie_subtitle_path(movie, subtitle.file_path)
+                key = movie_subtitle_storage_key(movie, subtitle.file_path)
             except ApiError:
                 continue
-            if not absolute_path.exists() or not absolute_path.is_file():
+            try:
+                stat = asset_storage().stat(key)
+            except StorageNotFound:
                 continue
+            if not stat.is_file: continue
             items.append(
                 MovieSubtitleItemResource(
                     subtitle_id=subtitle.id,
                     url=build_signed_subtitle_url(subtitle.id),
                     created_at=subtitle.created_at,
-                    file_name=Path(absolute_path).name,
+                    file_name=Path(key).name,
                 )
             )
         return items
 
     @classmethod
-    def _discover_subtitle_paths(cls, movie: Movie) -> list[Path]:
-        """扫描该影片标准字幕目录下的 .srt 文件。"""
-        scan_root = movie_subtitle_dir(movie.movie_number)
-        if not scan_root.is_dir():
-            return []
-        discovered_paths: list[Path] = []
-        for subtitle_path in sorted(scan_root.iterdir(), key=lambda item: item.name.lower()):
-            if not subtitle_path.is_file() or subtitle_path.suffix.lower() != ".srt":
-                continue
-            try:
-                discovered_paths.append(ensure_movie_subtitle_path(movie, subtitle_path))
-            except ApiError:
-                continue
-        return discovered_paths
+    def _discover_subtitle_paths(cls, movie: Movie) -> list[str]:
+        prefix = movie_asset_relative_dir(normalize_asset_dir_name(movie.movie_number)) / "subtitles"
+        return sorted(
+            (item.key for item in asset_storage().list(prefix.as_posix()) if Path(item.key).suffix.lower() in MOVIE_SUBTITLE_EXTENSIONS),
+            key=str.lower,
+        )

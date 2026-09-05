@@ -34,6 +34,8 @@ from src.common.service_helpers import backoff_delay
 from src.metadata._providers.models import JavdbMovieActorResource
 from src.model import Image, Movie, MoviePlotImage
 from src.service.catalog.image_cleanup_service import ImageCleanupService
+from src.storage import asset_storage
+from src.storage.types import StorageNotFound
 
 
 class ImageDownloadError(Exception):
@@ -437,8 +439,7 @@ class MovieImageService:
         """并发下载一批图片；封面失败会中断导入，剧情图/头像失败仅告警跳过。"""
         tasks_to_download: list[ImagePersistTask] = []
         for image_task in image_tasks:
-            image_task.absolute_path.parent.mkdir(parents=True, exist_ok=True)
-            if image_task.absolute_path.exists():
+            if asset_storage().exists(image_task.relative_path):
                 logger.debug(
                     "Catalog image download reused local file type={} path={}",
                     image_task.image_type,
@@ -490,7 +491,15 @@ class MovieImageService:
             image_task.image_url,
             str(image_task.absolute_path),
         )
-        self.image_downloader(image_task.image_url, image_task.absolute_path)
+        local_path = asset_storage().local_path(image_task.relative_path)
+        if local_path is not None:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            self.image_downloader(image_task.image_url, local_path)
+            return
+        with tempfile.TemporaryDirectory(prefix="catalog-image-") as workspace:
+            prepared = Path(workspace) / Path(image_task.relative_path).name
+            self.image_downloader(image_task.image_url, prepared)
+            asset_storage().put_file(image_task.relative_path, prepared)
 
     def download_image_tasks_to_temporary_files(
         self,
@@ -499,9 +508,7 @@ class MovieImageService:
         if not image_tasks:
             return []
 
-        image_root = media_image_root_path()
-        image_root.mkdir(parents=True, exist_ok=True)
-        temp_root = Path(tempfile.mkdtemp(prefix="catalog-refresh-", dir=str(image_root)))
+        temp_root = Path(tempfile.mkdtemp(prefix="catalog-refresh-"))
         prepared_files = [
             PreparedImageFile(
                 image_task=image_task,
@@ -534,10 +541,17 @@ class MovieImageService:
             shutil.rmtree(temp_root, ignore_errors=True)
 
     def finalize_prepared_image_files(self, prepared_files: list[PreparedImageFile]) -> None:
+        storage = asset_storage()
         for prepared_file in prepared_files:
-            final_path = prepared_file.image_task.absolute_path
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(prepared_file.temp_path, final_path)
+            key = prepared_file.image_task.relative_path
+            try:
+                existing = storage.stat(key)
+            except StorageNotFound:
+                existing = None
+            if existing is not None and existing.size == prepared_file.temp_path.stat().st_size:
+                logger.debug("Catalog image unchanged, skip upload key={}", key)
+                continue
+            storage.put_file(key, prepared_file.temp_path)
 
         for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
             shutil.rmtree(temp_root, ignore_errors=True)
@@ -559,10 +573,9 @@ class MovieImageService:
         if image_task is None:
             return None
 
-        image_task.absolute_path.parent.mkdir(parents=True, exist_ok=True)
-        if not image_task.absolute_path.exists():
+        if not asset_storage().exists(image_task.relative_path):
             logger.debug("Persist image downloading url={} target={}", image_task.image_url, str(image_task.absolute_path))
-            self.image_downloader(image_task.image_url, image_task.absolute_path)
+            self._download_movie_image_task(image_task)
         else:
             logger.debug("Persist image reused local file path={}", str(image_task.absolute_path))
 
@@ -572,7 +585,7 @@ class MovieImageService:
         if image_task is None:
             return None
         # 非致命图片下载失败时不会落地文件，这里直接跳过数据库记录，避免脏路径。
-        if not image_task.absolute_path.exists():
+        if not asset_storage().exists(image_task.relative_path):
             logger.warning(
                 "Persist image skipped because local file is missing image_type={} url={} target={}",
                 image_task.image_type,
@@ -595,7 +608,7 @@ class MovieImageService:
         for image_task in image_tasks:
             if image_task is None:
                 continue
-            if not image_task.absolute_path.exists():
+            if not asset_storage().exists(image_task.relative_path):
                 logger.warning(
                     "Persist image skipped because local file is missing image_type={} url={} target={}",
                     image_task.image_type,

@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -27,17 +28,27 @@ def _build_fake_bin(bin_dir: Path) -> None:
         "exit 1\n",
     )
     # 默认 no-op；只在设了 CHOWN_LOG_PATH 时把参数写进独立日志，避免污染 su/supervisord 日志的行数断言。
+    # FAIL_CHOWN=1 模拟只读挂载或不支持 chown 的网络文件系统。
     _write_executable(
         bin_dir / "chown",
         "#!/usr/bin/env bash\n"
         "if [ -n \"${CHOWN_LOG_PATH:-}\" ]; then\n"
         "  printf 'chown:%s\\n' \"$*\" >> \"$CHOWN_LOG_PATH\"\n"
         "fi\n"
+        "if [ \"${FAIL_CHOWN:-0}\" = \"1\" ]; then\n"
+        "  echo \"chown: changing ownership: Read-only file system\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
         "exit 0\n",
     )
+    # su 同时承载两类调用：`-c \"test -w ...\"` 的可写性预检，和 `-c \"... src.start.commands ...\"`
+    # 的启动编排。预检结果由 WRITABLE 控制，编排步骤仍按 FAIL_* 开关决定成败。
     _write_executable(
         bin_dir / "su",
         "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *'test -w'*) [ \"${WRITABLE:-1}\" = \"1\" ] && exit 0 || exit 1 ;;\n"
+        "esac\n"
         "printf 'su:%s\\n' \"$*\" >> \"$LOG_PATH\"\n"
         "case \"$*\" in\n"
         "  *'commands wait-db'*) [ \"${FAIL_WAIT_DB:-0}\" = \"1\" ] && exit 1 ;;\n"
@@ -63,6 +74,8 @@ def _run_entrypoint(
     args: list[str] | None = None,
     create_config: bool = True,
     chown_log: bool = False,
+    writable: bool = True,
+    chown_fails: bool = False,
 ):
     repo_root = Path(__file__).resolve().parents[2]
     script_path = repo_root / "docker" / "backend" / "docker-entrypoint.sh"
@@ -86,6 +99,8 @@ def _run_entrypoint(
             "FAIL_MIGRATE": "1" if fail_migrate else "0",
             "FAIL_V053_UPGRADE": "1" if fail_v053_upgrade else "0",
             "FAIL_WAIT_DB": "1" if fail_wait_db else "0",
+            "WRITABLE": "1" if writable else "0",
+            "FAIL_CHOWN": "1" if chown_fails else "0",
             "SAKURAMEDIA_DATA_ROOT": str(data_root),
             "SAKURAMEDIA_APP_ROOT": str(app_root),
             "SAKURAMEDIA_SUPERVISORD_BIN": str(bin_dir / "supervisord"),
@@ -102,6 +117,28 @@ def _run_entrypoint(
     return result, lines
 
 
+_STARTUP_STEP_RE = re.compile(
+    r"-m src\.start\.commands "
+    r"(wait-db|upgrade-v053|migrate|initdb|plugins sync-dependencies)"
+)
+
+
+def _startup_steps(lines: list[str]) -> list[str]:
+    """只保留启动编排步骤，忽略 su 承载的其它检查（如目录可写性预检）。
+
+    入口脚本会新增/调整预检步骤，直接对 su 调用做计数断言会让这些无关改动
+    误伤测试；此处按已知步骤名归一化，专注验证编排顺序。
+    """
+    steps: list[str] = []
+    for line in lines:
+        match = _STARTUP_STEP_RE.search(line)
+        if match:
+            steps.append(match.group(1))
+        elif line.startswith("supervisord:"):
+            steps.append("supervisord")
+    return steps
+
+
 def test_docker_entrypoint_runs_migrations_before_starting_supervisor(tmp_path):
     result, lines = _run_entrypoint(tmp_path)
 
@@ -112,17 +149,14 @@ def test_docker_entrypoint_runs_migrations_before_starting_supervisor(tmp_path):
     assert "Bootstrapping default account and system playlists..." in result.stdout
     assert "Syncing plugin dependencies..." in result.stdout
     assert "Starting supervisor..." in result.stdout
-    assert len(lines) == 6
-    assert "-m src.start.commands wait-db" in lines[0]
-    assert "-m src.start.commands upgrade-v053" in lines[1]
-    assert "-m src.start.commands migrate" in lines[2]
-    assert "-m src.start.commands initdb" in lines[3]
-    assert "-m src.start.commands plugins sync-dependencies" in lines[4]
-    assert lines[0].startswith("su:")
-    assert lines[1].startswith("su:")
-    assert lines[2].startswith("su:")
-    assert lines[3].startswith("su:")
-    assert lines[5].startswith("supervisord:")
+    assert _startup_steps(lines) == [
+        "wait-db",
+        "upgrade-v053",
+        "migrate",
+        "initdb",
+        "plugins sync-dependencies",
+        "supervisord",
+    ]
 
 
 def test_docker_entrypoint_stops_when_database_is_not_ready(tmp_path):
@@ -132,8 +166,7 @@ def test_docker_entrypoint_stops_when_database_is_not_ready(tmp_path):
     assert "Waiting for database to become ready..." in result.stdout
     assert "Running database migrations..." not in result.stdout
     assert "Starting supervisor..." not in result.stdout
-    assert len(lines) == 1
-    assert "-m src.start.commands wait-db" in lines[0]
+    assert _startup_steps(lines) == ["wait-db"]
 
 
 def test_docker_entrypoint_stops_when_migration_fails(tmp_path):
@@ -143,10 +176,7 @@ def test_docker_entrypoint_stops_when_migration_fails(tmp_path):
     assert "Running database migrations..." in result.stdout
     assert "Bootstrapping default account and system playlists..." not in result.stdout
     assert "Starting supervisor..." not in result.stdout
-    assert len(lines) == 3
-    assert "-m src.start.commands wait-db" in lines[0]
-    assert "-m src.start.commands upgrade-v053" in lines[1]
-    assert "-m src.start.commands migrate" in lines[2]
+    assert _startup_steps(lines) == ["wait-db", "upgrade-v053", "migrate"]
 
 
 def test_docker_entrypoint_stops_when_v053_upgrade_fails(tmp_path):
@@ -156,9 +186,7 @@ def test_docker_entrypoint_stops_when_v053_upgrade_fails(tmp_path):
     assert "Syncing bundled providers and checking for a v0.5.3 database upgrade..." in result.stdout
     assert "Running database migrations..." not in result.stdout
     assert "Starting supervisor..." not in result.stdout
-    assert len(lines) == 2
-    assert "-m src.start.commands wait-db" in lines[0]
-    assert "-m src.start.commands upgrade-v053" in lines[1]
+    assert _startup_steps(lines) == ["wait-db", "upgrade-v053"]
 
 
 def test_docker_entrypoint_starts_without_config_file(tmp_path):
@@ -167,13 +195,14 @@ def test_docker_entrypoint_starts_without_config_file(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "Starting supervisor..." in result.stdout
-    assert len(lines) == 6
-    assert "-m src.start.commands wait-db" in lines[0]
-    assert "-m src.start.commands upgrade-v053" in lines[1]
-    assert "-m src.start.commands migrate" in lines[2]
-    assert "-m src.start.commands initdb" in lines[3]
-    assert "-m src.start.commands plugins sync-dependencies" in lines[4]
-    assert lines[5].startswith("supervisord:")
+    assert _startup_steps(lines) == [
+        "wait-db",
+        "upgrade-v053",
+        "migrate",
+        "initdb",
+        "plugins sync-dependencies",
+        "supervisord",
+    ]
 
 
 def test_docker_entrypoint_passthrough_for_non_start_commands(tmp_path):
@@ -182,6 +211,29 @@ def test_docker_entrypoint_passthrough_for_non_start_commands(tmp_path):
     assert result.returncode == 0
     assert result.stdout.strip() == "hello"
     assert lines == []
+
+
+def test_docker_entrypoint_fails_when_managed_dirs_are_not_writable(tmp_path):
+    """app 用户写不进 config/logs 时必须启动即失败。
+
+    否则容器会一路跑到写 config.toml 才崩，错误现场离根因很远。
+    """
+    result, lines = _run_entrypoint(tmp_path, writable=False)
+
+    assert result.returncode != 0
+    assert "无法写入" in result.stderr
+    # 权限预检发生在任何数据库操作之前。
+    assert "Waiting for database to become ready..." not in result.stdout
+    assert _startup_steps(lines) == []
+
+
+def test_docker_entrypoint_warns_when_chown_fails(tmp_path):
+    """chown 失败（只读挂载/NFS）不阻断启动，但必须留下告警。"""
+    result, _ = _run_entrypoint(tmp_path, chown_fails=True)
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING: chown failed" in result.stderr
+    assert "Starting supervisor..." in result.stdout
 
 
 def test_docker_entrypoint_chowns_managed_dirs_only(tmp_path):

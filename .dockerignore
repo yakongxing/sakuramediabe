@@ -2,9 +2,13 @@
 .gitignore
 .venv
 .pytest_cache
-__pycache__
-*.pyc
-*.pyo
+
+# Docker 的 .dockerignore 模式默认只匹配单层路径，`__pycache__` 不会命中
+# `src/a/b/__pycache__`。必须用 `**/` 前缀才递归，否则开发机上的陈旧字节码会被打进镜像。
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
 .DS_Store
 .idea
 .vscode
@@ -14,11 +18,25 @@ tests
 docs
 poetry.lock
 pyproject.toml
-*.md
-!src/service/catalog/prompts/*.md
+
+# 同理：`*.md` 只排根层级；用 `**/*.md` 递归排除后，再单独放行提示词资源。
+# 当前 src/ 内唯一的 .md 是 src/api/README.md（纯文档，运行时不读取），
+# 白名单保留是为了将来在 src/ 下新增 prompts/*.md 之类的运行时资源时不用再改这里。
+**/*.md
+!src/service/catalog/prompts/**/*.md
+
 .claude
 .worktrees
 .codex
 .codegraph
 .github
 .poetry
+
+# 本地开发产物与凭据，绝不能进镜像。
+# config.py 在无 /data 时会回退读 src/config/config.toml，开发者本地配置一旦被打包，
+# 容器就可能读到错误的数据库连接串。
+**/config.toml
+**/.env
+**/.env.test
+**/*.log
+**/*.sqlite3

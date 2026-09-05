@@ -39,18 +39,36 @@ chown_if_mismatch() {
     cur_uid="$(stat -c '%u' "${path}")"
     cur_gid="$(stat -c '%g' "${path}")"
     if [ "${cur_uid}" != "${target_uid}" ] || [ "${cur_gid}" != "${target_gid}" ]; then
-        chown "${target_uid}:${target_gid}" "${path}" || true
+        # 只读挂载或 NFS/SMB 等不支持 chown 的后端会失败；此处不中断启动，
+        # 但必须告警——否则容器会一路起到写 config.toml/日志时才炸，错误现场离根因很远。
+        if ! chown "${target_uid}:${target_gid}" "${path}"; then
+            echo "WARNING: chown failed path=${path} target=${target_uid}:${target_gid} current=${cur_uid}:${cur_gid}" >&2
+            echo "WARNING: 若后续出现权限错误，请在宿主机执行 chown -R ${target_uid}:${target_gid} 对应目录，或调整 PUID/PGID 与挂载目录属主一致。" >&2
+        fi
+    fi
+}
+
+verify_writable() {
+    # 提前确认 app 用户真的能在关键目录里落文件，把权限问题暴露在启动早期而不是首次写配置时。
+    local path="$1"
+    if ! su -s /bin/sh -c "test -w \"${path}\"" "${APP_USER}"; then
+        echo "ERROR: ${APP_USER} 无法写入 ${path}" >&2
+        echo "ERROR: 请检查挂载点属主是否匹配 PUID=${PUID:-1000} PGID=${PGID:-1000}，或该挂载是否为只读。" >&2
+        return 1
     fi
 }
 
 bootstrap_data_dirs() {
-    mkdir -p \
+    if ! mkdir -p \
         "${DATA_ROOT}/config" \
         "${DATA_ROOT}/cache/assets" \
         "${DATA_ROOT}/cache/gfriends" \
         "${DATA_ROOT}/media-clips" \
         "${DATA_ROOT}/plugins" \
-        "${DATA_ROOT}/logs"
+        "${DATA_ROOT}/logs"; then
+        echo "ERROR: 无法在 ${DATA_ROOT} 下创建数据目录；请确认该路径已挂载且可写。" >&2
+        exit 1
+    fi
 
     # bind mount 上来的 /data 可能属主是 root 或宿主机用户，导致切到 app 用户后写不进 config.toml/日志。
     # 只把我们自己 mkdir 的目录节点归给 app，非递归——volume 里的历史缓存/媒体文件保持原样，避免海量文件被扫。
@@ -68,6 +86,10 @@ bootstrap_data_dirs() {
         "${DATA_ROOT}/logs"; do
         chown_if_mismatch "${target_uid}" "${target_gid}" "${dir}"
     done
+
+    # config 与 logs 是启动必写路径（config.toml 自举、supervisord 日志），不可写就直接失败退出。
+    verify_writable "${DATA_ROOT}/config" || exit 1
+    verify_writable "${DATA_ROOT}/logs" || exit 1
 }
 
 wait_for_database() {
@@ -117,4 +139,6 @@ if [ "${1:-}" = "start" ]; then
     exec "${SUPERVISORD_BIN}" -c "${SUPERVISORD_CONFIG}"
 fi
 
+# 非 start 子命令：交给调用方指定的可执行文件（调试、一次性运维命令等）。
+# 这些路径不经过 bootstrap，因此仍以 root 运行，由调用方自行决定是否降权。
 exec "$@"
