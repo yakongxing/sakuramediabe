@@ -47,9 +47,11 @@ RUN chmod +x /docker-entrypoint.sh /usr/local/bin/healthcheck.py \
     && useradd --create-home --shell /bin/bash --gid app app
 
 COPY docker/backend/supervisord.conf /etc/supervisor/supervisord.conf
-COPY .bundled-provider-artifacts /app/bundled-plugins
+COPY docker/backend/package_bundled_providers.py /app/docker/backend/package_bundled_providers.py
 COPY src /app/src
-RUN chmod -R a+rX /app/src
+RUN python /app/docker/backend/package_bundled_providers.py --output /app/bundled-plugins \
+    && rm -rf /app/docker \
+    && chmod -R a+rX /app/src /app/bundled-plugins
 
 ARG SAKURAMEDIA_BACKEND_VERSION=v0.0.1
 ENV SAKURAMEDIA_BACKEND_VERSION=${SAKURAMEDIA_BACKEND_VERSION}

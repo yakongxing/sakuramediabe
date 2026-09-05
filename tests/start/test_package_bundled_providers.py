@@ -45,24 +45,24 @@ def _provider_zip(plugin_id: str, host_api_version: int) -> bytes:
     return buffer.getvalue()
 
 
-def test_package_bundled_providers_downloads_and_verifies_latest_releases(
+def test_package_bundled_providers_downloads_and_verifies_pinned_releases(
     monkeypatch, tmp_path
 ):
     packager = _load_packager()
     host_version = packager.host_api_version()
     local_zip = _provider_zip("sakuramedia_local_provider", host_version)
     cloud115_zip = _provider_zip("sakuramedia_115_provider", host_version)
-    local_api_url = packager.PROVIDER_RELEASES[0][1]
-    cloud115_api_url = packager.PROVIDER_RELEASES[1][1]
+    local_api_url = packager.PROVIDER_RELEASES[0][2]
+    cloud115_api_url = packager.PROVIDER_RELEASES[1][2]
     local_download_url = "https://downloads.example/local.zip"
     cloud115_download_url = "https://downloads.example/cloud115.zip"
     responses = {
         local_api_url: json.dumps(
             {
-                "tag_name": "v1.2.3",
+                "tag_name": packager.PROVIDER_RELEASES[0][1],
                 "assets": [
                     {
-                        "name": "sakuramedia_local_provider-1.2.3.zip",
+                        "name": f"sakuramedia_local_provider-{packager.PROVIDER_RELEASES[0][1].removeprefix('v')}.zip",
                         "browser_download_url": local_download_url,
                         "digest": f"sha256:{hashlib.sha256(local_zip).hexdigest()}",
                     }
@@ -71,10 +71,10 @@ def test_package_bundled_providers_downloads_and_verifies_latest_releases(
         ).encode(),
         cloud115_api_url: json.dumps(
             {
-                "tag_name": "v4.5.6",
+                "tag_name": packager.PROVIDER_RELEASES[1][1],
                 "assets": [
                     {
-                        "name": "sakuramedia_115_provider-4.5.6.zip",
+                        "name": f"sakuramedia_115_provider-{packager.PROVIDER_RELEASES[1][1].removeprefix('v')}.zip",
                         "browser_download_url": cloud115_download_url,
                         "digest": f"sha256:{hashlib.sha256(cloud115_zip).hexdigest()}",
                     }
@@ -107,10 +107,10 @@ def test_package_bundled_providers_rejects_a_release_asset_with_wrong_digest(
         {
             release_api_url: json.dumps(
                 {
-                    "tag_name": "v1.2.3",
+                    "tag_name": packager.PROVIDER_RELEASES[0][1],
                     "assets": [
                         {
-                            "name": "sakuramedia_local_provider-1.2.3.zip",
+                            "name": f"sakuramedia_local_provider-{packager.PROVIDER_RELEASES[0][1].removeprefix('v')}.zip",
                             "browser_download_url": download_url,
                             "digest": f"sha256:{'0' * 64}",
                         }
@@ -138,8 +138,8 @@ def test_package_bundled_providers_rejects_incompatible_host_api_version(
     local_zip = _provider_zip("sakuramedia_local_provider", host_version)
     # 115 provider 声明比宿主更高的版本，模拟 provider 先行发版的真实情况。
     cloud115_zip = _provider_zip("sakuramedia_115_provider", host_version + 1)
-    local_api_url = packager.PROVIDER_RELEASES[0][1]
-    cloud115_api_url = packager.PROVIDER_RELEASES[1][1]
+    local_api_url = packager.PROVIDER_RELEASES[0][2]
+    cloud115_api_url = packager.PROVIDER_RELEASES[1][2]
     local_download_url = "https://downloads.example/local.zip"
     cloud115_download_url = "https://downloads.example/cloud115.zip"
     monkeypatch.setattr(
@@ -148,10 +148,10 @@ def test_package_bundled_providers_rejects_incompatible_host_api_version(
         {
             local_api_url: json.dumps(
                 {
-                    "tag_name": "v1.2.3",
+                    "tag_name": packager.PROVIDER_RELEASES[0][1],
                     "assets": [
                         {
-                            "name": "sakuramedia_local_provider-1.2.3.zip",
+                            "name": f"sakuramedia_local_provider-{packager.PROVIDER_RELEASES[0][1].removeprefix('v')}.zip",
                             "browser_download_url": local_download_url,
                             "digest": f"sha256:{hashlib.sha256(local_zip).hexdigest()}",
                         }
@@ -160,10 +160,10 @@ def test_package_bundled_providers_rejects_incompatible_host_api_version(
             ).encode(),
             cloud115_api_url: json.dumps(
                 {
-                    "tag_name": "v4.5.6",
+                    "tag_name": packager.PROVIDER_RELEASES[1][1],
                     "assets": [
                         {
-                            "name": "sakuramedia_115_provider-4.5.6.zip",
+                            "name": f"sakuramedia_115_provider-{packager.PROVIDER_RELEASES[1][1].removeprefix('v')}.zip",
                             "browser_download_url": cloud115_download_url,
                             "digest": f"sha256:{hashlib.sha256(cloud115_zip).hexdigest()}",
                         }

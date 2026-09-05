@@ -14,11 +14,13 @@ from urllib.request import Request, urlopen
 PROVIDER_RELEASES = (
     (
         "sakuramedia_local_provider",
-        "https://api.github.com/repos/tinypinglite/sakuramedia_local_provider/releases/latest",
+        "v0.1.12",
+        "https://api.github.com/repos/tinypinglite/sakuramedia_local_provider/releases/tags/v0.1.12",
     ),
     (
         "sakuramedia_115_provider",
-        "https://api.github.com/repos/tinypinglite/sakuramedia_115_provider/releases/latest",
+        "v0.1.15",
+        "https://api.github.com/repos/tinypinglite/sakuramedia_115_provider/releases/tags/v0.1.15",
     ),
 )
 
@@ -114,10 +116,12 @@ def _release_asset(plugin_id: str, release_api_url: str) -> tuple[str, bytes, st
 
 
 def package_latest_releases(output: Path) -> list[dict[str, str]]:
-    downloaded = [
-        (plugin_id, *_release_asset(plugin_id, release_api_url))
-        for plugin_id, release_api_url in PROVIDER_RELEASES
-    ]
+    downloaded = []
+    for plugin_id, expected_tag, release_api_url in PROVIDER_RELEASES:
+        tag_name, content, sha256 = _release_asset(plugin_id, release_api_url)
+        if tag_name != expected_tag:
+            raise ValueError(f"unexpected provider release tag: {plugin_id} expected={expected_tag} actual={tag_name}")
+        downloaded.append((plugin_id, tag_name, content, sha256))
 
     # 打包期就拒绝 Host API 不兼容的 provider：宿主在 entrypoint 的 upgrade-v053 阶段
     # 会因 manifest 版本不匹配直接退出，容器起不来。把校验前移到构建期，
