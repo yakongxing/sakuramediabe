@@ -284,6 +284,43 @@ else:
     SETTINGS_TOML_PATH = pathlib.Path(__file__).parent / "config.toml"
 
 
+_STORAGE_ENV_MAP = {
+    "STORAGE__BACKEND": "backend",
+    "STORAGE__WEBDAV_BASE_URL": "webdav_base_url",
+    "STORAGE__USERNAME": "username",
+    "STORAGE__PASSWORD": "password",
+    "STORAGE__ROOT_PREFIX": "root_prefix",
+    "STORAGE__VERIFY_TLS": "verify_tls",
+    "STORAGE__CONNECT_TIMEOUT_SECONDS": "connect_timeout_seconds",
+    "STORAGE__READ_TIMEOUT_SECONDS": "read_timeout_seconds",
+    "STORAGE__WRITE_TIMEOUT_SECONDS": "write_timeout_seconds",
+    "STORAGE__POOL_TIMEOUT_SECONDS": "pool_timeout_seconds",
+    "STORAGE__UPLOAD_CHUNK_SIZE": "upload_chunk_size",
+    "STORAGE__DOWNLOAD_CHUNK_SIZE": "download_chunk_size",
+}
+
+
+def _deployment_env_settings() -> dict[str, Any]:
+    """Unprefixed deployment env vars that must override config.toml.
+
+    PaaS providers commonly inject ``DATABASE__URL`` directly. WebDAV storage
+    deployments use the matching ``STORAGE__...`` names. Keep this source
+    intentionally narrow instead of enabling every unprefixed settings section.
+    """
+    data: dict[str, Any] = {}
+    if "DATABASE__URL" in os.environ:
+        data.setdefault("database", {})["url"] = os.environ["DATABASE__URL"]
+
+    storage_values = {
+        field_name: os.environ[env_name]
+        for env_name, field_name in _STORAGE_ENV_MAP.items()
+        if env_name in os.environ
+    }
+    if storage_values:
+        data["storage"] = storage_values
+    return data
+
+
 class Settings(BaseSettings):
     database: Database = Field(default_factory=Database)
     auth: Auth = Field(default_factory=Auth)
@@ -327,6 +364,7 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (
             init_settings,
+            _deployment_env_settings,
             env_settings,
             dotenv_settings,
             file_secret_settings,
