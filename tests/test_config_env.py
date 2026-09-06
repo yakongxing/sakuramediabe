@@ -1,4 +1,7 @@
-from src.config.config import Settings
+import pytest
+from pydantic import ValidationError
+
+from src.config.config import Scheduler, Settings
 
 
 class temporary_config_path:
@@ -12,6 +15,47 @@ class temporary_config_path:
 
     def __exit__(self, *args):
         Settings.model_config["toml_file"] = self.original_config_path
+
+
+def test_scheduler_disabled_tasks_defaults_empty_and_loads_from_toml(monkeypatch, tmp_path):
+    assert Scheduler().disabled_tasks == []
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[scheduler]\ndisabled_tasks = ["image_search_index", "media_thumbnail_generation"]\n',
+        encoding="utf-8",
+    )
+
+    with temporary_config_path(monkeypatch, config_path):
+        configured = Settings()
+
+    assert configured.scheduler.disabled_tasks == [
+        "image_search_index",
+        "media_thumbnail_generation",
+    ]
+
+
+def test_scheduler_disabled_tasks_loads_from_nested_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SAKURAMEDIA_SCHEDULER__DISABLED_TASKS",
+        '["movie_similarity_recompute"]',
+    )
+    with temporary_config_path(monkeypatch, tmp_path / "missing.toml"):
+        configured = Settings()
+
+    assert configured.scheduler.disabled_tasks == ["movie_similarity_recompute"]
+
+
+@pytest.mark.parametrize(
+    "disabled_tasks",
+    [
+        ["image_search_index", "image_search_index"],
+        ["Image Search"],
+        ["_image_search_index"],
+    ],
+)
+def test_scheduler_disabled_tasks_rejects_duplicates_and_invalid_keys(disabled_tasks):
+    with pytest.raises(ValidationError):
+        Scheduler(disabled_tasks=disabled_tasks)
 
 
 def test_database_url_env_without_prefix_overrides_toml(monkeypatch, tmp_path):
@@ -32,16 +76,13 @@ def test_database_url_env_without_prefix_overrides_toml(monkeypatch, tmp_path):
 def test_storage_webdav_env_without_prefix_overrides_toml(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        "\n".join(
-            [
-                "[storage]",
-                'backend = "local"',
-                'webdav_base_url = "https://dav.example/from-file"',
-                'username = "file-user"',
-                'password = "file-pass"',
-                'root_prefix = "file-prefix"',
-            ]
-        ),
+        """[storage]
+backend = "local"
+webdav_base_url = "https://dav.example/from-file"
+username = "file-user"
+password = "file-pass"
+root_prefix = "file-prefix"
+""",
         encoding="utf-8",
     )
     monkeypatch.setenv("STORAGE__BACKEND", "webdav")

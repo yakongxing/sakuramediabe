@@ -36,6 +36,19 @@ BOOTSTRAP_RETRY_GRACE_SECONDS = 1
 BOOTSTRAP_ERROR_RETRY_SECONDS = 5
 
 
+def _disabled_scheduled_task_keys() -> set[str]:
+    """Return configured keys after checking them against assembled cron jobs."""
+    disabled = set(settings.scheduler.disabled_tasks)
+    scheduled_keys = {job.task_key for job in JOB_REGISTRY if not job.manual_only}
+    unknown = disabled - scheduled_keys
+    if unknown:
+        raise ValueError(
+            "scheduler.disabled_tasks contains unknown or non-scheduled task keys: "
+            + ", ".join(sorted(unknown))
+        )
+    return disabled
+
+
 def get_job_cron_setting(job_def: JobDefinition) -> str | None:
     """返回对外展示的 cron 配置路径。"""
     if job_def.manual_only:
@@ -147,6 +160,9 @@ def _schedule_bootstrap_job(
     复用注册表里 cron 任务的 task_key 与队列 mutex，因此与定时触发天然互斥；
     参数统一交给任务自己的 handler 或参数执行体。
     """
+    if job_key in _disabled_scheduled_task_keys():
+        logger.info("Bootstrap scheduled task is disabled; skipping task_key={}", job_key)
+        return
     if job_key not in BOOTSTRAP_QUEUE_TASK_KEYS:
         raise ValueError(f"unsupported_bootstrap_task_key: {job_key}")
     job_def = JOB_REGISTRY_BY_KEY.get(job_key)
@@ -277,6 +293,9 @@ def _bootstrap_gfriends_filetree_refresh(scheduler: BlockingScheduler) -> None:
     - 触发条件：disk cache 不存在或已超过 TTL（等 cron 又要一周太久）
     - 任何异常都吞掉：GFriends 只是头像美化，不能让引导逻辑打崩 APS 启动
     """
+    if "gfriends_filetree_refresh" in _disabled_scheduled_task_keys():
+        logger.info("Bootstrap scheduled task is disabled; skipping task_key=gfriends_filetree_refresh")
+        return
     try:
         from pathlib import Path
 
@@ -302,6 +321,9 @@ def _bootstrap_gfriends_filetree_refresh(scheduler: BlockingScheduler) -> None:
 
 def _bootstrap_movie_similarity_index(scheduler: BlockingScheduler) -> None:
     """相似度 alias 缺失时立刻安排首次构建，不阻塞 APS 启动。"""
+    if "movie_similarity_recompute" in _disabled_scheduled_task_keys():
+        logger.info("Bootstrap scheduled task is disabled; skipping task_key=movie_similarity_recompute")
+        return
     try:
         from src.service.discovery.qdrant_movie_similarity_store import (
             MovieSimilarityIndexError,
@@ -327,13 +349,20 @@ def _bootstrap_movie_similarity_index(scheduler: BlockingScheduler) -> None:
 
 def build_scheduler() -> BlockingScheduler:
     timezone = get_runtime_timezone()
+    disabled = _disabled_scheduled_task_keys()
+    if disabled:
+        logger.info(
+            "Scheduled tasks disabled count={} task_keys={}",
+            len(disabled),
+            ",".join(sorted(disabled)),
+        )
     scheduler = BlockingScheduler(
         executors={"default": ThreadPoolExecutor(4)},
         job_defaults={"coalesce": True, "max_instances": 1},
         timezone=timezone,
     )
     for job_def in JOB_REGISTRY:
-        if job_def.manual_only:
+        if job_def.manual_only or job_def.task_key in disabled:
             continue
         cron_expr = resolve_job_cron_expr(job_def)
         # cron 触发只入队（enqueue_scheduled_job），实际执行在 TaskWorker；
@@ -343,6 +372,7 @@ def build_scheduler() -> BlockingScheduler:
             args=[job_def],
             trigger=CronTrigger.from_crontab(cron_expr, timezone=timezone),
             id=job_def.task_key,
+            name=f"scheduled:{job_def.task_key}",
             replace_existing=True,
         )
     if TelemetryService.is_enabled():
@@ -373,7 +403,12 @@ def aps():
     cron_info = " ".join(
         f"{get_job_cron_setting(j)}={resolve_job_cron_expr(j)}"
         for j in JOB_REGISTRY
-        if not j.manual_only
+        if not j.manual_only and j.task_key not in set(settings.scheduler.disabled_tasks)
     )
-    logger.info("Starting scheduler runtime_timezone={} {}", get_runtime_timezone_name(), cron_info)
+    logger.info(
+        "Starting scheduler runtime_timezone={} disabled_tasks={} {}",
+        get_runtime_timezone_name(),
+        ",".join(sorted(settings.scheduler.disabled_tasks)) or "none",
+        cron_info,
+    )
     scheduler.start()

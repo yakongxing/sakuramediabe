@@ -2,6 +2,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import secrets
 import stat
 import tempfile
@@ -206,6 +207,8 @@ class Plugins(BaseModel):
 
 class Scheduler(BaseModel):
     enabled: bool = True
+    # 只阻止 APS 定时触发；手动 API/CLI 和持久队列 worker 不受影响。
+    disabled_tasks: list[str] = Field(default_factory=list)
     log_dir: str = "/data/logs"
     actor_subscription_sync_cron: str = "0 2 * * *"
     subscribed_movie_auto_download_cron: str = "30 2 * * *"
@@ -229,6 +232,19 @@ class Scheduler(BaseModel):
     # 具体语义见 ActivityCleanupService。
     activity_task_run_retention_per_key: int = 200
     activity_notification_read_retention_days: int = 3
+
+    @field_validator("disabled_tasks")
+    @classmethod
+    def _validate_disabled_tasks(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("scheduler.disabled_tasks 不允许包含重复 task key")
+        for task_key in value:
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", task_key):
+                raise ValueError(
+                    "scheduler.disabled_tasks 中的 task key 只能包含小写字母、"
+                    f"数字、下划线且必须以字母开头: {task_key}"
+                )
+        return value
 
     @model_validator(mode="before")
     @classmethod

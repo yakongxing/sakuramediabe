@@ -272,6 +272,38 @@ def test_build_scheduler_skips_telemetry_when_disabled(monkeypatch):
     assert scheduler.get_job("telemetry_heartbeat") is None
 
 
+def test_build_scheduler_selectively_omits_disabled_tasks(monkeypatch):
+    from src.scheduler.queue_tasks import QUEUE_TASK_REGISTRY
+
+    disabled = [
+        "movie_similarity_recompute",
+        "image_search_index",
+        "media_thumbnail_generation",
+    ]
+    monkeypatch.setattr("src.start.aps.settings.scheduler.disabled_tasks", disabled)
+
+    scheduler = build_scheduler()
+
+    for task_key in disabled:
+        assert scheduler.get_job(task_key) is None
+    assert scheduler.get_job("movie_heat_update") is not None
+    assert scheduler.get_job("movie_heat_update").name == "scheduled:movie_heat_update"
+    assert scheduler.get_job("download_task_sync") is not None
+    assert scheduler.get_job("gfriends_filetree_refresh") is not None
+    # APS filtering must not alter durable, non-APS worker dispatch.
+    assert "image_publication" in QUEUE_TASK_REGISTRY
+
+
+def test_build_scheduler_rejects_unknown_disabled_task(monkeypatch):
+    monkeypatch.setattr(
+        "src.start.aps.settings.scheduler.disabled_tasks",
+        ["not_a_registered_task"],
+    )
+
+    with pytest.raises(ValueError, match="not_a_registered_task"):
+        build_scheduler()
+
+
 def test_bootstrap_movie_similarity_index_schedules_missing_alias(monkeypatch):
     scheduler = build_scheduler()
     monkeypatch.setattr(
@@ -285,6 +317,37 @@ def test_bootstrap_movie_similarity_index_schedules_missing_alias(monkeypatch):
     job = scheduler.get_job("bootstrap_movie_similarity_index")
     assert job is not None
     assert job.trigger.run_date is not None
+
+
+def test_disabled_movie_similarity_bootstrap_does_not_probe_or_enqueue(monkeypatch):
+    monkeypatch.setattr(
+        "src.start.aps.settings.scheduler.disabled_tasks",
+        ["movie_similarity_recompute"],
+    )
+    probed = []
+    monkeypatch.setattr(
+        "src.service.discovery.qdrant_movie_similarity_store."
+        "get_qdrant_movie_similarity_store",
+        lambda: probed.append(True),
+    )
+    scheduler = build_scheduler()
+
+    _bootstrap_movie_similarity_index(scheduler)
+
+    assert probed == []
+    assert scheduler.get_job("bootstrap_movie_similarity_index") is None
+
+
+def test_disabled_gfriends_bootstrap_does_not_probe_cache_or_enqueue(monkeypatch):
+    monkeypatch.setattr(
+        "src.start.aps.settings.scheduler.disabled_tasks",
+        ["gfriends_filetree_refresh"],
+    )
+    scheduler = build_scheduler()
+
+    _bootstrap_gfriends_filetree_refresh(scheduler)
+
+    assert scheduler.get_job("bootstrap_gfriends_filetree_refresh") is None
 
 
 def test_similarity_bootstrap_enqueues_startup_run_and_worker_executes_handler(
