@@ -8,6 +8,15 @@ class StorageNotFound(StorageError): pass
 class StorageUnavailable(StorageError): pass
 
 
+class StoragePublicationUnknown(StorageUnavailable):
+    """A publish may have committed, but the backend could not confirm visibility."""
+
+    def __init__(self, key: str, message: str):
+        super().__init__(message)
+        self.key = key
+        self.publication_possible = True
+
+
 @dataclass(frozen=True)
 class ObjectStat:
     key: str

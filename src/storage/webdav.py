@@ -1,7 +1,14 @@
+from __future__ import annotations
+
+import hashlib
 import io
+import re
 import threading
+import time
 import uuid
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -9,11 +16,16 @@ import httpx
 from webdav4.client import Client, ResourceAlreadyExists, ResourceNotFound
 
 from .keys import normalize_prefix, normalize_storage_key
-from .types import ObjectStat, StorageNotFound, StorageUnavailable
-
+from .types import (
+    ObjectStat,
+    StorageNotFound,
+    StoragePublicationUnknown,
+    StorageUnavailable,
+)
 
 _locks_guard = threading.Lock()
 _path_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+_UPLOAD_TEMP_NAME = re.compile(r"^\..+\.uploading-[0-9a-f]{32}$")
 
 
 def _lock_for_path(path: str) -> threading.Lock:
@@ -22,12 +34,22 @@ def _lock_for_path(path: str) -> threading.Lock:
 
 
 class WebDAVStorageBackend:
-    def __init__(self, base_url: str, namespace: str, *, username: str = "", password: str = "", root_prefix: str = "", verify_tls: bool = True, timeout: httpx.Timeout | float = 60.0):
+    def __init__(self, base_url: str, namespace: str, *, username: str = "", password: str = "", root_prefix: str = "", verify_tls: bool = True, timeout: httpx.Timeout | float = 60.0, sleep=time.sleep, retry_delays: tuple[float, ...] = (0.1, 0.25, 0.5, 1.0), final_visibility_retry_delays: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0), publication_concurrency_limit: int = 2, temp_cleanup_interval_seconds: float = 3600, temp_cleanup_max_deletes: int = 16, temp_cleanup_age_seconds: float = 86400):
         self.base_url = base_url.rstrip("/")
         prefix = normalize_prefix(root_prefix)
         self.prefix = "/".join(part for part in (prefix, normalize_storage_key(namespace)) if part)
         self.auth = (username, password) if username or password else None
         self.timeout = timeout
+        self._sleep = sleep
+        self._retry_delays = retry_delays
+        self._final_visibility_retry_delays = final_visibility_retry_delays
+        self.publication_concurrency_limit = publication_concurrency_limit
+        self._publication_semaphore = threading.BoundedSemaphore(publication_concurrency_limit)
+        self._temp_cleanup_interval_seconds = temp_cleanup_interval_seconds
+        self._temp_cleanup_max_deletes = temp_cleanup_max_deletes
+        self._temp_cleanup_age_seconds = temp_cleanup_age_seconds
+        self._temp_cleanup_lock = threading.Lock()
+        self._last_temp_cleanup_at = 0.0
         self.client = Client(self.base_url, auth=self.auth, timeout=timeout, verify=verify_tls)
         self.http = httpx.Client(auth=self.auth, timeout=timeout, verify=verify_tls, follow_redirects=True)
 
@@ -76,7 +98,110 @@ class WebDAVStorageBackend:
         path = Path(normalize_storage_key(key))
         return str(path.with_name(f".{path.name}.uploading-{uuid.uuid4().hex}"))
 
-    def _publish_fileobj(self, key: str, file_obj, *, size: int, overwrite: bool) -> ObjectStat:
+    def _stat_visible(self, key: str, *, stage: str, retry_delays: tuple[float, ...] | None = None) -> ObjectStat:
+        delays = self._retry_delays if retry_delays is None else retry_delays
+        for attempt in range(len(delays) + 1):
+            try:
+                return self.stat(key)
+            except (StorageNotFound, StorageUnavailable) as exc:
+                if not self._is_transient(exc) or attempt == len(delays):
+                    status = self._status_code(exc)
+                    if isinstance(exc, StorageNotFound):
+                        status = 404
+                    raise StorageUnavailable(
+                        f"WebDAV {stage} visibility failed ({status or 'network'})"
+                    ) from exc
+                self._sleep(delays[attempt])
+
+    @staticmethod
+    def _status_code(exc: Exception) -> int | None:
+        current: BaseException | None = exc
+        while current is not None:
+            status = getattr(getattr(current, "response", None), "status_code", None)
+            if status is not None:
+                return int(status)
+            current = current.__cause__
+        return None
+
+    @classmethod
+    def _is_transient(cls, exc: Exception) -> bool:
+        status = cls._status_code(exc)
+        return status is None or status in {404, 409, 423, 429, 530} or (500 <= status <= 599)
+
+    def _destination_matches(
+        self,
+        key: str,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> ObjectStat | None:
+        try:
+            destination = self.stat(key)
+        except (StorageNotFound, StorageUnavailable):
+            return None
+        if destination.size != expected_size:
+            return None
+        try:
+            with self.open(key) as stream:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except StorageUnavailable:
+            return None
+        if digest.hexdigest() != expected_sha256:
+            return None
+        return destination
+
+    def _move_with_retry(
+        self,
+        source: str,
+        destination: str,
+        *,
+        destination_key: str,
+        expected_size: int,
+        expected_sha256: str,
+        overwrite: bool,
+    ) -> ObjectStat | None:
+        for attempt in range(len(self._retry_delays) + 1):
+            try:
+                self.client.move(source, destination, overwrite=overwrite)
+                return None
+            except Exception as exc:
+                status = self._status_code(exc)
+                transient = self._is_transient(exc)
+                conflict = status in {409, 412}
+                if transient or conflict:
+                    published = self._destination_matches(
+                        destination_key,
+                        expected_size=expected_size,
+                        expected_sha256=expected_sha256,
+                    )
+                    if published is not None:
+                        return published
+                if conflict:
+                    raise StorageUnavailable(
+                        f"WebDAV publish move failed ({status}): destination content mismatch"
+                    ) from exc
+                if not transient or attempt == len(self._retry_delays):
+                    if transient:
+                        raise StoragePublicationUnknown(
+                            destination_key,
+                            f"WebDAV publish move outcome unknown ({status or 'network'})",
+                        ) from exc
+                    raise StorageUnavailable(f"WebDAV publish move failed ({status or 'network'})") from exc
+                self._sleep(self._retry_delays[attempt])
+
+    def _delete_temporary_best_effort(self, key: str) -> None:
+        for attempt in range(len(self._retry_delays) + 1):
+            try:
+                self.delete(key, missing_ok=True)
+                return
+            except StorageUnavailable as exc:
+                if not self._is_transient(exc) or attempt == len(self._retry_delays):
+                    return
+                self._sleep(self._retry_delays[attempt])
+
+    def _publish_fileobj(self, key: str, file_obj, *, size: int, expected_sha256: str, overwrite: bool) -> ObjectStat:
         normalized = normalize_storage_key(key)
         if not overwrite and self.exists(normalized): raise FileExistsError(normalized)
         final_path = self._path(normalized)
@@ -85,26 +210,82 @@ class WebDAVStorageBackend:
         with _lock_for_path(f"file:{final_path}"):
             self._mkdir_parents(normalized)
             try:
-                self.client.upload_fileobj(file_obj, tmp_path, overwrite=True, size=size)
-                tmp_stat = self.stat(tmp_key)
+                try:
+                    self.client.upload_fileobj(file_obj, tmp_path, overwrite=True, size=size)
+                except Exception as exc:
+                    status = self._status_code(exc)
+                    raise StorageUnavailable(
+                        f"WebDAV temporary upload failed ({status or 'network'})"
+                    ) from exc
+                tmp_stat = self._stat_visible(tmp_key, stage="temporary")
                 if tmp_stat.size != size:
                     raise StorageUnavailable(
                         f"WebDAV upload size mismatch key={normalized} expected={size} actual={tmp_stat.size}"
                     )
-                if overwrite:
-                    self.delete(normalized, missing_ok=True)
-                self.client.move(tmp_path, final_path, overwrite=overwrite)
-                return self.stat(normalized)
+                reconciled = self._move_with_retry(
+                    tmp_path,
+                    final_path,
+                    destination_key=normalized,
+                    expected_size=size,
+                    expected_sha256=expected_sha256,
+                    overwrite=overwrite,
+                )
+                try:
+                    final_stat = reconciled or self._stat_visible(
+                        normalized,
+                        stage="final",
+                        retry_delays=self._final_visibility_retry_delays,
+                    )
+                except StorageUnavailable as exc:
+                    raise StoragePublicationUnknown(
+                        normalized, "WebDAV publish committed but final visibility is unknown"
+                    ) from exc
+                if final_stat.size != size:
+                    raise StorageUnavailable(
+                        f"WebDAV final size mismatch key={normalized} expected={size} actual={final_stat.size}"
+                    )
+                self._delete_temporary_best_effort(tmp_key)
+                self._maybe_cleanup_expired_uploads(str(Path(normalized).parent))
+                return final_stat
+            except StoragePublicationUnknown:
+                raise
             except Exception:
-                self.delete(tmp_key, missing_ok=True)
+                self._delete_temporary_best_effort(tmp_key)
                 raise
 
     def put_file(self, key: str, source: Path, *, overwrite: bool = True) -> ObjectStat:
-        with source.open("rb") as handle:
-            return self._publish_fileobj(key, handle, size=source.stat().st_size, overwrite=overwrite)
+        digest = hashlib.sha256()
+        with source.open("rb") as hash_handle:
+            for chunk in iter(lambda: hash_handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        with source.open("rb") as handle, self._publication_semaphore:
+            return self._publish_fileobj(key, handle, size=source.stat().st_size, expected_sha256=digest.hexdigest(), overwrite=overwrite)
 
     def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True) -> ObjectStat:
-        return self._publish_fileobj(key, io.BytesIO(content), size=len(content), overwrite=overwrite)
+        with self._publication_semaphore:
+            return self._publish_fileobj(key, io.BytesIO(content), size=len(content), expected_sha256=hashlib.sha256(content).hexdigest(), overwrite=overwrite)
+
+    def _maybe_cleanup_expired_uploads(self, prefix: str) -> None:
+        now = time.monotonic()
+        if now - self._last_temp_cleanup_at < self._temp_cleanup_interval_seconds:
+            return
+        if not self._temp_cleanup_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if now - self._last_temp_cleanup_at < self._temp_cleanup_interval_seconds:
+                return
+            self._last_temp_cleanup_at = now
+            try:
+                self.cleanup_expired_uploads(
+                    prefix,
+                    older_than=datetime.now(timezone.utc) - timedelta(seconds=self._temp_cleanup_age_seconds),
+                    max_deletes=self._temp_cleanup_max_deletes,
+                )
+            except Exception:
+                return
+        finally:
+            self._temp_cleanup_lock.release()
 
     def open(self, key: str):
         target = io.BytesIO()
@@ -137,6 +318,51 @@ class WebDAVStorageBackend:
             name = str(row.get("name", "")).rstrip("/").rsplit("/", 1)[-1]
             if name: result.append(ObjectStat(f"{normalized}/{name}", self._size(row), True, row.get("etag")))
         return result
+
+    @staticmethod
+    def _modified_at(value) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    parsed = parsedate_to_datetime(value)
+                except (TypeError, ValueError):
+                    return None
+        else:
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+    def cleanup_expired_uploads(self, prefix: str, *, older_than: datetime, max_deletes: int = 16) -> list[str]:
+        """Best-effort removal of expired publication temps in one known directory."""
+        normalized = normalize_storage_key(prefix)
+        cutoff = older_than.replace(tzinfo=timezone.utc) if older_than.tzinfo is None else older_than.astimezone(timezone.utc)
+        try:
+            rows = self.client.ls(self._path(normalized), detail=True)
+        except ResourceNotFound:
+            return []
+        except Exception as exc:
+            status = self._status_code(exc)
+            raise StorageUnavailable(f"WebDAV temp cleanup list failed ({status or 'network'})") from exc
+        deleted: list[str] = []
+        for row in rows:
+            if row.get("type") == "directory":
+                continue
+            name = str(row.get("name", "")).rstrip("/").rsplit("/", 1)[-1]
+            modified = self._modified_at(row.get("modified") or row.get("last_modified"))
+            if not _UPLOAD_TEMP_NAME.fullmatch(name) or modified is None or modified >= cutoff:
+                continue
+            key = f"{normalized}/{name}"
+            try:
+                self.delete(key, missing_ok=True)
+            except StorageUnavailable:
+                continue
+            deleted.append(key)
+            if len(deleted) >= max_deletes:
+                break
+        return deleted
 
     def local_path(self, key: str): return None
 

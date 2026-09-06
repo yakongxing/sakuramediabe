@@ -112,6 +112,11 @@ class Storage(BaseModel):
     pool_timeout_seconds: float = Field(default=10.0, gt=0)
     upload_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
     download_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
+    webdav_publication_max_workers: int = Field(default=2, ge=1, le=8)
+    webdav_final_visibility_retry_seconds: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+    webdav_temp_cleanup_interval_seconds: float = Field(default=3600, ge=60)
+    webdav_temp_cleanup_age_seconds: float = Field(default=86400, ge=3600)
+    webdav_temp_cleanup_max_deletes: int = Field(default=16, ge=1, le=256)
 
     @model_validator(mode="after")
     def _validate_storage(self):

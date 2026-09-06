@@ -40,6 +40,8 @@ from src.service.catalog.movie_image_service import (
     ThinCoverResolution,
 )
 from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
+from src.storage import asset_storage
+from src.storage.types import StorageUnavailable
 
 # 兼容既有导入路径：ImageDownloadError 等类型历史上从本模块导出，且多处 `except ImageDownloadError`
 # 依赖同一个类对象，这里显式再导出保证类身份唯一。
@@ -137,6 +139,7 @@ class CatalogImportService:
             | (Movie.javdb_id == detail.javdb_id)
         )
         if existing_movie is not None:
+            self._repair_missing_actor_avatars(detail.actors or [])
             logger.debug(
                 "Catalog import skipped existing movie movie_id={} movie_number={}",
                 existing_movie.id,
@@ -374,6 +377,123 @@ class CatalogImportService:
                 ]
         return movie, created, tuple(changed_fields)
 
+    def _compensate_actor_avatar_repair(
+        self,
+        profile_image: Image,
+        *,
+        image_record_existed: bool,
+        object_existed: bool,
+        storage,
+    ) -> None:
+        if not image_record_existed:
+            self.image_service.delete_image_record_if_unused(profile_image)
+        # Publication uses deterministic keys that another process can reuse. Even when
+        # this call uploaded the bytes, object ownership is not exclusive, so leave the
+        # object for delayed reference-aware cleanup instead of racing another linker.
+
+    def _repair_missing_actor_avatars(self, actors: list[JavdbMovieActorResource]) -> None:
+        """Repair prior nonfatal avatar-download misses without refreshing movie metadata."""
+        for actor_resource in actors:
+            if not (actor_resource.avatar_url or "").strip():
+                continue
+            actor = Actor.get_or_none(Actor.javdb_id == actor_resource.javdb_id)
+            if actor is None:
+                continue
+            storage = asset_storage()
+            expected_profile_image_id = actor.profile_image_id
+            if expected_profile_image_id is not None:
+                existing_profile = actor.profile_image
+                try:
+                    existing_profile_exists = storage.exists(existing_profile.origin)
+                except StorageUnavailable as exc:
+                    logger.warning(
+                        "Catalog actor avatar repair storage probe failed "
+                        "actor_javdb_id={} path={} detail={}",
+                        actor_resource.javdb_id,
+                        existing_profile.origin,
+                        exc,
+                    )
+                    continue
+                if existing_profile_exists:
+                    continue
+            image_task = self.image_service._build_image_task(
+                owner_type="actor",
+                owner_key=actor_resource.javdb_id,
+                image_url=actor_resource.avatar_url,
+            )
+            if image_task is None:
+                continue
+            try:
+                object_existed = storage.exists(image_task.relative_path)
+            except StorageUnavailable as exc:
+                logger.warning(
+                    "Catalog actor avatar repair storage probe failed "
+                    "actor_javdb_id={} path={} detail={}",
+                    actor_resource.javdb_id,
+                    image_task.relative_path,
+                    exc,
+                )
+                continue
+            image_record_existed = Image.get_or_none(Image.origin == image_task.relative_path)
+            try:
+                profile_image = self.image_service.persist_image(
+                    owner_type="actor",
+                    owner_key=actor_resource.javdb_id,
+                    image_url=actor_resource.avatar_url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Catalog actor avatar repair publication/upsert failed actor_javdb_id={} detail={}",
+                    actor_resource.javdb_id,
+                    exc,
+                )
+                continue
+            if profile_image is None:
+                continue
+            if expected_profile_image_id == profile_image.id:
+                continue
+
+            lock_context = self.persist_lock or nullcontext()
+            obsolete_paths: set[str] = set()
+            try:
+                with lock_context, get_database().atomic():
+                    condition = Actor.id == actor.id
+                    if expected_profile_image_id is None:
+                        condition &= Actor.profile_image.is_null(True)
+                    else:
+                        condition &= Actor.profile_image == expected_profile_image_id
+                    updated = Actor.update(profile_image=profile_image).where(condition).execute()
+                    if updated != 1:
+                        self._compensate_actor_avatar_repair(
+                            profile_image,
+                            image_record_existed=image_record_existed is not None,
+                            object_existed=object_existed,
+                            storage=storage,
+                        )
+                    elif expected_profile_image_id is not None:
+                        old_profile = Image.get_or_none(Image.id == expected_profile_image_id)
+                        if old_profile is not None and old_profile.id != profile_image.id:
+                            obsolete_paths.update(
+                                self.image_service.delete_image_record_if_unused(old_profile)
+                            )
+            except Exception:
+                self._compensate_actor_avatar_repair(
+                    profile_image,
+                    image_record_existed=image_record_existed is not None,
+                    object_existed=object_existed,
+                    storage=storage,
+                )
+                raise
+            if obsolete_paths:
+                try:
+                    self.image_service.delete_obsolete_image_files(obsolete_paths)
+                except Exception as exc:
+                    logger.warning(
+                        "Catalog actor avatar old object cleanup failed count={} detail={}",
+                        len(obsolete_paths),
+                        exc,
+                    )
+
     def refresh_movie_metadata_strict(
         self,
         movie: Movie,
@@ -399,21 +519,32 @@ class CatalogImportService:
             actor_image_tasks_by_javdb_id,
         )
 
-        # 严格刷新先把新图片全部下载到临时目录，避免中途失败污染正式目录。
-        prepared_files = self.image_service.download_image_tasks_to_temporary_files(image_tasks)
-        thin_cover_resolution = self.image_service.resolve_thin_cover_from_prepared_images(
-            movie.movie_number,
-            cover_task,
-            plot_tasks,
-            prepared_files,
-        )
-        if thin_cover_resolution.generated_prepared_file is not None:
-            prepared_files.append(thin_cover_resolution.generated_prepared_file)
-        new_relative_paths = {prepared.image_task.relative_path for prepared in prepared_files}
-        finalized = False
+        prepared_files: list[PreparedImageFile] = []
+        created_keys: set[str] = set()
+        database_committed = False
         obsolete_paths: set[str] = set()
         old_plot_image_ids: list[int] = []
         try:
+            # 严格刷新先把新图片全部下载到临时目录，避免中途失败污染正式目录。
+            prepared_files = self.image_service.download_image_tasks_to_temporary_files(image_tasks)
+            thin_cover_resolution = self.image_service.resolve_thin_cover_from_prepared_images(
+                movie.movie_number,
+                cover_task,
+                plot_tasks,
+                prepared_files,
+            )
+            if thin_cover_resolution.generated_prepared_file is not None:
+                prepared_files.append(thin_cover_resolution.generated_prepared_file)
+            # Strict refresh publishes immutable objects before any Image/Actor FK can commit.
+            # Existing deterministic keys remain readable; only newly refreshed objects are versioned.
+            self.image_service.version_prepared_image_keys(prepared_files)
+            new_relative_paths = {
+                prepared.image_task.relative_path for prepared in prepared_files
+            }
+            self.image_service.finalize_prepared_image_files(
+                prepared_files,
+                created_keys=created_keys,
+            )
             lock_context = self.persist_lock or nullcontext()
             with lock_context, get_database().atomic():
                 persisted_movie, obsolete_paths, old_plot_image_ids = self._refresh_movie_metadata_records_strict(
@@ -426,6 +557,7 @@ class CatalogImportService:
                     plot_tasks=plot_tasks,
                     actor_image_tasks_by_javdb_id=actor_image_tasks_by_javdb_id,
                 )
+            database_committed = True
             if old_plot_image_ids:
                 try:
                     from src.service.discovery.qdrant_plot_image_store import (
@@ -439,9 +571,14 @@ class CatalogImportService:
                         len(old_plot_image_ids),
                         exc,
                     )
-            self.image_service.finalize_prepared_image_files(prepared_files)
-            self.image_service.delete_obsolete_image_files(obsolete_paths - new_relative_paths)
-            finalized = True
+            try:
+                self.image_service.delete_obsolete_image_files(obsolete_paths - new_relative_paths)
+            except Exception as exc:
+                logger.warning(
+                    "Catalog strict refresh obsolete image cleanup failed count={} detail={}",
+                    len(obsolete_paths - new_relative_paths),
+                    exc,
+                )
             logger.info(
                 "Catalog strict metadata refresh finished movie_id={} movie_number={}",
                 persisted_movie.id,
@@ -449,8 +586,14 @@ class CatalogImportService:
             )
             return persisted_movie
         finally:
-            if not finalized:
-                self.image_service.cleanup_prepared_image_files(prepared_files)
+            self.image_service.cleanup_prepared_image_files(prepared_files)
+            if not database_committed and created_keys:
+                # These keys are content-addressed and can be shared by another process.
+                # Immediate deletion cannot prove ownership and can race a concurrent commit.
+                logger.warning(
+                    "Catalog strict refresh left unreferenced candidates for delayed cleanup count={}",
+                    len(created_keys),
+                )
 
     def _refresh_movie_metadata_records_strict(
         self,
@@ -628,13 +771,10 @@ class CatalogImportService:
             )
 
         old_profile_image = actor.profile_image
-        actor.profile_image = None
-        actor.save(only=[Actor.profile_image])
         obsolete_paths: set[str] = set()
-        if old_profile_image is not None:
-            obsolete_paths.update(self.image_service.delete_image_record_if_unused(old_profile_image))
-
-        profile_image = self.image_service.persist_refreshed_image_record(profile_image_task)
+        profile_image = old_profile_image
+        if profile_image_task is not None:
+            profile_image = self.image_service.persist_refreshed_image_record(profile_image_task)
         actor.name = actor_resource.name
         actor.alias_name = self._merge_actor_alias_name(
             primary_name=actor_resource.name,
@@ -644,6 +784,12 @@ class CatalogImportService:
         actor.javdb_type = actor_resource.javdb_type
         actor.profile_image = profile_image
         actor.save()
+        if (
+            profile_image_task is not None
+            and old_profile_image is not None
+            and (profile_image is None or profile_image.id != old_profile_image.id)
+        ):
+            obsolete_paths.update(self.image_service.delete_image_record_if_unused(old_profile_image))
         return actor, obsolete_paths
 
     def backfill_movie_thin_cover(self, movie: Movie) -> bool:

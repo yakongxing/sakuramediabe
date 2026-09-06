@@ -8,7 +8,7 @@
 薄封面解析（``resolve_thin_cover_*``）和入库 helper（``persist_*``）。
 """
 
-import os
+import hashlib
 import shutil
 import tempfile
 import time
@@ -35,7 +35,11 @@ from src.metadata._providers.models import JavdbMovieActorResource
 from src.model import Image, Movie, MoviePlotImage
 from src.service.catalog.image_cleanup_service import ImageCleanupService
 from src.storage import asset_storage
-from src.storage.types import StorageNotFound
+from src.storage.types import (
+    StorageNotFound,
+    StoragePublicationUnknown,
+    StorageUnavailable,
+)
 
 
 class ImageDownloadError(Exception):
@@ -72,6 +76,7 @@ class MovieImageService:
     IMAGE_DOWNLOAD_MAX_RETRIES = 6
     # 图片下载超时秒数
     IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 30
+    IMAGE_DOWNLOAD_MAX_WORKERS = 8
 
     def __init__(self, image_downloader: Callable[[str, Path], None] | None = None):
         # http_client 急切构造：下载单测会在实例上 monkeypatch http_client.request，
@@ -437,9 +442,10 @@ class MovieImageService:
 
     def download_image_tasks(self, image_tasks: list[ImagePersistTask]) -> None:
         """并发下载一批图片；封面失败会中断导入，剧情图/头像失败仅告警跳过。"""
+        storage = asset_storage()
         tasks_to_download: list[ImagePersistTask] = []
         for image_task in image_tasks:
-            if asset_storage().exists(image_task.relative_path):
+            if storage.exists(image_task.relative_path):
                 logger.debug(
                     "Catalog image download reused local file type={} path={}",
                     image_task.image_type,
@@ -452,13 +458,20 @@ class MovieImageService:
             return
 
         cover_download_errors: list[ImageDownloadError] = []
-        with ThreadPoolExecutor(max_workers=len(tasks_to_download), thread_name_prefix="catalog-image") as executor:
-            future_map = {executor.submit(self._download_movie_image_task, task): task for task in tasks_to_download}
+        publication_errors: list[StorageUnavailable] = []
+        with ThreadPoolExecutor(max_workers=min(self.IMAGE_DOWNLOAD_MAX_WORKERS, len(tasks_to_download)), thread_name_prefix="catalog-image") as executor:
+            future_map = {
+                executor.submit(self._download_movie_image_task, task, storage): task
+                for task in tasks_to_download
+            }
             for future in as_completed(future_map):
                 image_task = future_map[future]
                 try:
                     future.result()
                 except Exception as exc:
+                    if isinstance(exc, StorageUnavailable):
+                        publication_errors.append(exc)
+                        continue
                     # 仅封面下载失败会中断影片导入；剧情图和演员头像失败只记录告警并继续。
                     if image_task.image_type != "cover":
                         logger.warning(
@@ -481,25 +494,34 @@ class MovieImageService:
                     else:
                         cover_download_errors.append(ImageDownloadError(f"download_failed:{image_task.image_url}:{exc}"))
 
+        if publication_errors:
+            raise publication_errors[0]
         if cover_download_errors:
             raise cover_download_errors[0]
 
-    def _download_movie_image_task(self, image_task: ImagePersistTask) -> None:
+    def _download_movie_image_task(self, image_task: ImagePersistTask, storage=None) -> None:
         logger.debug(
             "Catalog image download scheduled type={} url={} target={}",
             image_task.image_type,
             image_task.image_url,
             str(image_task.absolute_path),
         )
-        local_path = asset_storage().local_path(image_task.relative_path)
+        storage = storage or asset_storage()
+        local_path = storage.local_path(image_task.relative_path)
         if local_path is not None:
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            self.image_downloader(image_task.image_url, local_path)
+            try:
+                self.image_downloader(image_task.image_url, local_path)
+            except Exception as exc:
+                raise ImageDownloadError(f"download_failed:{image_task.image_url}:{exc}") from exc
             return
         with tempfile.TemporaryDirectory(prefix="catalog-image-") as workspace:
             prepared = Path(workspace) / Path(image_task.relative_path).name
-            self.image_downloader(image_task.image_url, prepared)
-            asset_storage().put_file(image_task.relative_path, prepared)
+            try:
+                self.image_downloader(image_task.image_url, prepared)
+            except Exception as exc:
+                raise ImageDownloadError(f"download_failed:{image_task.image_url}:{exc}") from exc
+            storage.put_file(image_task.relative_path, prepared)
 
     def download_image_tasks_to_temporary_files(
         self,
@@ -519,7 +541,7 @@ class MovieImageService:
         ]
 
         try:
-            with ThreadPoolExecutor(max_workers=len(prepared_files), thread_name_prefix="catalog-refresh-image") as executor:
+            with ThreadPoolExecutor(max_workers=min(self.IMAGE_DOWNLOAD_MAX_WORKERS, len(prepared_files)), thread_name_prefix="catalog-refresh-image") as executor:
                 future_map = {
                     executor.submit(self._download_prepared_image_file, prepared_file): prepared_file
                     for prepared_file in prepared_files
@@ -540,21 +562,71 @@ class MovieImageService:
         for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
             shutil.rmtree(temp_root, ignore_errors=True)
 
-    def finalize_prepared_image_files(self, prepared_files: list[PreparedImageFile]) -> None:
+    @staticmethod
+    def _sha256_stream(stream) -> str:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _prepared_matches_storage(cls, storage, key: str, temp_path: Path) -> bool:
+        try:
+            existing = storage.stat(key)
+        except StorageNotFound:
+            return False
+        if existing.size != temp_path.stat().st_size:
+            return False
+        with temp_path.open("rb") as prepared_stream, storage.open(key) as stored_stream:
+            return cls._sha256_stream(prepared_stream) == cls._sha256_stream(stored_stream)
+
+    @classmethod
+    def version_prepared_image_keys(cls, prepared_files: list[PreparedImageFile]) -> None:
+        """Give strict-refresh objects immutable content-derived keys before publication."""
+        for prepared_file in prepared_files:
+            with prepared_file.temp_path.open("rb") as stream:
+                content_id = cls._sha256_stream(stream)
+            current = Path(prepared_file.image_task.relative_path)
+            prepared_file.image_task.relative_path = str(
+                current.with_name(f"{current.stem}-{content_id}{current.suffix}")
+            )
+
+    def finalize_prepared_image_files(
+        self,
+        prepared_files: list[PreparedImageFile],
+        *,
+        created_keys: set[str] | None = None,
+    ) -> None:
         storage = asset_storage()
         for prepared_file in prepared_files:
             key = prepared_file.image_task.relative_path
-            try:
-                existing = storage.stat(key)
-            except StorageNotFound:
-                existing = None
-            if existing is not None and existing.size == prepared_file.temp_path.stat().st_size:
+            if self._prepared_matches_storage(storage, key, prepared_file.temp_path):
                 logger.debug("Catalog image unchanged, skip upload key={}", key)
                 continue
-            storage.put_file(key, prepared_file.temp_path)
+            try:
+                storage.put_file(key, prepared_file.temp_path, overwrite=False)
+            except StoragePublicationUnknown:
+                if created_keys is not None:
+                    created_keys.add(key)
+                raise
+            except FileExistsError:
+                if self._prepared_matches_storage(storage, key, prepared_file.temp_path):
+                    continue
+                raise StorageUnavailable(f"Immutable image key collision key={key}") from None
+            if created_keys is not None:
+                created_keys.add(key)
 
         for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
             shutil.rmtree(temp_root, ignore_errors=True)
+
+    @staticmethod
+    def delete_image_files_best_effort(keys: Iterable[str]) -> None:
+        storage = asset_storage()
+        for key in keys:
+            try:
+                storage.delete(key, missing_ok=True)
+            except Exception as exc:
+                logger.warning("Catalog image compensation delete failed key={} detail={}", key, exc)
 
     def persist_image(
         self,
