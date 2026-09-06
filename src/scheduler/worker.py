@@ -49,6 +49,11 @@ class TaskWorker:
         self._in_flight: dict[int, str] = {}
 
     def start(self) -> None:
+        # Run journal reconciliation synchronously before claimers start. A process
+        # may have crashed after fsyncing a manifest but before inserting a queue
+        # row, so lease-based recovery alone cannot discover all durable work.
+        ensure_database_ready()
+        self._run_housekeeping_once()
         for lane, concurrency in self._lanes.items():
             for index in range(concurrency):
                 threading.Thread(
@@ -136,10 +141,13 @@ class TaskWorker:
         interval = max(self._lease_seconds // 3, 5)
         while not self._stop.wait(interval):
             try:
-                self._renew_in_flight_leases()
-                self._recover_expired_leases()
+                self._run_housekeeping_once()
             except Exception:
                 logger.exception("Task worker housekeeping failed")
+
+    def _run_housekeeping_once(self) -> None:
+        self._renew_in_flight_leases()
+        self._recover_expired_leases()
 
     def _renew_in_flight_leases(self) -> None:
         with self._lock:
@@ -149,12 +157,10 @@ class TaskWorker:
 
     def _recover_expired_leases(self) -> None:
         recovered = TaskQueueService.recover_expired_leases()
-        if not recovered:
-            return
         self._run_business_recovery({run.task_key for run in recovered})
 
     @staticmethod
     def _run_business_recovery(task_keys: set[str]) -> None:
-        from src.start.recovery import recover_business_states
+        from src.start.recovery import recover_housekeeping_states
 
-        recover_business_states(task_keys)
+        recover_housekeeping_states(task_keys)

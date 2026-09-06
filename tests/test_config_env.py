@@ -66,3 +66,18 @@ def test_storage_webdav_env_without_prefix_overrides_toml(monkeypatch, tmp_path)
     assert settings.storage.username == "env-user"
     assert settings.storage.password == "env-pass"
     assert settings.storage.root_prefix == "env-prefix"
+
+
+def test_image_pipeline_concurrency_and_staging_support_environment_overrides(monkeypatch, tmp_path):
+    from src.config.config import Settings
+
+    monkeypatch.setenv("METADATA__IMAGE_DOWNLOAD_MAX_WORKERS", "5")
+    monkeypatch.setenv("STORAGE__WEBDAV_PUBLICATION_MAX_WORKERS", "4")
+    monkeypatch.setenv("STORAGE__IMAGE_PUBLICATION_STAGING_ROOT", "/data/custom-images")
+
+    with temporary_config_path(monkeypatch, tmp_path / "missing.toml"):
+        configured = Settings()
+
+    assert configured.metadata.image_download_max_workers == 5
+    assert configured.storage.webdav_publication_max_workers == 4
+    assert configured.storage.image_publication_staging_root == "/data/custom-images"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -25,6 +26,7 @@ from .types import (
 
 _locks_guard = threading.Lock()
 _path_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+_publication_semaphores: dict[int, threading.BoundedSemaphore] = {}
 _UPLOAD_TEMP_NAME = re.compile(r"^\..+\.uploading-[0-9a-f]{32}$")
 
 
@@ -33,7 +35,14 @@ def _lock_for_path(path: str) -> threading.Lock:
         return _path_locks[path]
 
 
+def _publication_semaphore(limit: int) -> threading.BoundedSemaphore:
+    """Share the configured PUT bound across every backend instance/namespace."""
+    with _locks_guard:
+        return _publication_semaphores.setdefault(limit, threading.BoundedSemaphore(limit))
+
+
 class WebDAVStorageBackend:
+    supports_direct_immutable_put = True
     def __init__(self, base_url: str, namespace: str, *, username: str = "", password: str = "", root_prefix: str = "", verify_tls: bool = True, timeout: httpx.Timeout | float = 60.0, sleep=time.sleep, retry_delays: tuple[float, ...] = (0.1, 0.25, 0.5, 1.0), final_visibility_retry_delays: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0), publication_concurrency_limit: int = 2, temp_cleanup_interval_seconds: float = 3600, temp_cleanup_max_deletes: int = 16, temp_cleanup_age_seconds: float = 86400):
         self.base_url = base_url.rstrip("/")
         prefix = normalize_prefix(root_prefix)
@@ -44,7 +53,7 @@ class WebDAVStorageBackend:
         self._retry_delays = retry_delays
         self._final_visibility_retry_delays = final_visibility_retry_delays
         self.publication_concurrency_limit = publication_concurrency_limit
-        self._publication_semaphore = threading.BoundedSemaphore(publication_concurrency_limit)
+        self._publication_semaphore = _publication_semaphore(publication_concurrency_limit)
         self._temp_cleanup_interval_seconds = temp_cleanup_interval_seconds
         self._temp_cleanup_max_deletes = temp_cleanup_max_deletes
         self._temp_cleanup_age_seconds = temp_cleanup_age_seconds
@@ -142,7 +151,11 @@ class WebDAVStorageBackend:
         if destination.size != expected_size:
             return None
         try:
-            with self.open(key) as stream:
+            # webdav4 writes incrementally into this disk-backed handle. Avoid
+            # holding another full image in memory solely for verification.
+            with tempfile.TemporaryFile() as stream:
+                self.client.download_fileobj(self._path(key), stream)
+                stream.seek(0)
                 digest = hashlib.sha256()
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
@@ -253,16 +266,76 @@ class WebDAVStorageBackend:
                 self._delete_temporary_best_effort(tmp_key)
                 raise
 
-    def put_file(self, key: str, source: Path, *, overwrite: bool = True) -> ObjectStat:
+    def _publish_immutable_fileobj(self, key: str, file_obj, *, size: int, expected_sha256: str) -> ObjectStat:
+        """Publish a content-addressed key without the metadata + temporary MOVE protocol."""
+        normalized = normalize_storage_key(key)
+        final_path = self._path(normalized)
+        with _lock_for_path(f"file:{final_path}"):
+            self._mkdir_parents(normalized)
+            for attempt in range(len(self._retry_delays) + 1):
+                try:
+                    file_obj.seek(0)
+                    self.client.upload_fileobj(
+                        file_obj, final_path, overwrite=False, size=size
+                    )
+                except Exception as exc:
+                    status = self._status_code(exc)
+                    matching = self._destination_matches(
+                        normalized,
+                        expected_size=size,
+                        expected_sha256=expected_sha256,
+                    )
+                    if matching is not None:
+                        return matching
+                    if status in {409, 412}:
+                        raise StorageUnavailable(
+                            f"WebDAV immutable key collision ({status}) key={normalized}"
+                        ) from exc
+                    if not self._is_transient(exc) or attempt == len(self._retry_delays):
+                        raise StorageUnavailable(
+                            f"WebDAV direct upload failed ({status or 'network'})"
+                        ) from exc
+                    self._sleep(self._retry_delays[attempt])
+                    continue
+                final_stat = self._stat_visible(
+                    normalized,
+                    stage="final",
+                    retry_delays=self._final_visibility_retry_delays,
+                )
+                if final_stat.size != size:
+                    raise StorageUnavailable(
+                        f"WebDAV final size mismatch key={normalized} expected={size} actual={final_stat.size}"
+                    )
+                verified = self._destination_matches(
+                    normalized,
+                    expected_size=size,
+                    expected_sha256=expected_sha256,
+                )
+                if verified is None:
+                    raise StorageUnavailable(
+                        f"WebDAV final content mismatch key={normalized}"
+                    )
+                return verified
+        raise AssertionError("unreachable")
+
+    def put_file(self, key: str, source: Path, *, overwrite: bool = True, immutable: bool = False) -> ObjectStat:
         digest = hashlib.sha256()
         with source.open("rb") as hash_handle:
             for chunk in iter(lambda: hash_handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         with source.open("rb") as handle, self._publication_semaphore:
+            if immutable:
+                if overwrite:
+                    raise ValueError("immutable publication requires overwrite=False")
+                return self._publish_immutable_fileobj(key, handle, size=source.stat().st_size, expected_sha256=digest.hexdigest())
             return self._publish_fileobj(key, handle, size=source.stat().st_size, expected_sha256=digest.hexdigest(), overwrite=overwrite)
 
-    def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True) -> ObjectStat:
+    def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True, immutable: bool = False) -> ObjectStat:
         with self._publication_semaphore:
+            if immutable:
+                if overwrite:
+                    raise ValueError("immutable publication requires overwrite=False")
+                return self._publish_immutable_fileobj(key, io.BytesIO(content), size=len(content), expected_sha256=hashlib.sha256(content).hexdigest())
             return self._publish_fileobj(key, io.BytesIO(content), size=len(content), expected_sha256=hashlib.sha256(content).hexdigest(), overwrite=overwrite)
 
     def _maybe_cleanup_expired_uploads(self, prefix: str) -> None:

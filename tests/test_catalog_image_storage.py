@@ -30,7 +30,7 @@ def test_finalize_prepared_image_files_skips_upload_when_size_unchanged(monkeypa
         def open(self, key):
             return io.BytesIO(b"image")
 
-        def put_file(self, key, source, *, overwrite=True):
+        def put_file(self, key, source, *, overwrite=True, immutable=False):
             self.put_calls.append((key, source))
 
     storage = FakeStorage()
@@ -65,7 +65,7 @@ def test_finalize_prepared_image_files_uploads_same_size_different_content(monke
         def __init__(self): self.put_calls = []
         def stat(self, key): return ObjectStat(key=key, size=5)
         def open(self, key): return io.BytesIO(b"other")
-        def put_file(self, key, source, *, overwrite=True): self.put_calls.append((key, source.read_bytes()))
+        def put_file(self, key, source, *, overwrite=True, immutable=False): self.put_calls.append((key, source.read_bytes()))
 
     storage = FakeStorage()
     monkeypatch.setattr(module, "asset_storage", lambda: storage)
@@ -159,6 +159,36 @@ def test_image_service_does_not_add_backend_publication_semaphore(monkeypatch, t
     service.download_image_tasks(tasks)
 
     assert 2 < storage.maximum_active <= service.IMAGE_DOWNLOAD_MAX_WORKERS
+
+
+def test_source_download_parallelism_uses_its_own_configured_bound(monkeypatch, tmp_path):
+    from src.service.catalog import movie_image_service as module
+
+    active = maximum = 0
+    lock = threading.Lock()
+
+    class LocalStorage:
+        def exists(self, key): return False
+        def local_path(self, key): return tmp_path / key
+
+    def download(_url, path):
+        nonlocal active, maximum
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.02)
+        path.write_bytes(b"image")
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(module.settings.metadata, "image_download_max_workers", 2)
+    monkeypatch.setattr(module, "asset_storage", lambda: LocalStorage())
+    tasks = [ImagePersistTask("actor", str(i), f"actors/{i}.jpg", tmp_path / str(i)) for i in range(6)]
+
+    MovieImageService(image_downloader=download).download_image_tasks(tasks)
+
+    assert maximum == 2
 
 
 def test_optional_image_publication_failure_is_not_swallowed(monkeypatch, tmp_path):

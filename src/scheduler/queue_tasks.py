@@ -17,11 +17,13 @@ from src.scheduler.contracts import JobDefinition
 
 LANE_DEFAULT = "default"
 LANE_IMPORT = "import"
+LANE_IMAGE = "image"
 
 # 并发道容量：default 复刻 APS ThreadPoolExecutor(4)，导入道使用 2 并发。
 LANE_CONCURRENCY: dict[str, int] = {
     LANE_DEFAULT: 4,
     LANE_IMPORT: 2,
+    LANE_IMAGE: 2,
 }
 
 
@@ -41,6 +43,12 @@ def _run_gfriends_filetree_refresh(_reporter, params: dict[str, Any]) -> dict:
     return refresh_gfriends_filetree(force=force)
 
 
+def _run_image_publication(reporter, params: dict[str, Any]) -> dict:
+    from src.service.catalog.image_publication_service import ImagePublicationService
+
+    return ImagePublicationService.execute(reporter, params)
+
+
 QUEUE_TASK_REGISTRY: dict[str, JobDefinition] = {
     definition.task_key: definition
     for definition in (
@@ -52,6 +60,20 @@ QUEUE_TASK_REGISTRY: dict[str, JobDefinition] = {
             manual_only=True,
             handler=_run_library_import,
             lane=LANE_IMPORT,
+        ),
+        JobDefinition(
+            task_key="image_publication",
+            log_name="image-publication",
+            cli_name="image-publication",
+            cli_help="Publish one durable catalog image batch",
+            manual_only=True,
+            handler=_run_image_publication,
+            lane=LANE_IMAGE,
+            manual_trigger_allowed=True,
+            business_recovery=lambda: __import__(
+                "src.service.catalog.image_publication_service",
+                fromlist=["ImagePublicationService"],
+            ).ImagePublicationService.recover_interrupted(),
         ),
     )
 }

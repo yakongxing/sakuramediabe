@@ -31,6 +31,7 @@ from src.common.media_paths import (
 )
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import backoff_delay
+from src.config import settings
 from src.metadata._providers.models import JavdbMovieActorResource
 from src.model import Image, Movie, MoviePlotImage
 from src.service.catalog.image_cleanup_service import ImageCleanupService
@@ -76,6 +77,7 @@ class MovieImageService:
     IMAGE_DOWNLOAD_MAX_RETRIES = 6
     # 图片下载超时秒数
     IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 30
+    # Compatibility alias; runtime fan-out is controlled by settings.metadata.
     IMAGE_DOWNLOAD_MAX_WORKERS = 8
 
     def __init__(self, image_downloader: Callable[[str, Path], None] | None = None):
@@ -459,7 +461,7 @@ class MovieImageService:
 
         cover_download_errors: list[ImageDownloadError] = []
         publication_errors: list[StorageUnavailable] = []
-        with ThreadPoolExecutor(max_workers=min(self.IMAGE_DOWNLOAD_MAX_WORKERS, len(tasks_to_download)), thread_name_prefix="catalog-image") as executor:
+        with ThreadPoolExecutor(max_workers=min(settings.metadata.image_download_max_workers, len(tasks_to_download)), thread_name_prefix="catalog-image") as executor:
             future_map = {
                 executor.submit(self._download_movie_image_task, task, storage): task
                 for task in tasks_to_download
@@ -526,11 +528,14 @@ class MovieImageService:
     def download_image_tasks_to_temporary_files(
         self,
         image_tasks: list[ImagePersistTask],
+        *,
+        temp_root: Path | None = None,
     ) -> list[PreparedImageFile]:
         if not image_tasks:
             return []
 
-        temp_root = Path(tempfile.mkdtemp(prefix="catalog-refresh-"))
+        temp_root = temp_root or Path(tempfile.mkdtemp(prefix="catalog-refresh-"))
+        temp_root.mkdir(parents=True, exist_ok=True)
         prepared_files = [
             PreparedImageFile(
                 image_task=image_task,
@@ -541,7 +546,7 @@ class MovieImageService:
         ]
 
         try:
-            with ThreadPoolExecutor(max_workers=min(self.IMAGE_DOWNLOAD_MAX_WORKERS, len(prepared_files)), thread_name_prefix="catalog-refresh-image") as executor:
+            with ThreadPoolExecutor(max_workers=min(settings.metadata.image_download_max_workers, len(prepared_files)), thread_name_prefix="catalog-refresh-image") as executor:
                 future_map = {
                     executor.submit(self._download_prepared_image_file, prepared_file): prepared_file
                     for prepared_file in prepared_files
@@ -596,28 +601,37 @@ class MovieImageService:
         prepared_files: list[PreparedImageFile],
         *,
         created_keys: set[str] | None = None,
+        cleanup: bool = True,
     ) -> None:
+        if not prepared_files:
+            return
         storage = asset_storage()
-        for prepared_file in prepared_files:
+        def publish(prepared_file: PreparedImageFile) -> str | None:
             key = prepared_file.image_task.relative_path
-            if self._prepared_matches_storage(storage, key, prepared_file.temp_path):
+            if not getattr(storage, "supports_direct_immutable_put", False) and self._prepared_matches_storage(storage, key, prepared_file.temp_path):
                 logger.debug("Catalog image unchanged, skip upload key={}", key)
-                continue
+                return None
             try:
-                storage.put_file(key, prepared_file.temp_path, overwrite=False)
+                storage.put_file(key, prepared_file.temp_path, overwrite=False, immutable=True)
             except StoragePublicationUnknown:
-                if created_keys is not None:
-                    created_keys.add(key)
                 raise
             except FileExistsError:
                 if self._prepared_matches_storage(storage, key, prepared_file.temp_path):
-                    continue
+                    return None
                 raise StorageUnavailable(f"Immutable image key collision key={key}") from None
-            if created_keys is not None:
-                created_keys.add(key)
+            return key
 
-        for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
-            shutil.rmtree(temp_root, ignore_errors=True)
+        with ThreadPoolExecutor(
+            max_workers=min(settings.storage.webdav_publication_max_workers, len(prepared_files)),
+            thread_name_prefix="image-publication",
+        ) as executor:
+            for key in executor.map(publish, prepared_files):
+                if key is not None and created_keys is not None:
+                    created_keys.add(key)
+
+        if cleanup:
+            for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
     @staticmethod
     def delete_image_files_best_effort(keys: Iterable[str]) -> None:

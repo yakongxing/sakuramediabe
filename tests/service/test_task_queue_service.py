@@ -46,8 +46,12 @@ def test_enqueue_creates_pending_queue_row(test_db):
 
 
 def test_enqueue_scheduled_coalesces_when_same_task_is_queued(test_db):
-    first = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
-    second = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    first = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
+    second = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
 
     assert first is not None
     assert second is None
@@ -55,7 +59,9 @@ def test_enqueue_scheduled_coalesces_when_same_task_is_queued(test_db):
 
 
 def test_enqueue_manual_conflict_raises_with_blocking_run_id(test_db):
-    blocking = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    blocking = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
 
     with pytest.raises(TaskQueueConflictError) as exc_info:
         TaskQueueService.enqueue(
@@ -68,19 +74,27 @@ def test_enqueue_manual_conflict_raises_with_blocking_run_id(test_db):
 def test_enqueue_allowed_again_after_terminal_state_releases_mutex(test_db):
     from src.service.system import ActivityService
 
-    first = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    first = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
     ActivityService.fail_task_run(first.id, error_message="boom", notify_result=False)
 
-    second = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    second = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
 
     assert second is not None
     assert second.id != first.id
 
 
 def test_claim_next_claims_earliest_due_row_and_sets_lease(test_db):
-    first = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    first = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
     # 用不同 task_key 绕过 scheduled coalesce，验证按 id 顺序领取两行。
-    second = TaskQueueService.enqueue(task_key="actor_subscription_sync", trigger_type="scheduled")
+    second = TaskQueueService.enqueue(
+        task_key="actor_subscription_sync", trigger_type="scheduled"
+    )
 
     claimed = TaskQueueService.claim_next(lease_seconds=120)
 
@@ -98,22 +112,36 @@ def test_claim_next_skips_future_schedule(test_db):
     queued = TaskQueueService.enqueue(
         task_key="movie_heat_update", trigger_type="scheduled"
     )
-    BackgroundTaskRun.update(
-        scheduled_at=utc_now_for_db() + timedelta(hours=1)
-    ).where(BackgroundTaskRun.id == queued.id).execute()
+    BackgroundTaskRun.update(scheduled_at=utc_now_for_db() + timedelta(hours=1)).where(
+        BackgroundTaskRun.id == queued.id
+    ).execute()
 
     assert TaskQueueService.claim_next() is None
 
 
+def test_enqueue_accepts_explicit_future_schedule_without_sleep(test_db):
+    scheduled_at = utc_now_for_db() + timedelta(minutes=7)
+    queued = TaskQueueService.enqueue(
+        task_key="delayed_internal", trigger_type="internal", scheduled_at=scheduled_at
+    )
+
+    assert BackgroundTaskRun.get_by_id(queued.id).scheduled_at == scheduled_at
+    assert TaskQueueService.claim_next() is None
+
+
 def test_recover_expired_leases_fails_run_and_releases_mutex(test_db):
-    stale = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    stale = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
     TaskQueueService.claim_next(lease_seconds=60)
     # 直接把租约拨到过去，模拟持有者进程死亡后停止续租。
     BackgroundTaskRun.update(
         lease_expires_at=utc_now_for_db() - timedelta(seconds=1)
     ).where(BackgroundTaskRun.id == stale.id).execute()
     # running 行仍持有 mutex，必须换 task_key 才能再入队一行为"健康对照"。
-    healthy = TaskQueueService.enqueue(task_key="actor_subscription_sync", trigger_type="scheduled")
+    healthy = TaskQueueService.enqueue(
+        task_key="actor_subscription_sync", trigger_type="scheduled"
+    )
     TaskQueueService.claim_next(lease_seconds=3600)
 
     recovered = TaskQueueService.recover_expired_leases()
@@ -131,11 +159,16 @@ def test_recover_expired_leases_fails_run_and_releases_mutex(test_db):
     healthy_row = BackgroundTaskRun.get_by_id(healthy.id)
     assert healthy_row.state == "running"
     # mutex 释放后同 task_key 可再次入队。
-    assert TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled") is not None
+    assert (
+        TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+        is not None
+    )
 
 
 def test_renew_leases_extends_running_rows_only(test_db):
-    run = TaskQueueService.enqueue(task_key="movie_heat_update", trigger_type="scheduled")
+    run = TaskQueueService.enqueue(
+        task_key="movie_heat_update", trigger_type="scheduled"
+    )
     TaskQueueService.claim_next(lease_seconds=60)
     before = BackgroundTaskRun.get_by_id(run.id).lease_expires_at
 
@@ -146,8 +179,23 @@ def test_renew_leases_extends_running_rows_only(test_db):
     assert after > before
     # pending 行不续租。
     # running 行仍持有 mutex，用另一个 task_key 造 pending 对照行。
-    queued = TaskQueueService.enqueue(task_key="actor_subscription_sync", trigger_type="scheduled")
+    queued = TaskQueueService.enqueue(
+        task_key="actor_subscription_sync", trigger_type="scheduled"
+    )
     assert TaskQueueService.renew_leases([queued.id]) == 0
+
+
+def test_enqueue_unserialized_allows_multiple_durable_work_items(test_db):
+    first = TaskQueueService.enqueue(
+        task_key="image_publication", trigger_type="internal", serialized=False
+    )
+    second = TaskQueueService.enqueue(
+        task_key="image_publication", trigger_type="internal", serialized=False
+    )
+
+    assert first is not None and second is not None
+    assert first.id != second.id
+    assert first.mutex_key is None and second.mutex_key is None
 
 
 def test_bootstrap_blocker_settlement_is_restricted_to_builtin_bootstrap_keys(test_db):
@@ -228,14 +276,15 @@ def test_expired_lease_recovery_skips_row_when_heartbeat_holds_lock(test_db):
     assert recovered == []
     assert stored.state == "running"
     assert stored.lease_expires_at > utc_now_for_db()
-    assert SystemNotification.select().where(
-        SystemNotification.related_task_run == queued.id
-    ).count() == 0
+    assert (
+        SystemNotification.select()
+        .where(SystemNotification.related_task_run == queued.id)
+        .count()
+        == 0
+    )
 
 
-def test_expired_lease_recovery_wins_before_heartbeat_update(
-    test_db, monkeypatch
-):
+def test_expired_lease_recovery_wins_before_heartbeat_update(test_db, monkeypatch):
     from src.model import SystemNotification
     from src.service.system.activity.task_runs import TaskRunService
 
@@ -280,9 +329,12 @@ def test_expired_lease_recovery_wins_before_heartbeat_update(
     assert stored.state == "failed"
     assert stored.mutex_key is None
     assert stored.lease_expires_at is None
-    assert SystemNotification.select().where(
-        SystemNotification.related_task_run == queued.id
-    ).count() == 1
+    assert (
+        SystemNotification.select()
+        .where(SystemNotification.related_task_run == queued.id)
+        .count()
+        == 1
+    )
 
 
 def test_concurrent_expired_lease_recovery_has_single_winner_and_notification(test_db):
@@ -294,9 +346,7 @@ def test_concurrent_expired_lease_recovery_has_single_winner_and_notification(te
     def recover() -> list[int]:
         with test_db.connection_context():
             barrier.wait()
-            return [
-                run.id for run in TaskQueueService.recover_expired_leases()
-            ]
+            return [run.id for run in TaskQueueService.recover_expired_leases()]
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(recover)
@@ -307,6 +357,9 @@ def test_concurrent_expired_lease_recovery_has_single_winner_and_notification(te
     assert sorted(results, key=len) == [[], [queued.id]]
     assert stored.state == "failed"
     assert stored.lease_expires_at is None
-    assert SystemNotification.select().where(
-        SystemNotification.related_task_run == queued.id
-    ).count() == 1
+    assert (
+        SystemNotification.select()
+        .where(SystemNotification.related_task_run == queued.id)
+        .count()
+        == 1
+    )

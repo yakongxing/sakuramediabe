@@ -12,12 +12,18 @@ BUSINESS_RECOVERY_HANDLERS: dict[str, Callable[[], object]] = {
     "library_import": ImportTaskService.recover_interrupted_downloads,
 }
 
+# These handlers reconcile durable state which may exist without any queue row.
+# They must run independently of lease recovery during every worker housekeeping
+# pass (including the synchronous pass at worker startup).
+HOUSEKEEPING_RECOVERY_TASK_KEYS = frozenset({"image_publication"})
+
 def recover_business_states(task_keys: set[str]) -> None:
     """优先调用 JobDefinition 声明的恢复钩子，队列专属任务再查宿主注册表。"""
+    from src.scheduler.queue_tasks import QUEUE_TASK_REGISTRY
     from src.scheduler.registry import JOB_REGISTRY_BY_KEY
 
     for task_key in sorted(task_keys):
-        job_def = JOB_REGISTRY_BY_KEY.get(task_key)
+        job_def = JOB_REGISTRY_BY_KEY.get(task_key) or QUEUE_TASK_REGISTRY.get(task_key)
         handler = (
             job_def.business_recovery
             if job_def is not None and job_def.business_recovery is not None
@@ -31,3 +37,8 @@ def recover_business_states(task_keys: set[str]) -> None:
             )
         except Exception:
             logger.exception("Business recovery failed task_key={}", task_key)
+
+
+def recover_housekeeping_states(task_keys: set[str] | None = None) -> None:
+    """Recover expired-run state plus queue-independent durable journals."""
+    recover_business_states(set(task_keys or ()) | HOUSEKEEPING_RECOVERY_TASK_KEYS)

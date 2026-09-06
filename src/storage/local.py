@@ -1,4 +1,3 @@
-import io
 import os
 import shutil
 import tempfile
@@ -28,7 +27,7 @@ class LocalStorageBackend:
         except StorageNotFound: return False
         return True
 
-    def put_file(self, key: str, source: Path, *, overwrite: bool = True) -> ObjectStat:
+    def put_file(self, key: str, source: Path, *, overwrite: bool = True, immutable: bool = False) -> ObjectStat:
         target = self.local_path(key)
         target.parent.mkdir(parents=True, exist_ok=True)
         if not overwrite and target.exists(): raise FileExistsError(key)
@@ -36,16 +35,22 @@ class LocalStorageBackend:
         os.close(fd)
         try:
             shutil.copyfile(source, temporary)
-            os.replace(temporary, target)
+            if overwrite:
+                os.replace(temporary, target)
+            else:
+                # Atomic create-if-absent; the earlier exists check is only a
+                # fast path and must not permit a concurrent overwrite.
+                os.link(temporary, target)
+                os.unlink(temporary)
         finally:
             try: os.unlink(temporary)
             except FileNotFoundError: pass
         return self.stat(key)
 
-    def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True) -> ObjectStat:
+    def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True, immutable: bool = False) -> ObjectStat:
         with tempfile.NamedTemporaryFile() as source:
             source.write(content); source.flush()
-            return self.put_file(key, Path(source.name), overwrite=overwrite)
+            return self.put_file(key, Path(source.name), overwrite=overwrite, immutable=immutable)
 
     def open(self, key: str):
         try: return self.local_path(key).open("rb")

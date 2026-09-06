@@ -34,15 +34,19 @@ class ImageCleanupService:
         return any(
             (
                 database.table_exists(Movie._meta.table_name)
-                and Movie.select(Movie.id).where(
-                    (Movie.cover_image == image) | (Movie.thin_cover_image == image)
-                ).exists(),
+                and Movie.select(Movie.id)
+                .where((Movie.cover_image == image) | (Movie.thin_cover_image == image))
+                .exists(),
                 database.table_exists(Actor._meta.table_name)
                 and Actor.select(Actor.id).where(Actor.profile_image == image).exists(),
                 database.table_exists(MoviePlotImage._meta.table_name)
-                and MoviePlotImage.select(MoviePlotImage.id).where(MoviePlotImage.image == image).exists(),
+                and MoviePlotImage.select(MoviePlotImage.id)
+                .where(MoviePlotImage.image == image)
+                .exists(),
                 database.table_exists(MediaThumbnail._meta.table_name)
-                and MediaThumbnail.select(MediaThumbnail.id).where(MediaThumbnail.image == image).exists(),
+                and MediaThumbnail.select(MediaThumbnail.id)
+                .where(MediaThumbnail.image == image)
+                .exists(),
             )
         )
 
@@ -50,8 +54,31 @@ class ImageCleanupService:
     def delete_obsolete_image_files(cls, relative_paths: set[str]) -> None:
         if not relative_paths:
             return
+        # A cleanup may be retried after a committed publication. A replay can
+        # have attached the same content-addressed key again, so fail closed at
+        # the last possible moment rather than deleting a live object.
+        referenced_paths: set[str] = set()
+        try:
+            images = Image.select(
+                Image.origin, Image.small, Image.medium, Image.large
+            ).where(
+                (Image.origin.in_(relative_paths))
+                | (Image.small.in_(relative_paths))
+                | (Image.medium.in_(relative_paths))
+                | (Image.large.in_(relative_paths))
+            )
+            for image in images:
+                referenced_paths.update(
+                    path
+                    for path in (image.origin, image.small, image.medium, image.large)
+                    if path
+                )
+        except (AttributeError, RuntimeError):
+            # Some isolated storage tests intentionally run without a database.
+            # Production cleanup is only invoked with an initialized database.
+            pass
         storage = asset_storage()
-        for relative_path in relative_paths:
+        for relative_path in relative_paths - referenced_paths:
             if not relative_path:
                 continue
             storage.delete(relative_path, missing_ok=True)

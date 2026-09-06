@@ -21,11 +21,20 @@ ALLOWED_TASK_TRIGGER_TYPES = {"scheduled", "manual", "startup", "internal"}
 ALLOWED_TASK_STATES = {"pending", "running", "completed", "failed"}
 ACTIVE_TASK_RUN_STATES = {"pending", "running"}
 TASK_RUN_SORT_FIELDS = {
-    "started_at:desc": (BackgroundTaskRun.started_at.desc(), BackgroundTaskRun.id.desc()),
+    "started_at:desc": (
+        BackgroundTaskRun.started_at.desc(),
+        BackgroundTaskRun.id.desc(),
+    ),
     "started_at:asc": (BackgroundTaskRun.started_at.asc(), BackgroundTaskRun.id.asc()),
-    "created_at:desc": (BackgroundTaskRun.created_at.desc(), BackgroundTaskRun.id.desc()),
+    "created_at:desc": (
+        BackgroundTaskRun.created_at.desc(),
+        BackgroundTaskRun.id.desc(),
+    ),
     "created_at:asc": (BackgroundTaskRun.created_at.asc(), BackgroundTaskRun.id.asc()),
-    "updated_at:desc": (BackgroundTaskRun.updated_at.desc(), BackgroundTaskRun.id.desc()),
+    "updated_at:desc": (
+        BackgroundTaskRun.updated_at.desc(),
+        BackgroundTaskRun.id.desc(),
+    ),
     "updated_at:asc": (BackgroundTaskRun.updated_at.asc(), BackgroundTaskRun.id.asc()),
 }
 
@@ -40,7 +49,9 @@ def now() -> datetime:
     return utc_now_for_db()
 
 
-def merge_summary(base_summary: dict[str, Any], summary_patch: dict[str, Any] | None) -> dict[str, Any]:
+def merge_summary(
+    base_summary: dict[str, Any], summary_patch: dict[str, Any] | None
+) -> dict[str, Any]:
     if not summary_patch:
         return dict(base_summary)
     merged = dict(base_summary)
@@ -115,16 +126,23 @@ class TaskRunService:
         if normalized_state is not None:
             query = query.where(BackgroundTaskRun.state == normalized_state)
         if normalized_trigger_type is not None:
-            query = query.where(BackgroundTaskRun.trigger_type == normalized_trigger_type)
+            query = query.where(
+                BackgroundTaskRun.trigger_type == normalized_trigger_type
+            )
         if normalized_task_key is not None:
             query = query.where(BackgroundTaskRun.task_key == normalized_task_key)
         return query.order_by(*order_by)
 
     @classmethod
-    def page_task_runs(cls, query, *, page: int, page_size: int) -> PageResponse[TaskRunResource]:
+    def page_task_runs(
+        cls, query, *, page: int, page_size: int
+    ) -> PageResponse[TaskRunResource]:
         total = query.count()
         start = (page - 1) * page_size
-        items = [cls.to_task_run_resource(item) for item in query.offset(start).limit(page_size)]
+        items = [
+            cls.to_task_run_resource(item)
+            for item in query.offset(start).limit(page_size)
+        ]
         return PageResponse[TaskRunResource](
             items=items, page=page, page_size=page_size, total=total
         )
@@ -139,6 +157,7 @@ class TaskRunService:
         state: str = "pending",
         mutex_key: str | None = None,
         params: dict[str, Any] | None = None,
+        scheduled_at: datetime | None = None,
     ) -> BackgroundTaskRun:
         normalized_trigger_type = normalize_allowed_filter(
             trigger_type,
@@ -158,7 +177,7 @@ class TaskRunService:
                 started_at=now() if normalized_state == "running" else None,
                 result_summary={},
                 params=params,
-                scheduled_at=now(),
+                scheduled_at=scheduled_at or now(),
             )
             return task_run
 
@@ -260,8 +279,12 @@ class TaskRunService:
             task_run.finished_at = now()
             task_run.mutex_key = None
             task_run.lease_expires_at = None
-            task_run.result_summary = merge_summary(task_run.result_summary or {}, result_summary)
-            task_run.result_text = result_text or format_result_text(task_run.result_summary)
+            task_run.result_summary = merge_summary(
+                task_run.result_summary or {}, result_summary
+            )
+            task_run.result_text = result_text or format_result_text(
+                task_run.result_summary
+            )
             task_run.updated_at = now()
             task_run.save()
             if notify_result:

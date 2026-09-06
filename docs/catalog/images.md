@@ -122,3 +122,22 @@ GET /files/images/movies/24/SONE-210/cover.jpg?expires=1700000900&signature=<sig
 - `ImageResource` 是嵌入式资源，不提供 `/images/{id}` 这类单独详情接口
 - 当前没有真实多尺寸图片生成逻辑，因此 `origin/small/medium/large` 只是统一接口形态
 - 历史旧导入数据如果路径结构不符合当前规范，可能无法通过文件路由访问
+
+### WebDAV 发布队列
+
+WebDAV 新导入和严格刷新都会先把下载结果写入持久化 staging，再向数据库任务队列提交
+`image_publication`。API 返回时仍保留旧图片引用；worker 以内容哈希版本 key 直接 PUT，
+读回校验成功后才在事务内切换引用。失败的 task run 和 staging 会保留并按配置重试，
+进程重启会从 PostgreSQL 队列及 staging manifest 恢复遗漏的 hand-off。终态失败 staging
+保留七天供诊断后清理，损坏的 staging 默认保留一天后清理。
+
+保守默认值及环境覆盖：
+
+- `metadata.image_download_max_workers = 8` / `METADATA__IMAGE_DOWNLOAD_MAX_WORKERS`
+- `storage.webdav_publication_max_workers = 4` / `STORAGE__WEBDAV_PUBLICATION_MAX_WORKERS`
+- `storage.image_publication_staging_root = "/data/cache/image-publication"` / `STORAGE__IMAGE_PUBLICATION_STAGING_ROOT`
+- `storage.image_publication_retry_limit = 3` / `STORAGE__IMAGE_PUBLICATION_RETRY_LIMIT`
+- `storage.image_publication_failed_retention_seconds = 604800` / `STORAGE__IMAGE_PUBLICATION_FAILED_RETENTION_SECONDS`
+- `storage.image_publication_invalid_stage_grace_seconds = 86400` / `STORAGE__IMAGE_PUBLICATION_INVALID_STAGE_GRACE_SECONDS`
+
+staging 根目录必须位于持久化 `/data` 卷。配置变更后需重启 API 与 APS worker。

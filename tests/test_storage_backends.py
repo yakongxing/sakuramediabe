@@ -29,6 +29,20 @@ def test_local_backend_round_trip(tmp_path):
     assert not backend.exists("movies/a.jpg")
 
 
+def test_local_backend_failed_copy_never_truncates_existing_target(monkeypatch, tmp_path):
+    backend = LocalStorageBackend(tmp_path / "assets")
+    backend.put_bytes("movies/a.jpg", b"old")
+    source = tmp_path / "new.jpg"
+    source.write_bytes(b"new")
+    monkeypatch.setattr("src.storage.local.shutil.copyfile", lambda *args: (_ for _ in ()).throw(OSError("disk")))
+
+    with pytest.raises(OSError, match="disk"):
+        backend.put_file("movies/a.jpg", source)
+
+    with backend.open("movies/a.jpg") as handle:
+        assert handle.read() == b"old"
+
+
 def test_webdav_backend_maps_namespace(monkeypatch):
     from src.storage import webdav as module
 
@@ -91,6 +105,60 @@ def test_webdav_put_file_publishes_through_temporary_key(monkeypatch, tmp_path):
     moves = [call for call in calls if call[0] == "move"]
     assert moves == [("move", uploads[0][1], "tenant/assets/movies/cover.jpg", True)]
     assert all(call[1] != "tenant/assets/movies/cover.jpg" for call in uploads)
+
+
+def test_webdav_immutable_put_uploads_directly_to_final_key(monkeypatch, tmp_path):
+    from src.storage import webdav as module
+
+    uploads = []
+    moves = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs): pass
+        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def info(self, path):
+            assert uploads, "immutable publication must not stat the new final key before PUT"
+            return {"size": 5, "type": "file"}
+        def upload_fileobj(self, stream, path, overwrite, size):
+            uploads.append((path, overwrite, size, stream.read()))
+        def move(self, *args, **kwargs): moves.append((args, kwargs))
+        def download_fileobj(self, path, target): target.write(b"image")
+        def ls(self, *args, **kwargs): return []
+
+    monkeypatch.setattr(module, "Client", FakeClient)
+    monkeypatch.setattr(module.httpx, "Client", lambda **kwargs: object())
+    source = tmp_path / "cover.jpg"
+    source.write_bytes(b"image")
+    backend = module.WebDAVStorageBackend("https://dav.example/root", "assets")
+
+    result = backend.put_file(
+        "movies/a/cover-deadbeef.jpg", source, overwrite=False, immutable=True
+    )
+
+    assert result.size == 5
+    assert uploads == [("assets/movies/a/cover-deadbeef.jpg", False, 5, b"image")]
+    assert moves == []
+
+
+def test_webdav_immutable_put_rejects_same_size_wrong_content(monkeypatch, tmp_path):
+    from src.storage import webdav as module
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs): pass
+        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def upload_fileobj(self, *args, **kwargs): pass
+        def info(self, path): return {"size": 5, "type": "file", "etag": "not-a-hash"}
+        def download_fileobj(self, path, target): target.write(b"wrong")
+
+    monkeypatch.setattr(module, "Client", FakeClient)
+    monkeypatch.setattr(module.httpx, "Client", lambda **kwargs: object())
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"image")
+
+    with pytest.raises(module.StorageUnavailable, match="content mismatch"):
+        module.WebDAVStorageBackend("https://dav.example", "assets").put_file(
+            "movies/a/hash.jpg", source, overwrite=False, immutable=True
+        )
 
 
 def test_webdav_put_retries_eventual_temp_visibility_404(monkeypatch):

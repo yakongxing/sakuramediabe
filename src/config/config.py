@@ -112,7 +112,15 @@ class Storage(BaseModel):
     pool_timeout_seconds: float = Field(default=10.0, gt=0)
     upload_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
     download_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
-    webdav_publication_max_workers: int = Field(default=2, ge=1, le=8)
+    # Global WebDAV PUT bound, shared by publication jobs and independent of HTTP downloads.
+    webdav_publication_max_workers: int = Field(default=4, ge=1, le=16)
+    # Persistent hand-off area. It must be mounted with the rest of /data.
+    image_publication_staging_root: str = "/data/cache/image-publication"
+    image_publication_retry_limit: int = Field(default=3, ge=0, le=10)
+    # Failed journals remain inspectable for a bounded period, while malformed
+    # partial stages get a shorter grace period before recovery removes them.
+    image_publication_failed_retention_seconds: int = Field(default=604800, ge=60)
+    image_publication_invalid_stage_grace_seconds: int = Field(default=86400, ge=60)
     webdav_final_visibility_retry_seconds: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
     webdav_temp_cleanup_interval_seconds: float = Field(default=3600, ge=60)
     webdav_temp_cleanup_age_seconds: float = Field(default=86400, ge=3600)
@@ -127,6 +135,16 @@ class Storage(BaseModel):
             parsed = urlparse(self.webdav_base_url.strip())
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("storage.webdav_base_url must be an http(s) URL")
+            staging = Path(self.image_publication_staging_root).expanduser()
+            if not staging.is_absolute():
+                raise ValueError("storage.image_publication_staging_root must be absolute")
+            # A WebDAV hand-off is only durable if it is outside conventional
+            # volatile runtime filesystems. Deployments should mount /data.
+            resolved = staging.resolve()
+            if resolved == Path("/tmp") or Path("/tmp") in resolved.parents:
+                raise ValueError(
+                    "storage.image_publication_staging_root must use persistent storage"
+                )
         return self
 
 class Metadata(BaseModel):
@@ -137,6 +155,8 @@ class Metadata(BaseModel):
     gfriends_filetree_cache_path: str = "/data/cache/gfriends/gfriends-filetree.json"
     gfriends_filetree_cache_ttl_hours: int = 24 * 7
     import_metadata_max_workers: int = 3
+    # Bounded source-image HTTP downloads; deliberately separate from storage PUTs.
+    image_download_max_workers: int = Field(default=8, ge=1, le=32)
 
     @field_validator("gfriends_filetree_url", "gfriends_cdn_base_url")
     @classmethod
@@ -302,6 +322,11 @@ _STORAGE_ENV_MAP = {
     "STORAGE__POOL_TIMEOUT_SECONDS": "pool_timeout_seconds",
     "STORAGE__UPLOAD_CHUNK_SIZE": "upload_chunk_size",
     "STORAGE__DOWNLOAD_CHUNK_SIZE": "download_chunk_size",
+    "STORAGE__WEBDAV_PUBLICATION_MAX_WORKERS": "webdav_publication_max_workers",
+    "STORAGE__IMAGE_PUBLICATION_STAGING_ROOT": "image_publication_staging_root",
+    "STORAGE__IMAGE_PUBLICATION_RETRY_LIMIT": "image_publication_retry_limit",
+    "STORAGE__IMAGE_PUBLICATION_FAILED_RETENTION_SECONDS": "image_publication_failed_retention_seconds",
+    "STORAGE__IMAGE_PUBLICATION_INVALID_STAGE_GRACE_SECONDS": "image_publication_invalid_stage_grace_seconds",
 }
 
 
@@ -323,6 +348,10 @@ def _deployment_env_settings() -> dict[str, Any]:
     }
     if storage_values:
         data["storage"] = storage_values
+    if "METADATA__IMAGE_DOWNLOAD_MAX_WORKERS" in os.environ:
+        data.setdefault("metadata", {})["image_download_max_workers"] = os.environ[
+            "METADATA__IMAGE_DOWNLOAD_MAX_WORKERS"
+        ]
     return data
 
 

@@ -15,7 +15,7 @@ pending 的 BackgroundTaskRun 行即队列元素，四个原语：
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from peewee import IntegrityError, fn
@@ -60,12 +60,14 @@ class TaskQueueService:
         task_name: str | None = None,
         params: dict[str, Any] | None = None,
         conflict: str = "skip",
+        serialized: bool = True,
+        scheduled_at: datetime | None = None,
     ) -> BackgroundTaskRun | None:
         """入队一次执行。conflict="skip" 返回 None（scheduled 的 coalesce 语义），
         conflict="raise" 抛 TaskQueueConflictError 并带上阻塞方 run id（manual 用）。"""
         if conflict not in ("skip", "raise"):
             raise ValueError(f"unsupported_conflict_policy: {conflict}")
-        mutex_key = cls.build_mutex_key(task_key)
+        mutex_key = cls.build_mutex_key(task_key) if serialized else None
         try:
             return TaskRunService.create_task_run(
                 task_key=task_key,
@@ -74,6 +76,7 @@ class TaskQueueService:
                 state="pending",
                 mutex_key=mutex_key,
                 params=params,
+                scheduled_at=scheduled_at,
             )
         except IntegrityError:
             if conflict == "skip":
