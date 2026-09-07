@@ -43,7 +43,11 @@ from src.model import (
     MovieTag,
     Tag,
 )
-from src.plugins.provider_protocol import MEDIA_PROVIDER_REGISTRY
+from src.plugins.provider_protocol import (
+    MEDIA_PROVIDER_REGISTRY,
+    ProviderOperationError,
+    ProviderUnavailableError,
+)
 from src.schema.catalog.actors import ImageResource
 from src.schema.catalog.movies import (
     MovieBlacklistBatchRequest,
@@ -70,6 +74,7 @@ from src.schema.catalog.movies import (
 from src.schema.common.pagination import PageResponse
 from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
 from src.service.collections import PlaylistService
+from src.service.playback.provider_helpers import library_handle_for, media_handle_for
 
 
 class MovieService:
@@ -388,11 +393,12 @@ class MovieService:
                     last_watched_at=progress.last_watched_at,
                 )
             media.points = points_by_media_id.get(media.id, [])
-            media.play_url = build_signed_media_url(media.id)
-            media.provider_key = media.library.provider_key if media.library_id is not None else None
-            media.playback_deliveries = list(
-                MEDIA_PROVIDER_REGISTRY.require(media.library.provider_key).playback_deliveries
+            bundle = MEDIA_PROVIDER_REGISTRY.require(media.library.provider_key)
+            media.play_url = build_signed_media_url(
+                media.id, delivery=bundle.playback_deliveries[0]
             )
+            media.provider_key = media.library.provider_key
+            media.playback_deliveries = list(bundle.playback_deliveries)
             resources.append(MovieMediaResource.from_attributes_model(media))
         return resources
 
@@ -450,6 +456,24 @@ class MovieService:
         for library, medias, playback_format in cls._merge_playback_groups(movie):
             if library.id != library_id:
                 continue
+            try:
+                storage = MEDIA_PROVIDER_REGISTRY.storage_for(library_handle_for(library))
+                preflight_merged_playback = getattr(storage, "preflight_merged_playback", None)
+                if callable(preflight_merged_playback):
+                    preflight_merged_playback(
+                        medias=tuple(media_handle_for(media) for media in medias)
+                    )
+            except ProviderUnavailableError as exc:
+                raise ApiError(503, "provider_not_installed", "媒体提供方未安装") from exc
+            except ProviderOperationError as exc:
+                status_code = {
+                    "source_not_found": 404,
+                    "authentication_failed": 401,
+                    "unavailable": 503,
+                    "invalid_config": 422,
+                    "unsupported": 422,
+                }[exc.code]
+                raise ApiError(status_code, f"provider_{exc.code}", exc.safe_message) from exc
             resource_path = "stream.mp4" if playback_format == "mp4" else "index.m3u8"
             return MovieMergedPlaybackResource(
                 play_url=build_signed_merged_media_url(
@@ -693,6 +717,8 @@ class MovieService:
     ) -> list[JavdbMovieReviewResource]:
         movie = cls._require_movie(movie_number)
         sort_value = sort.value if isinstance(sort, MovieReviewSort) else str(sort)
+        if not movie.javdb_id:
+            return []
         try:
             return build_javdb_provider().get_movie_reviews_by_javdb_id(
                 movie.javdb_id,
@@ -825,28 +851,32 @@ class MovieService:
         blacklisted: bool,
     ) -> None:
         ordered_keys, display_by_key = cls._dedup_movie_number_keys(payload.movie_numbers)
-        movies = list(Movie.select().where(fn.UPPER(Movie.movie_number).in_(ordered_keys)))
-        matched_keys = {movie.movie_number.strip().upper() for movie in movies}
-        missing = [display_by_key[key] for key in ordered_keys if key not in matched_keys]
-        if missing:
-            raise ApiError(
-                404,
-                "movie_not_found",
-                "影片不存在",
-                {"movie_numbers": missing},
+        with Movie._meta.database.atomic():
+            movies = list(
+                Movie.select().where(fn.UPPER(Movie.movie_number).in_(ordered_keys))
+                .order_by(Movie.id).for_update()
             )
-        if blacklisted:
-            subscribed = [movie.movie_number for movie in movies if movie.is_subscribed]
-            if subscribed:
+            matched_keys = {movie.movie_number.strip().upper() for movie in movies}
+            missing = [display_by_key[key] for key in ordered_keys if key not in matched_keys]
+            if missing:
                 raise ApiError(
-                    409,
-                    "movie_is_subscribed",
-                    "已订阅影片不能加入黑名单，请先取消订阅",
-                    {"movie_numbers": subscribed},
+                    404,
+                    "movie_not_found",
+                    "影片不存在",
+                    {"movie_numbers": missing},
                 )
-        Movie.update(is_blacklisted=blacklisted).where(
-            Movie.id.in_([movie.id for movie in movies])
-        ).execute()
+            if blacklisted:
+                subscribed = [movie.movie_number for movie in movies if movie.is_subscribed]
+                if subscribed:
+                    raise ApiError(
+                        409,
+                        "movie_is_subscribed",
+                        "已订阅影片不能加入黑名单，请先取消订阅",
+                        {"movie_numbers": subscribed},
+                    )
+            MovieOwnershipGateway.update_host_manual(
+                [movie.id for movie in movies], {"is_blacklisted": blacklisted}
+            )
 
     @classmethod
     def batch_set_subscription(

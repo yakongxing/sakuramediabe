@@ -1,6 +1,16 @@
 # API 设计约定
 
-本文件定义 SakuraMedia API 的统一约定。所有资源文档都应遵循这里的规则。
+本文件是 SakuraMedia API 的统一设计约定。新增或修改接口时遵循本文；具体路径、参数和响应结构以代码中的路由、Schema 和生成的 OpenAPI 为准，不再维护逐接口文档。本文描述设计要求，不代表现有接口已全部完成对齐。
+
+## 设计原则
+
+- 面向业务资源设计接口，以清晰的资源边界和 HTTP 语义表达行为。
+- 同类接口保持一致的命名、参数、响应和错误语义，避免让客户端为相同能力编写多套处理逻辑。
+- 请求和响应通过 Schema 明确定义并校验，不直接暴露数据库模型、内部路径或敏感凭据。
+- router 只负责参数接入、依赖与响应，业务编排放在 service，避免在接口层堆积复杂逻辑。
+- 读取操作不改变业务状态；耗时操作建模为任务资源，返回任务标识供客户端查询进度和结果。
+- 默认要求认证，普通接口通过统一依赖校验身份，媒体文件通过 URL 签名校验访问权限；校验通过后才能读取数据或执行操作。
+- 只实现当前需求，不为未确定的场景增加抽象、兼容分支或额外接口。
 
 ## 路径与资源命名
 
@@ -113,9 +123,13 @@
 
 ## 认证约定
 
-- 除登录接口外，所有接口都要求 Bearer Token
-- 登录接口定义在 `auth` 资源下（如 `/auth/tokens`）
-- 偏离默认规则时，必须在资源文档中单独注明
+- **除登录接口外，所有接口均需鉴权：普通接口使用 Bearer Token，媒体文件使用 URL 签名校验。**
+- 登录接口使用账号密码换取令牌，无需预先提供 Bearer Token；入口为 `POST /auth/tokens`，`POST /auth/docs-token` 是 API 调试文档使用的同类登录入口。
+- 除媒体文件访问外，其他接口统一使用 `Authorization: Bearer <access_token>`，通过共享的 `get_current_user` 依赖完成认证；令牌刷新、状态查询、媒体信息查询及插件管理接口均遵守此规则。
+- 媒体文件访问是 Bearer Token 的例外：图片、视频播放流、字幕和片段文件通过 URL 中的 `expires + signature` 校验，无需额外携带 Bearer Token。统一复用 `src/common/file_signatures.py` 的签名与过期时间算法，缺少签名、签名无效或过期时返回 `403 Forbidden`。
+- URL 签名仅授权访问对应媒体文件，不代表登录身份，不能用于调用其他业务接口。
+- 使用 Bearer Token 的接口缺少令牌、令牌无效或过期时返回 `401 Unauthorized`；已认证但无权执行操作时返回 `403 Forbidden`。
+- 不在 URL、日志或错误响应中泄露访问令牌、密码等敏感信息。
 
 ## 用户上下文约定
 
@@ -135,3 +149,44 @@
 - 本规范不追求 HATEOAS
 - 本规范不提供旧接口迁移映射
 - 本规范不以当前实现代码为约束
+
+## 部署扩展说明
+
+以下内容记录部署相关的实现扩展，不替代由代码生成的 OpenAPI。
+
+### 选择性停用定时任务
+
+`scheduler.disabled_tasks` 可选择性停止 APS 定时触发（默认 `[]`），但不会关闭手动
+API/CLI 或持久队列 worker。例如：
+
+```toml
+[scheduler]
+disabled_tasks = [
+  "movie_similarity_recompute",
+  "image_search_index",
+  "media_thumbnail_generation",
+]
+```
+
+也可设置
+`SAKURAMEDIA_SCHEDULER__DISABLED_TASKS='["image_search_index"]'`。未知、重复或格式
+非法的 task key 会在配置加载或 scheduler 装配时被拒绝。
+
+### WebDAV 图片发布队列
+
+WebDAV 新导入和严格刷新先将下载结果写入持久化 staging，再向数据库任务队列提交
+`image_publication`。API 返回时保留旧图片引用；worker 使用内容哈希版本 key 上传，读回
+校验成功后才在事务内切换引用。失败任务与 staging 按配置重试；进程重启会从 PostgreSQL
+队列和 staging manifest 恢复遗漏的 hand-off。终态失败 staging 默认保留七天，损坏的
+staging 默认保留一天。
+
+相关默认值和环境变量：
+
+- `metadata.image_download_max_workers = 8` / `METADATA__IMAGE_DOWNLOAD_MAX_WORKERS`
+- `storage.webdav_publication_max_workers = 4` / `STORAGE__WEBDAV_PUBLICATION_MAX_WORKERS`
+- `storage.image_publication_staging_root = "/data/cache/image-publication"` / `STORAGE__IMAGE_PUBLICATION_STAGING_ROOT`
+- `storage.image_publication_retry_limit = 3` / `STORAGE__IMAGE_PUBLICATION_RETRY_LIMIT`
+- `storage.image_publication_failed_retention_seconds = 604800` / `STORAGE__IMAGE_PUBLICATION_FAILED_RETENTION_SECONDS`
+- `storage.image_publication_invalid_stage_grace_seconds = 86400` / `STORAGE__IMAGE_PUBLICATION_INVALID_STAGE_GRACE_SECONDS`
+
+staging 根目录必须位于持久化 `/data` 卷；配置变更后需重启 API 与 APS worker。

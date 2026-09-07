@@ -12,7 +12,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, TypeGuard
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -131,6 +131,43 @@ class StagedMedia:
     # Optional provider-observed dimensions. The host validates and persists a
     # canonical "WxH" value when creating Media.
     resolution: str | None = None
+
+
+@dataclass(frozen=True)
+class MediaTransferSourceInfo:
+    """Metadata safe to expose from a source provider to a target provider."""
+
+    file_name: str
+    size_bytes: int
+
+
+class MediaTransferReader(Protocol):
+    """Seekable byte reader deliberately narrower than a local file object."""
+
+    def read(self, size: int = -1) -> bytes: ...
+
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+
+
+class MediaTransferSource(Protocol):
+    """A stable source snapshot whose provider-owned details stay private."""
+
+    info: MediaTransferSourceInfo
+
+    def open_reader(self) -> AbstractContextManager[MediaTransferReader]: ...
+
+    def assert_unchanged(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class StagedMediaTransfer:
+    """Opaque result of a target provider's optimized transfer attempt."""
+
+    status: Literal["staged", "not_available"]
+    storage_ref: JsonObject | None = None
+    receipt: JsonObject | None = None
+    file_name: str | None = None
+    size_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +365,12 @@ class StorageMergedPlaybackProvider(Protocol):
     ) -> Response: ...
 
 
+class StorageMergedPlaybackPreflightProvider(Protocol):
+    """Optional capability for validating a merged stream before its URL is issued."""
+
+    def preflight_merged_playback(self, *, medias: tuple[MediaHandle, ...]) -> None: ...
+
+
 class MediaProviderMergedPlaybackBundle(Protocol):
     """Optional bundle declaration paired with ``StorageMergedPlaybackProvider``."""
 
@@ -342,6 +385,38 @@ class StorageImportSourceIdentityProvider(Protocol):
     """
 
     def get_import_source_identity(self, *, source: ImportFile) -> str | None: ...
+
+
+class StorageMediaTransferSourceProvider(Protocol):
+    """Optional capability to expose one managed media file as raw bytes."""
+
+    def open_transfer_source(
+        self, *, media: MediaHandle
+    ) -> AbstractContextManager[MediaTransferSource]: ...
+
+
+class StorageMediaTransferSourceCleanupProvider(Protocol):
+    """Delete only the unchanged source of the currently open transfer session."""
+
+    def cleanup_transfer_source(
+        self, *, media: MediaHandle, source: MediaTransferSource
+    ) -> None: ...
+
+
+class StorageMediaTransferTargetProvider(Protocol):
+    """Optional capability to stage an optimized copy from a source session."""
+
+    def stage_transfer(
+        self,
+        *,
+        source: MediaTransferSource,
+        placement: ImportPlacement,
+        operation_key: str,
+    ) -> StagedMediaTransfer: ...
+
+    def finalize_transfer(self, *, receipt: JsonObject) -> None: ...
+
+    def abort_transfer(self, *, receipt: JsonObject) -> None: ...
 
 
 class StorageMediaRefScanner(Protocol):
@@ -401,6 +476,7 @@ class MediaProviderBundle(Protocol):
     provider_key: str
     display_name: str
     library_config_fields: tuple[ConfigField, ...]
+    # 首项为插件默认传输方式；其余项为可显式请求的方式。
     playback_deliveries: tuple[PlaybackDelivery, ...]
     downloads: DownloadComponent | None
 
@@ -449,6 +525,29 @@ def _require_methods(value: object, methods: Iterable[str], kind: str) -> None:
     missing = [name for name in methods if not callable(getattr(value, name, None))]
     if missing:
         raise TypeError(f"{kind} 缺少必需操作: {', '.join(missing)}")
+
+
+def supports_media_transfer_source(
+    provider: object,
+) -> TypeGuard[StorageMediaTransferSourceProvider]:
+    """Runtime check for the optional source direction without invoking it."""
+    return callable(getattr(provider, "open_transfer_source", None))
+
+
+def supports_media_transfer_source_cleanup(
+    provider: object,
+) -> TypeGuard[StorageMediaTransferSourceCleanupProvider]:
+    return callable(getattr(provider, "cleanup_transfer_source", None))
+
+
+def supports_media_transfer_target(
+    provider: object,
+) -> TypeGuard[StorageMediaTransferTargetProvider]:
+    """Runtime check for the optional target direction without invoking it."""
+    return all(
+        callable(getattr(provider, name, None))
+        for name in ("stage_transfer", "finalize_transfer", "abort_transfer")
+    )
 
 
 class ProviderUnavailableError(LookupError):
@@ -549,6 +648,9 @@ __all__ = [
     "MediaHandle",
     "MediaProviderBundle",
     "MediaProviderRegistry",
+    "MediaTransferReader",
+    "MediaTransferSource",
+    "MediaTransferSourceInfo",
     "PlaybackContext",
     "PlaybackDelivery",
     "PreparedLibrary",
@@ -558,12 +660,20 @@ __all__ = [
     "ProviderUnavailableError",
     "RemoteDownloadTask",
     "StagedMedia",
+    "StagedMediaTransfer",
     "StorageDurationProbeProvider",
     "StorageImportSourceIdentityProvider",
     "StorageManagedMediaRefScanner",
+    "StorageMediaTransferSourceCleanupProvider",
+    "StorageMediaTransferSourceProvider",
+    "StorageMediaTransferTargetProvider",
+    "StorageMergedPlaybackPreflightProvider",
     "StorageProvider",
     "StorageResolutionProbeProvider",
     "ThumbnailArtifact",
     "ThumbnailGeneration",
     "refresh_media_provider_registry",
+    "supports_media_transfer_source",
+    "supports_media_transfer_source_cleanup",
+    "supports_media_transfer_target",
 ]

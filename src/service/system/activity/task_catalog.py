@@ -3,6 +3,7 @@ TASK_NAME_REGISTRY = {
     "subscribed_movie_auto_download": "已订阅缺失影片自动下载",
     "movie_heat_update": "影片热度更新",
     "movie_interaction_sync": "影片互动数同步",
+    "movie_javdb_backfill": "JavDB 影片补录",
     "movie_similarity_recompute": "影片相似度重算",
     "download_task_sync": "下载任务状态同步",
     "download_task_auto_import": "已完成下载自动导入",
@@ -11,4 +12,5 @@ TASK_NAME_REGISTRY = {
     "media_thumbnail_generation": "媒体缩略图生成",
     "image_search_index": "图像搜索索引构建",
     "library_import": "媒体库导入",
+    "media_storage_transfer": "媒体存储迁移",
 }

@@ -18,14 +18,18 @@ from src.config.config import Plugins
 from src.plugins.context import PluginContext
 from src.plugins.contracts import (
     HOST_API_VERSION,
-    MIN_SUPPORTED_HOST_API_VERSION,
     PluginRegistration,
+    validate_host_api_version,
 )
 from src.plugins.dependencies import (
     dependency_failure_message,
     enable_dependency_site_packages,
 )
 from src.plugins.extensions import EXTENSION_VALIDATORS
+from src.plugins.extensions.metadata import (
+    METADATA_SOURCE_EXTENSION_KEY,
+    METADATA_SOURCE_HOST_API_VERSION,
+)
 from src.plugins.manifest import MANIFEST_FILENAME, load_manifest_from_file
 from src.plugins.provider_protocol import refresh_media_provider_registry
 from src.scheduler.contracts import JobDefinition
@@ -162,6 +166,10 @@ def _load_plugin_dir(
         raise PluginLoadError(
             plugin_id, "resolve", f"manifest.plugin_id={manifest.plugin_id} 与启用项不一致"
         )
+    try:
+        validate_host_api_version(manifest.host_api_version)
+    except ValueError as exc:
+        raise PluginLoadError(plugin_id, "validate_manifest", str(exc)) from exc
     dependency_error = dependency_failure_message(
         root_dir=plugin_dir.parent,
         manifest=manifest,
@@ -213,19 +221,28 @@ def _load_plugin_dir(
             "register 返回的 version 与 manifest 不一致: "
             f"register={registration.version} manifest={manifest.version}",
         )
-    if manifest.host_api_version != HOST_API_VERSION:
+    # Legacy packages exist in both forms: some retain their v4 registration,
+    # while the official bundled plugins import the host's current constant at
+    # runtime.  The manifest remains the pre-import compatibility boundary.
+    supported_registration_versions = {
+        manifest.host_api_version,
+        HOST_API_VERSION,
+    }
+    if registration.host_api_version not in supported_registration_versions:
         raise PluginLoadError(
             plugin_id,
             "validate_registration",
-            "manifest 声明的 Host API 版本不兼容: "
-            f"manifest={manifest.host_api_version} "
-            f"host=[{MIN_SUPPORTED_HOST_API_VERSION},{HOST_API_VERSION}]",
+            "register 返回的 host_api_version 与 manifest/宿主版本不兼容: "
+            f"register={registration.host_api_version} "
+            f"manifest={manifest.host_api_version} host={HOST_API_VERSION}",
         )
-    if registration.host_api_version != manifest.host_api_version:
+
+    if (
+        any(ext.key == METADATA_SOURCE_EXTENSION_KEY for ext in registration.extensions)
+        and manifest.host_api_version < METADATA_SOURCE_HOST_API_VERSION
+    ):
         raise PluginLoadError(
-            plugin_id,
-            "validate_registration",
-            "register 返回的 host_api_version 与 manifest 不一致",
+            plugin_id, "validate_extensions", "元数据来源插件的 manifest 必须声明 Host API 6 或更高版本"
         )
 
     jobs = _validate_plugin_jobs(

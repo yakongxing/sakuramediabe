@@ -8,12 +8,12 @@ from src.model.catalog.tags import Tag
 from src.model.mixins import TimestampedMixin
 
 # 受保护字段白名单（v2-lite 字段主权）：插件可写字段的宿主固定名单。
-# 当前开放 title / summary / maker_name / director_name / is_collection（宿主严格刷新已收敛走
-# gateway，插件可补充/修正文案、厂商/导演信息和合集判定）；后续每个可写字段必须由第一个
+# 开放文案、厂商/导演、合集判定与屏蔽状态；宿主刷新和人工修改均收敛走 gateway。
+# 屏蔽写入还需校验订阅状态。后续每个可写字段必须由第一个
 # 真实插件提出、补 MOVIE_FIELD_CODECS 类型校验、并收敛对应宿主写点后才加入。
 # 白名单非空后，已持久化 Movie 的裸 save() 会被护栏拒绝。
 PROTECTED_MOVIE_FIELDS: frozenset[str] = frozenset(
-    {"title", "summary", "maker_name", "director_name", "is_collection"}
+    {"title", "summary", "maker_name", "director_name", "is_collection", "is_blacklisted"}
 )
 
 # 受保护字段 codec：字段名 -> 接受的值类型；开放写入前必须补上（v2-lite 文档约定）。
@@ -23,6 +23,7 @@ MOVIE_FIELD_CODECS: dict[str, type] = {
     "maker_name": str,
     "director_name": str,
     "is_collection": bool,
+    "is_blacklisted": bool,
 }
 
 
@@ -39,7 +40,9 @@ class MovieSeries(TimestampedMixin, BaseModel):
 
 
 class Movie(TimestampedMixin, BaseModel):
-    javdb_id = CaseSensitiveCharField(max_length=64, unique=True, index=True, verbose_name="JavDB ID")
+    javdb_id = CaseSensitiveCharField(max_length=64, unique=True, index=True, null=True, verbose_name="JavDB ID")
+    metadata_source = JsonbField(null=True)
+    javdb_next_check_at = peewee.DateTimeField(null=True, index=True)
     movie_number = peewee.CharField(max_length=255, unique=True, index=True, verbose_name="番号")
     title = peewee.TextField(verbose_name="标题")
     release_date = peewee.DateTimeField(verbose_name="发布时间", index=True, null=True)
@@ -130,7 +133,7 @@ class Movie(TimestampedMixin, BaseModel):
         # 分隔符与大小写都是有效信息（一本道 072625_001 与加勒比 072625-001 是两部不同影片，
         # 东热 n0646 的规范写法就是小写）。系统内部各处番号副本列只允许拷贝本列；
         # 人工输入的匹配统一走 service_helpers.find_movie_by_number（大小写不敏感 + 分隔符候选）。
-        self.javdb_id = (self.javdb_id or "").strip()
+        self.javdb_id = (self.javdb_id or "").strip() or None
         self.movie_number = (self.movie_number or "").strip()
         self._guard_protected_field_write(
             only=kwargs.get("only"),

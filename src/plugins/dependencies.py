@@ -6,7 +6,7 @@ import json
 import site
 import subprocess
 import sys
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import MetadataPathFinder, PackageNotFoundError, version
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -21,6 +21,15 @@ from src.plugins.manifest import (
 _RUNTIME_DIRNAME = ".runtime"
 _SITE_PACKAGES_DIRNAME = "site-packages"
 _FAILURES_FILENAME = "dependency-failures.json"
+
+
+def _invalidate_metadata_caches() -> None:
+    invalidate = MetadataPathFinder.invalidate_caches
+    try:
+        invalidate()
+    except TypeError:
+        # Python 3.10 exposes this hook as an unbound method.
+        invalidate(MetadataPathFinder)  # type: ignore[call-arg]
 
 
 def dependency_site_packages_dir(root_dir: Path) -> Path:
@@ -104,6 +113,10 @@ def _install_dependencies(
         check=False,
     )
     if result.returncode == 0:
+        # importlib.metadata caches directory scans. A dependency installed into
+        # an already-enabled site-packages directory must become visible during
+        # this same process, even when the directory mtime has not advanced.
+        _invalidate_metadata_caches()
         return None
     details = (result.stderr or result.stdout).strip().splitlines()
     suffix = details[-1] if details else f"pip 退出码 {result.returncode}"
