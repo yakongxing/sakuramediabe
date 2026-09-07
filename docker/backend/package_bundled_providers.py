@@ -30,6 +30,9 @@ _CONTRACTS_PATH = (
 _HOST_API_VERSION_PATTERN = re.compile(
     r"^HOST_API_VERSION\s*=\s*(\d+)\s*$", re.MULTILINE
 )
+_MIN_SUPPORTED_HOST_API_VERSION_PATTERN = re.compile(
+    r"^MIN_SUPPORTED_HOST_API_VERSION\s*=\s*(\d+)\s*$", re.MULTILINE
+)
 
 
 def host_api_version(contracts_path: Path | None = None) -> int:
@@ -42,6 +45,19 @@ def host_api_version(contracts_path: Path | None = None) -> int:
     match = _HOST_API_VERSION_PATTERN.search(path.read_text(encoding="utf-8"))
     if match is None:
         raise ValueError(f"cannot resolve HOST_API_VERSION from {path}")
+    return int(match.group(1))
+
+
+def min_supported_host_api_version(contracts_path: Path | None = None) -> int:
+    """读取宿主仍兼容的最低插件 Host API 版本。"""
+    path = contracts_path or _CONTRACTS_PATH
+    match = _MIN_SUPPORTED_HOST_API_VERSION_PATTERN.search(
+        path.read_text(encoding="utf-8")
+    )
+    if match is None:
+        raise ValueError(
+            f"cannot resolve MIN_SUPPORTED_HOST_API_VERSION from {path}"
+        )
     return int(match.group(1))
 
 
@@ -126,15 +142,17 @@ def package_latest_releases(output: Path) -> list[dict[str, str]]:
     # 打包期就拒绝 Host API 不兼容的 provider：宿主在 entrypoint 的 upgrade-v053 阶段
     # 会因 manifest 版本不匹配直接退出，容器起不来。把校验前移到构建期，
     # 让发版在 CI 就失败，而不是把一个必然崩溃的镜像推到 Docker Hub。
-    expected_version = host_api_version()
+    max_supported_version = host_api_version()
+    min_supported_version = min_supported_host_api_version()
     incompatible = [
         (plugin_id, tag_name, _manifest_host_api_version(plugin_id, content))
         for plugin_id, tag_name, content, _ in downloaded
     ]
     mismatched = [
-        f"{plugin_id} tag={tag_name} manifest={declared} host={expected_version}"
+        f"{plugin_id} tag={tag_name} manifest={declared} "
+        f"host=[{min_supported_version},{max_supported_version}]"
         for plugin_id, tag_name, declared in incompatible
-        if declared != expected_version
+        if not min_supported_version <= declared <= max_supported_version
     ]
     if mismatched:
         raise ValueError(

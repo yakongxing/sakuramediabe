@@ -49,9 +49,9 @@ def test_package_bundled_providers_downloads_and_verifies_pinned_releases(
     monkeypatch, tmp_path
 ):
     packager = _load_packager()
-    host_version = packager.host_api_version()
-    local_zip = _provider_zip("sakuramedia_local_provider", host_version)
-    cloud115_zip = _provider_zip("sakuramedia_115_provider", host_version)
+    min_host_version = packager.min_supported_host_api_version()
+    local_zip = _provider_zip("sakuramedia_local_provider", min_host_version)
+    cloud115_zip = _provider_zip("sakuramedia_115_provider", min_host_version)
     local_api_url = packager.PROVIDER_RELEASES[0][2]
     cloud115_api_url = packager.PROVIDER_RELEASES[1][2]
     local_download_url = "https://downloads.example/local.zip"
