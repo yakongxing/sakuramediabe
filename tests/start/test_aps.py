@@ -291,7 +291,7 @@ def test_build_scheduler_selectively_omits_disabled_tasks(monkeypatch):
     assert scheduler.get_job("download_task_sync") is not None
     assert scheduler.get_job("gfriends_filetree_refresh") is not None
     # APS filtering must not alter durable, non-APS worker dispatch.
-    assert "image_publication" in QUEUE_TASK_REGISTRY
+    assert "image_publication" not in QUEUE_TASK_REGISTRY
 
 
 def test_build_scheduler_rejects_unknown_disabled_task(monkeypatch):

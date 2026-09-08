@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from loguru import logger
 
 from src.common import resolve_image_file_path
+from src.common.image_references import is_nonlocal_image_reference
 from src.common.service_helpers import emit_progress
 from src.config.config import settings
 from src.model import (
@@ -208,6 +209,15 @@ class ImageSearchIndexService:
             valid_thumbnails: list[MediaThumbnail] = []
             payloads: list[bytes] = []
             for thumbnail in batch:
+                if is_nonlocal_image_reference(thumbnail.image.origin):
+                    logger.info(
+                        "Image search thumbnail indexing skipped unsupported "
+                        "nonlocal reference thumbnail_id={} media_id={}",
+                        thumbnail.id,
+                        thumbnail.media_id,
+                    )
+                    failed_ids.append(thumbnail.id)
+                    continue
                 try:
                     payloads.append(
                         resolve_image_file_path(thumbnail.image.origin).read_bytes()
@@ -266,6 +276,14 @@ class ImageSearchIndexService:
             valid_plot_images: list[MoviePlotImage] = []
             payloads: list[bytes] = []
             for plot_image in batch:
+                if is_nonlocal_image_reference(plot_image.image.origin):
+                    logger.info(
+                        "Plot image indexing skipped unsupported external reference plot_image_id={} movie_id={}",
+                        plot_image.id,
+                        plot_image.movie_id,
+                    )
+                    failed_ids.append(plot_image.id)
+                    continue
                 try:
                     payloads.append(
                         resolve_image_file_path(plot_image.image.origin).read_bytes()

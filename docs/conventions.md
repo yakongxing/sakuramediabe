@@ -172,21 +172,9 @@ disabled_tasks = [
 `SAKURAMEDIA_SCHEDULER__DISABLED_TASKS='["image_search_index"]'`。未知、重复或格式
 非法的 task key 会在配置加载或 scheduler 装配时被拒绝。
 
-### WebDAV 图片发布队列
+### 目录图片引用
 
-WebDAV 新导入和严格刷新先将下载结果写入持久化 staging，再向数据库任务队列提交
-`image_publication`。API 返回时保留旧图片引用；worker 使用内容哈希版本 key 上传，读回
-校验成功后才在事务内切换引用。失败任务与 staging 按配置重试；进程重启会从 PostgreSQL
-队列和 staging manifest 恢复遗漏的 hand-off。终态失败 staging 默认保留七天，损坏的
-staging 默认保留一天。
-
-相关默认值和环境变量：
-
-- `metadata.image_download_max_workers = 8` / `METADATA__IMAGE_DOWNLOAD_MAX_WORKERS`
-- `storage.webdav_publication_max_workers = 4` / `STORAGE__WEBDAV_PUBLICATION_MAX_WORKERS`
-- `storage.image_publication_staging_root = "/data/cache/image-publication"` / `STORAGE__IMAGE_PUBLICATION_STAGING_ROOT`
-- `storage.image_publication_retry_limit = 3` / `STORAGE__IMAGE_PUBLICATION_RETRY_LIMIT`
-- `storage.image_publication_failed_retention_seconds = 604800` / `STORAGE__IMAGE_PUBLICATION_FAILED_RETENTION_SECONDS`
-- `storage.image_publication_invalid_stage_grace_seconds = 86400` / `STORAGE__IMAGE_PUBLICATION_INVALID_STAGE_GRACE_SECONDS`
-
-staging 根目录必须位于持久化 `/data` 卷；配置变更后需重启 API 与 APS worker。
+JavDB 与其他远程元数据源提供的影片封面、剧情图和演员头像直接保存为第三方
+HTTP(S) URL，不经过 WebDAV 或本地图片发布队列，并原样保留查询字符串。通过稳定
+宿主 API 接入的 bundled provider 插件交付的是本地图片文件（没有第三方 URL），
+这些文件仍由宿主导入内部存储。应用生成的媒体缩略图同样使用配置的存储后端。

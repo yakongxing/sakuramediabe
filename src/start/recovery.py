@@ -15,7 +15,7 @@ BUSINESS_RECOVERY_HANDLERS: dict[str, Callable[[], object]] = {
 # These handlers reconcile durable state which may exist without any queue row.
 # They must run independently of lease recovery during every worker housekeeping
 # pass (including the synchronous pass at worker startup).
-HOUSEKEEPING_RECOVERY_TASK_KEYS = frozenset({"image_publication"})
+HOUSEKEEPING_RECOVERY_TASK_KEYS: frozenset[str] = frozenset()
 
 def recover_business_states(task_keys: set[str]) -> None:
     """优先调用 JobDefinition 声明的恢复钩子，队列专属任务再查宿主注册表。"""

@@ -3,6 +3,7 @@ import io
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,6 +124,58 @@ def test_delete_obsolete_image_files_uses_storage_backend(monkeypatch):
     module.ImageCleanupService.delete_obsolete_image_files({"movies/ab/ABC-001/plot-0.jpg"})
 
     assert storage.deleted == [("movies/ab/ABC-001/plot-0.jpg", True)]
+
+
+def test_delete_obsolete_image_files_never_passes_external_url_to_storage(monkeypatch):
+    from src.service.catalog import image_cleanup_service as module
+
+    class FakeStorage:
+        def delete(self, key, *, missing_ok=True):
+            raise AssertionError(f"external reference reached storage: {key}")
+
+    monkeypatch.setattr(module, "asset_storage", lambda: FakeStorage())
+
+    module.ImageCleanupService.delete_obsolete_image_files(
+        {
+            "https://images.example.test/cover.jpg?token=x",
+            " https://images.example.test/cover.jpg",
+            "\udfff",
+            "https://user:secret@images.example.test/cover.jpg",
+            "file:///tmp/cover.jpg",
+            "https://[not-an-ipv6]/cover.jpg",
+            "https://white space.example/cover.jpg",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "reference", [" https://images.example.test/cover.jpg", "\udfff"]
+)
+def test_thin_cover_rejects_unsafe_reference_before_path_or_pillow_io(
+    reference, monkeypatch
+):
+    from src.service.catalog import movie_image_service as module
+
+    monkeypatch.setattr(
+        module,
+        "media_image_root_path",
+        lambda: pytest.fail("unsafe thin-cover reference reached filesystem"),
+    )
+    service = MovieImageService()
+    monkeypatch.setattr(
+        service,
+        "_generate_thin_cover_task_from_cover",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unsafe thin-cover reference reached PIL"
+        ),
+    )
+    movie = SimpleNamespace(
+        cover_image=SimpleNamespace(origin=reference), movie_number="ABC-001"
+    )
+
+    resolution = service.resolve_thin_cover_from_existing_movie(movie, [])
+
+    assert resolution.use_cover is True
 
 
 def test_image_service_does_not_add_backend_publication_semaphore(monkeypatch, tmp_path):

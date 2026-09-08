@@ -390,8 +390,9 @@ def test_backfill_replaces_lists_and_images_after_preparation(
         ],
     )
     result = metadata_env.service.backfill_plugin_movie(movie, detail)
-    new_cover = metadata_env.root / "assets" / result.cover_image.origin
-    assert new_cover.is_file() and new_cover != old_cover and not old_cover.exists()
+    assert result.cover_image.origin == detail.cover_image
+    assert result.thin_cover_image_id == result.cover_image_id
+    assert not old_cover.exists()
     assert MovieTag.select().where(MovieTag.movie == movie).count() == 0
     assert MovieActor.get(MovieActor.movie == movie).actor.javdb_id == "new-actor"
 
@@ -427,7 +428,6 @@ def test_backfill_cleans_only_unreferenced_old_actor_images(
     )
     old_image_id = actor.profile_image_id
     assets = metadata_env.root / "assets"
-    old_path = assets / actor.profile_image.origin
     if case == "shared":
         Actor.create(javdb_id="other-actor", name="Other", profile_image=old_image_id)
     detail = remote_detail(actors=[
@@ -454,10 +454,14 @@ def test_backfill_cleans_only_unreferenced_old_actor_images(
         assert current.profile_image_id == old_image_id
     else:
         assert current.profile_image_id != old_image_id
-    assert (assets / current.profile_image.origin).is_file()
+    expected_url = (
+        "https://example.com/old.png"
+        if case in {"missing", "rollback"}
+        else "https://example.com/new.png"
+    )
+    assert current.profile_image.origin == expected_url
     keep_old_image = case != "replace"
     assert Image.select().where(Image.id == old_image_id).exists() == keep_old_image
-    assert old_path.is_file() == keep_old_image
 
 
 def test_backfill_failure_preserves_old_data_and_files(metadata_env, monkeypatch):
@@ -481,19 +485,18 @@ def test_backfill_failure_preserves_old_data_and_files(metadata_env, monkeypatch
     assert paths_after == paths_before
 
 
-def test_download_failure_does_not_bind_javdb_id(metadata_env, monkeypatch):
+def test_backfill_does_not_download_catalog_images(metadata_env, monkeypatch):
     movie = import_plugin(metadata_env, monkeypatch)
     monkeypatch.setattr(
         metadata_env.service.image_service,
         "image_downloader",
         Mock(side_effect=OSError("download")),
     )
-    with pytest.raises(OSError):
-        metadata_env.service.backfill_plugin_movie(
-            movie, remote_detail(cover_image="https://example.com/new.png")
-        )
-    assert Movie.get_by_id(movie.id).javdb_id is None
-    assert (metadata_env.root / "assets" / movie.cover_image.origin).is_file()
+    result = metadata_env.service.backfill_plugin_movie(
+        movie, remote_detail(cover_image="https://example.com/new.png")
+    )
+    assert result.javdb_id is not None
+    metadata_env.service.image_service.image_downloader.assert_not_called()
 
 
 def test_javdb_conflicts_do_not_merge_or_modify_movie(metadata_env, monkeypatch):
@@ -697,6 +700,10 @@ def test_concurrent_imports_keep_one_movie_and_its_images(
     from src.model import Image
 
     assert files == {image.origin for image in Image.select()}
+    assert all(
+        not image.origin.startswith(("http://", "https://"))
+        for image in Image.select()
+    )
     assert not list((metadata_env.root / "plugins").rglob("cover.png"))
 
 

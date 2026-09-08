@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from src.common import resolve_image_file_path
+from src.common.image_references import is_nonlocal_image_reference
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
     emit_progress,
@@ -162,6 +163,12 @@ class MomentRecommendationService:
 
     @staticmethod
     def _read_seed_image_bytes(seed: _MomentSeed) -> bytes | None:
+        if is_nonlocal_image_reference(seed.thumbnail.image.origin):
+            logger.info(
+                "Moment recommendation seed skipped unsupported external reference point_id={}",
+                seed.point.id,
+            )
+            return None
         try:
             image_path = resolve_image_file_path(seed.thumbnail.image.origin)
             if not image_path.exists() or not image_path.is_file():

@@ -4,6 +4,7 @@ from shutil import move
 from loguru import logger
 from PIL import Image as PILImage
 
+from src.common.image_references import is_nonlocal_image_reference
 from src.common.media_paths import (
     MOVIE_MEDIA_SUBDIR,
     media_image_root_path,
@@ -115,6 +116,8 @@ class ThumbnailArtifactService:
 
     @staticmethod
     def read_dimensions(image_origin: str) -> tuple[int | None, int | None]:
+        if is_nonlocal_image_reference(image_origin):
+            raise ValueError("thumbnail_image_reference_nonlocal")
         with PILImage.open(media_image_root_path() / image_origin) as image:
             return image.size
 

@@ -4,6 +4,10 @@ from enum import Enum
 from pydantic import Field, field_validator
 
 from src.common import build_signed_image_url
+from src.common.image_references import (
+    is_external_image_reference,
+    is_nonlocal_image_reference,
+)
 from src.schema.common.base import SchemaModel
 
 
@@ -28,8 +32,12 @@ class ImageResource(SchemaModel):
 
     @staticmethod
     def _sign_image_path(value: str) -> str:
+        if is_external_image_reference(value):
+            return value
         if value.startswith("/files/images/"):
             return value
+        if is_nonlocal_image_reference(value):
+            raise ValueError("malformed URL-like image reference")
         return build_signed_image_url(value)
 
     @field_validator("origin", "small", "medium", "large")

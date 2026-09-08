@@ -7,23 +7,23 @@
 3. ``update_movie_fields``：指定字段更新——不存在先完整导入，存在只写白名单字段。
 """
 
-import hashlib
-import io
-
 import pytest
 
 from src.metadata._providers.models import (
     JavdbMovieActorResource,
     JavdbMovieDetailResource,
 )
-from src.model import Actor, BackgroundTaskRun, Image, Movie
+from src.model import Actor, BackgroundTaskRun, Image, Movie, MoviePlotImage
 from src.service.catalog.catalog_import_service import CatalogImportService
-from src.service.catalog.movie_image_service import (
-    ImagePersistTask,
-    PreparedImageFile,
-    ThinCoverResolution,
-)
+from src.service.catalog.movie_image_service import ImagePersistTask
 from src.storage.types import StorageUnavailable
+
+
+def _url_with_utf8_size(size: int) -> str:
+    prefix = "https://example.test/"
+    remaining = size - len(prefix.encode("utf-8"))
+    multibyte_characters, ascii_characters = divmod(remaining, len("界".encode()))
+    return prefix + ("界" * multibyte_characters) + ("x" * ascii_characters)
 
 
 def _prepared_file(tmp_path, name: str, content: bytes):
@@ -119,7 +119,7 @@ def test_import_existing_movie_repairs_actor_avatar_missed_earlier(
         summary="local",
     )
     actor = Actor.create(javdb_id="actor-fast-repair", name="演员")
-    image = Image.create(
+    Image.create(
         origin="repaired.jpg",
         small="repaired.jpg",
         medium="repaired.jpg",
@@ -138,246 +138,11 @@ def test_import_existing_movie_repairs_actor_avatar_missed_earlier(
         actors=[resource],
     )
     service = CatalogImportService()
-    monkeypatch.setattr(service.image_service, "persist_image", lambda **kwargs: image)
-
     returned, created = service.import_movie_if_missing(detail)
 
     assert created is False
     assert returned.id == movie.id
-    assert Actor.get_by_id(actor.id).profile_image_id == image.id
-
-
-def test_import_existing_movie_repairs_dangling_actor_avatar_file(test_db, monkeypatch):
-    from src.service.catalog import catalog_import_service as module
-
-    movie = _create_local_movie(
-        javdb_id="javdb-dangling",
-        movie_number="DANGLING-001",
-        title="local",
-        summary="local",
-    )
-    image = Image.create(
-        origin="actors/dangling.jpg",
-        small="actors/dangling.jpg",
-        medium="actors/dangling.jpg",
-        large="actors/dangling.jpg",
-    )
-    actor = Actor.create(javdb_id="actor-dangling", name="演员", profile_image=image)
-    resource = JavdbMovieActorResource(
-        javdb_id=actor.javdb_id,
-        name=actor.name,
-        avatar_url="https://example.invalid/dangling.jpg",
-    )
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="remote",
-        summary="remote",
-        actors=[resource],
-    )
-    storage = type("Storage", (), {"exists": lambda self, key: False})()
-    monkeypatch.setattr(module, "asset_storage", lambda: storage)
-    service = CatalogImportService()
-    persisted = []
-    monkeypatch.setattr(
-        service.image_service,
-        "persist_image",
-        lambda **kwargs: persisted.append(kwargs) or image,
-    )
-
-    service.import_movie_if_missing(detail)
-
-    assert len(persisted) == 1
-    assert Actor.get_by_id(actor.id).profile_image_id == image.id
-
-
-@pytest.mark.parametrize("has_profile_image", [True, False])
-def test_import_existing_movie_ignores_avatar_storage_probe_unavailable(
-    test_db, monkeypatch, has_profile_image
-):
-    from src.service.catalog import catalog_import_service as module
-
-    movie = _create_local_movie(
-        javdb_id="javdb-probe-down",
-        movie_number="PROBE-DOWN-001",
-        title="local",
-        summary="local",
-    )
-    image = Image.create(
-        origin="actors/probe-down.jpg",
-        small="actors/probe-down.jpg",
-        medium="actors/probe-down.jpg",
-        large="actors/probe-down.jpg",
-    )
-    actor = Actor.create(
-        javdb_id="actor-probe-down",
-        name="演员",
-        profile_image=image if has_profile_image else None,
-    )
-    resource = JavdbMovieActorResource(
-        javdb_id=actor.javdb_id,
-        name=actor.name,
-        avatar_url="https://example.invalid/probe-down.jpg",
-    )
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="remote",
-        summary="remote",
-        actors=[resource],
-    )
-
-    class UnavailableStorage:
-        def exists(self, key):
-            raise StorageUnavailable("storage probe unavailable")
-
-    monkeypatch.setattr(module, "asset_storage", lambda: UnavailableStorage())
-    warnings = []
-    monkeypatch.setattr(module.logger, "warning", lambda *args: warnings.append(args))
-
-    returned, created = CatalogImportService().import_movie_if_missing(detail)
-
-    assert created is False
-    assert returned.id == movie.id
-    assert len(warnings) == 1
-    assert "avatar repair storage probe failed" in warnings[0][0]
-
-
-def test_actor_avatar_repair_transaction_failure_removes_owned_file_and_record(
-    test_db, monkeypatch
-):
-    from src.service.catalog import catalog_import_service as module
-
-    actor = Actor.create(javdb_id="actor-compensate", name="演员")
-    resource = JavdbMovieActorResource(
-        javdb_id=actor.javdb_id,
-        name=actor.name,
-        avatar_url="https://example.invalid/new.jpg",
-    )
-    deleted = []
-
-    class Storage:
-        def exists(self, key):
-            return False
-
-        def delete(self, key, *, missing_ok=True):
-            deleted.append(key)
-
-    class FailingLock:
-        def __enter__(self):
-            raise RuntimeError("transaction lock failed")
-
-        def __exit__(self, *args):
-            return False
-
-    monkeypatch.setattr(module, "asset_storage", lambda: Storage())
-    service = CatalogImportService(persist_lock=FailingLock())
-    task = service.image_service._build_image_task(
-        "actor", actor.javdb_id, resource.avatar_url
-    )
-    created_images = []
-
-    def persist_image(**kwargs):
-        image = Image.create(
-            origin=task.relative_path,
-            small=task.relative_path,
-            medium=task.relative_path,
-            large=task.relative_path,
-        )
-        created_images.append(image)
-        return image
-
-    monkeypatch.setattr(service.image_service, "persist_image", persist_image)
-
-    with pytest.raises(RuntimeError, match="transaction lock failed"):
-        service._repair_missing_actor_avatars([resource])
-
-    assert Image.get_or_none(Image.id == created_images[0].id) is None
-    # Deterministic avatar keys may have been reused concurrently; leave the object
-    # for delayed reference-aware cleanup rather than deleting it eagerly.
-    assert deleted == []
-    assert Actor.get_by_id(actor.id).profile_image_id is None
-
-
-def test_actor_avatar_repair_replaces_dangling_record_and_removes_old_unused_image(
-    test_db, monkeypatch
-):
-    from src.service.catalog import catalog_import_service as module
-
-    old_image = Image.create(
-        origin="actors/old-dangling.jpg",
-        small="actors/old-dangling.jpg",
-        medium="actors/old-dangling.jpg",
-        large="actors/old-dangling.jpg",
-    )
-    actor = Actor.create(javdb_id="actor-replace", name="演员", profile_image=old_image)
-    resource = JavdbMovieActorResource(
-        javdb_id=actor.javdb_id,
-        name=actor.name,
-        avatar_url="https://example.invalid/new.jpg",
-    )
-    new_image = Image.create(
-        origin="actors/new.jpg",
-        small="actors/new.jpg",
-        medium="actors/new.jpg",
-        large="actors/new.jpg",
-    )
-    deleted = []
-
-    class Storage:
-        def exists(self, key):
-            return False
-
-        def delete(self, key, *, missing_ok=True):
-            deleted.append(key)
-
-    monkeypatch.setattr(module, "asset_storage", lambda: Storage())
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service, "persist_image", lambda **kwargs: new_image
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "delete_obsolete_image_files",
-        lambda paths: deleted.extend(sorted(paths)),
-    )
-
-    service._repair_missing_actor_avatars([resource])
-
-    assert Actor.get_by_id(actor.id).profile_image_id == new_image.id
-    assert Image.get_or_none(Image.id == old_image.id) is None
-    assert deleted == [old_image.origin]
-
-
-def test_actor_avatar_repair_upsert_failure_after_publication_is_nonfatal(
-    test_db, monkeypatch
-):
-    from src.service.catalog import catalog_import_service as module
-
-    actor = Actor.create(javdb_id="actor-upsert-fail", name="演员")
-    resource = JavdbMovieActorResource(
-        javdb_id=actor.javdb_id,
-        name=actor.name,
-        avatar_url="https://example.invalid/new.jpg",
-    )
-
-    class Storage:
-        def exists(self, key):
-            return False
-
-    monkeypatch.setattr(module, "asset_storage", lambda: Storage())
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "persist_image",
-        lambda **kwargs: (_ for _ in ()).throw(
-            RuntimeError("upsert failed after publish")
-        ),
-    )
-
-    service._repair_missing_actor_avatars([resource])
-
-    assert Actor.get_by_id(actor.id).profile_image_id is None
+    assert Actor.get_by_id(actor.id).profile_image.origin == resource.avatar_url
 
 
 def test_import_movie_if_missing_creates_new_movie(test_db):
@@ -399,95 +164,132 @@ def test_import_movie_if_missing_creates_new_movie(test_db):
     assert refreshed.watched_count == 100
 
 
-def test_webdav_import_stages_and_enqueues_without_sync_publication(
-    test_db, monkeypatch, tmp_path
-):
-    from src.service.catalog import catalog_import_service as module
+def test_catalog_import_persists_provider_urls_without_image_io(test_db, monkeypatch):
+    from src.service.catalog import image_cleanup_service, movie_image_service
 
-    monkeypatch.setattr(module.settings.storage, "backend", "webdav")
-    monkeypatch.setattr(
-        module.settings.storage, "image_publication_staging_root", str(tmp_path)
+    def storage_touched():
+        pytest.fail("catalog import constructed an asset storage backend")
+
+    monkeypatch.setattr(movie_image_service, "asset_storage", storage_touched)
+    monkeypatch.setattr(image_cleanup_service, "asset_storage", storage_touched)
+    actor_resource = JavdbMovieActorResource(
+        javdb_id="actor-direct",
+        name="演员",
+        avatar_url="https://images.example.test/avatar.jpg?token=a%2Fb",
     )
     detail = _build_detail(
-        javdb_id="webdav-import",
-        movie_number="WD-001",
-        title="remote",
+        javdb_id="direct-import",
+        movie_number="DIRECT-001",
+        title="Direct",
         summary="summary",
+        actors=[actor_resource],
     )
-    detail.cover_image = "https://example.invalid/cover.jpg"
-    service = CatalogImportService()
-    sync_calls = []
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks",
-        lambda tasks: sync_calls.append(tasks),
+    detail.cover_image = "https://images.example.test/cover.jpg?size=large"
+    detail.plot_images = [
+        "https://images.example.test/plot-1.jpg",
+        "https://images.example.test/plot-1.jpg",
+        "https://images.example.test/plot-2.jpg?x=1",
+    ]
+    service = CatalogImportService(
+        image_downloader=lambda *_: pytest.fail("catalog image downloader was called")
     )
 
-    def download(tasks, *, temp_root):
-        result = []
-        for index, task in enumerate(tasks):
-            path = temp_root / f"{index}.jpg"
-            path.write_bytes(b"image")
-            result.append(PreparedImageFile(task, path, temp_root))
-        return result
-
-    monkeypatch.setattr(
-        service.image_service, "download_image_tasks_to_temporary_files", download
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
     movie, created = service.import_movie_if_missing(detail)
 
+    movie = Movie.get_by_id(movie.id)
+    actor = Actor.get(Actor.javdb_id == actor_resource.javdb_id)
+    plot_origins = [
+        link.image.origin
+        for link in MoviePlotImage.select(MoviePlotImage, Image)
+        .join(Image)
+        .where(MoviePlotImage.movie == movie)
+        .order_by(MoviePlotImage.id)
+    ]
     assert created is True
-    assert sync_calls == []
-    queued = BackgroundTaskRun.get(BackgroundTaskRun.task_key == "image_publication")
-    assert queued.params["operation"] == "import"
-    assert Movie.get_by_id(movie.id).cover_image_id is None
+    assert movie.cover_image.origin == detail.cover_image
+    assert movie.thin_cover_image_id == movie.cover_image_id
+    assert actor.profile_image.origin == actor_resource.avatar_url
+    assert plot_origins == list(dict.fromkeys(detail.plot_images))
+    assert (
+        BackgroundTaskRun.select()
+        .where(BackgroundTaskRun.task_key == "image_publication")
+        .count()
+        == 0
+    )
 
 
-def test_webdav_import_enqueue_failure_rolls_back_movie_and_cleans_stage(
-    test_db, monkeypatch, tmp_path
-):
-    from src.service.catalog import catalog_import_service as module
-    from src.service.catalog.image_publication_service import ImagePublicationService
+def test_direct_image_url_utf8_byte_boundary_upserts_unique_origin(test_db):
+    reference = _url_with_utf8_size(2048)
+    service = CatalogImportService().image_service
+    cover_task, _, _ = service.build_catalog_direct_image_tasks(
+        "DIRECT-BOUNDARY-001", reference, [], []
+    )
 
-    monkeypatch.setattr(module.settings.storage, "backend", "webdav")
+    first = service.persist_refreshed_image_record(cover_task)
+    second = service.persist_refreshed_image_record(cover_task)
+
+    assert first is not None
+    assert second is not None
+    assert first.id == second.id
+    assert Image.get_by_id(first.id).origin == reference
+    assert Image.select().where(Image.origin == reference).count() == 1
+
+
+def test_strict_refresh_direct_urls_are_atomic_and_do_no_image_io(test_db, monkeypatch):
+    actor_resource = JavdbMovieActorResource(
+        javdb_id="actor-refresh",
+        name="演员",
+        avatar_url="https://images.example.test/old-avatar.jpg",
+    )
+    old_detail = _build_detail(
+        javdb_id="direct-refresh",
+        movie_number="DIRECT-REFRESH-001",
+        title="Old",
+        summary="old",
+        actors=[actor_resource],
+    )
+    old_detail.cover_image = "https://images.example.test/old-cover.jpg"
+    old_detail.plot_images = ["https://images.example.test/old-plot.jpg"]
+    service = CatalogImportService(
+        image_downloader=lambda *_: pytest.fail("catalog image downloader was called")
+    )
+    movie, _ = service.import_movie_if_missing(old_detail)
+
+    new_actor = actor_resource.model_copy(
+        update={"avatar_url": "https://images.example.test/new-avatar.jpg"}
+    )
+    new_detail = _build_detail(
+        javdb_id=old_detail.javdb_id,
+        movie_number=old_detail.movie_number,
+        title="New",
+        summary="new",
+        actors=[new_actor],
+    )
+    new_detail.cover_image = "https://images.example.test/new-cover.jpg"
+    new_detail.plot_images = ["https://images.example.test/new-plot.jpg"]
+    original_replace_tags = service._replace_movie_tags
     monkeypatch.setattr(
-        module.settings.storage, "image_publication_staging_root", str(tmp_path)
-    )
-    detail = _build_detail(
-        javdb_id="queue-fail", movie_number="QF-001", title="remote", summary="summary"
-    )
-    detail.cover_image = "https://example.invalid/cover.jpg"
-    service = CatalogImportService()
-
-    def download(tasks, *, temp_root):
-        path = temp_root / "cover.jpg"
-        path.write_bytes(b"image")
-        return [PreparedImageFile(tasks[0], path, temp_root)]
-
-    monkeypatch.setattr(
-        service.image_service, "download_image_tasks_to_temporary_files", download
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
-    monkeypatch.setattr(
-        ImagePublicationService,
-        "enqueue_refresh",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("queue down")),
+        service,
+        "_replace_movie_tags",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("transaction failed")),
     )
 
-    with pytest.raises(RuntimeError, match="queue down"):
-        service.import_movie_if_missing(detail)
+    with pytest.raises(RuntimeError, match="transaction failed"):
+        service.refresh_movie_metadata_strict(movie, new_detail)
 
-    assert Movie.get_or_none(Movie.javdb_id == detail.javdb_id) is None
-    assert list(tmp_path.iterdir()) == []
+    unchanged = Movie.get_by_id(movie.id)
+    assert unchanged.title == "Old"
+    assert unchanged.cover_image.origin == old_detail.cover_image
+    monkeypatch.setattr(service, "_replace_movie_tags", original_replace_tags)
+
+    refreshed = service.refresh_movie_metadata_strict(unchanged, new_detail)
+
+    assert refreshed.cover_image.origin == new_detail.cover_image
+    assert refreshed.thin_cover_image_id == refreshed.cover_image_id
+    assert (
+        Actor.get(Actor.javdb_id == new_actor.javdb_id).profile_image.origin
+        == new_actor.avatar_url
+    )
 
 
 def test_import_movie_if_missing_does_not_mark_collection(test_db):
@@ -612,292 +414,6 @@ def test_existing_actor_missing_avatar_can_be_repaired(test_db, monkeypatch):
     assert Actor.get_by_id(actor.id).profile_image_id == image.id
 
 
-def test_strict_refresh_upload_failure_leaves_database_image_reference_unchanged(
-    test_db, monkeypatch
-):
-    old_image = Image.create(
-        origin="old.jpg", small="old.jpg", medium="old.jpg", large="old.jpg"
-    )
-    new_image = Image.create(
-        origin="new.jpg", small="new.jpg", medium="new.jpg", large="new.jpg"
-    )
-    movie = _create_local_movie(
-        javdb_id="javdb-upload-fail",
-        movie_number="FAIL-001",
-        title="old",
-        summary="old",
-    )
-    movie.cover_image = old_image
-    movie.save(only=[Movie.cover_image])
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="new",
-        summary="new",
-    )
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "build_movie_import_image_tasks",
-        lambda *args: (None, [], {}),
-    )
-    monkeypatch.setattr(service.image_service, "collect_image_tasks", lambda *args: [])
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks_to_temporary_files",
-        lambda tasks: [],
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
-    monkeypatch.setattr(
-        service,
-        "_refresh_movie_metadata_records_strict",
-        lambda **kwargs: (
-            Movie.update(cover_image=new_image).where(Movie.id == movie.id).execute()
-            and Movie.get_by_id(movie.id),
-            set(),
-            [],
-        ),
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "finalize_prepared_image_files",
-        lambda prepared, **kwargs: (_ for _ in ()).throw(
-            StorageUnavailable("publish failed")
-        ),
-    )
-
-    with pytest.raises(StorageUnavailable, match="publish failed"):
-        service.refresh_movie_metadata_strict(movie, detail)
-
-    assert Movie.get_by_id(movie.id).cover_image_id == old_image.id
-
-
-def test_strict_refresh_partial_upload_failure_preserves_published_immutable_objects(
-    test_db, monkeypatch, tmp_path
-):
-    from src.service.catalog import movie_image_service as image_module
-    from src.storage.types import ObjectStat, StorageNotFound
-
-    movie = _create_local_movie(
-        javdb_id="javdb-partial", movie_number="PARTIAL-001", title="old", summary="old"
-    )
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="new",
-        summary="new",
-    )
-    values = [("reused", b"same"), ("created", b"new"), ("failure", b"boom")]
-    prepared = []
-    for name, content in values:
-        task, path, root = _prepared_file(tmp_path, name, content)
-        prepared.append(PreparedImageFile(task, path, root))
-    reused_key = f"movies/a/reused-{hashlib.sha256(b'same').hexdigest()}.jpg"
-
-    class FakeStorage:
-        def __init__(self):
-            self.objects = {reused_key: b"same"}
-            self.deleted = []
-
-        def stat(self, key):
-            if key not in self.objects:
-                raise StorageNotFound(key)
-            return ObjectStat(key, len(self.objects[key]))
-
-        def open(self, key):
-            return io.BytesIO(self.objects[key])
-
-        def put_file(self, key, source, *, overwrite=True, immutable=False):
-            if "failure-" in key:
-                raise StorageUnavailable("third upload failed")
-            self.objects[key] = source.read_bytes()
-            return self.stat(key)
-
-        def delete(self, key, *, missing_ok=True):
-            self.deleted.append(key)
-            self.objects.pop(key, None)
-
-    storage = FakeStorage()
-    monkeypatch.setattr(image_module, "asset_storage", lambda: storage)
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "build_movie_import_image_tasks",
-        lambda *args: (None, [], {}),
-    )
-    monkeypatch.setattr(service.image_service, "collect_image_tasks", lambda *args: [])
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks_to_temporary_files",
-        lambda tasks: prepared,
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
-
-    with pytest.raises(StorageUnavailable, match="third upload failed"):
-        service.refresh_movie_metadata_strict(movie, detail)
-
-    created_key = f"movies/a/created-{hashlib.sha256(b'new').hexdigest()}.jpg"
-    assert storage.deleted == []
-    assert storage.objects == {reused_key: b"same", created_key: b"new"}
-    assert all(not item.temp_root.exists() for item in prepared)
-
-
-def test_strict_refresh_db_rollback_preserves_published_immutable_objects(
-    test_db, monkeypatch, tmp_path
-):
-    from src.service.catalog import movie_image_service as image_module
-    from src.storage.types import ObjectStat, StorageNotFound
-
-    movie = _create_local_movie(
-        javdb_id="javdb-rollback",
-        movie_number="ROLLBACK-001",
-        title="old",
-        summary="old",
-    )
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="new",
-        summary="new",
-    )
-    task, path, root = _prepared_file(tmp_path, "created", b"new")
-    prepared = [PreparedImageFile(task, path, root)]
-
-    class FakeStorage:
-        def __init__(self):
-            self.objects = {}
-            self.deleted = []
-
-        def stat(self, key):
-            if key not in self.objects:
-                raise StorageNotFound(key)
-            return ObjectStat(key, len(self.objects[key]))
-
-        def open(self, key):
-            return io.BytesIO(self.objects[key])
-
-        def put_file(self, key, source, *, overwrite=True, immutable=False):
-            self.objects[key] = source.read_bytes()
-            return self.stat(key)
-
-        def delete(self, key, *, missing_ok=True):
-            self.deleted.append(key)
-            self.objects.pop(key, None)
-
-    storage = FakeStorage()
-    monkeypatch.setattr(image_module, "asset_storage", lambda: storage)
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "build_movie_import_image_tasks",
-        lambda *args: (None, [], {}),
-    )
-    monkeypatch.setattr(service.image_service, "collect_image_tasks", lambda *args: [])
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks_to_temporary_files",
-        lambda tasks: prepared,
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
-
-    def fail_records(**kwargs):
-        Movie.update(watched_count=999).where(Movie.id == movie.id).execute()
-        raise RuntimeError("database write failed")
-
-    monkeypatch.setattr(service, "_refresh_movie_metadata_records_strict", fail_records)
-
-    with pytest.raises(RuntimeError, match="database write failed"):
-        service.refresh_movie_metadata_strict(movie, detail)
-
-    created_key = f"movies/a/created-{hashlib.sha256(b'new').hexdigest()}.jpg"
-    assert storage.deleted == []
-    assert storage.objects == {created_key: b"new"}
-    assert Movie.get_by_id(movie.id).watched_count == 0
-
-
-def test_strict_refresh_rollback_never_deletes_shared_content_addressed_key(
-    test_db, monkeypatch, tmp_path
-):
-    from src.service.catalog import movie_image_service as image_module
-    from src.storage.types import ObjectStat, StorageNotFound
-
-    movie = _create_local_movie(
-        javdb_id="javdb-shared", movie_number="SHARED-001", title="old", summary="old"
-    )
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="new",
-        summary="new",
-    )
-    task, path, root = _prepared_file(tmp_path, "shared", b"same-content")
-    prepared = [PreparedImageFile(task, path, root)]
-    deleted = []
-    objects = {}
-
-    class FakeStorage:
-        def stat(self, key):
-            if key not in objects:
-                raise StorageNotFound(key)
-            return ObjectStat(key, len(objects[key]))
-
-        def open(self, key):
-            return io.BytesIO(objects[key])
-
-        def put_file(self, key, source, *, overwrite=True, immutable=False):
-            objects[key] = source.read_bytes()
-            # A concurrent refresh commits a reference to the same immutable key.
-            image = Image.create(origin=key, small=key, medium=key, large=key)
-            Actor.create(javdb_id="concurrent-actor", name="actor", profile_image=image)
-            return self.stat(key)
-
-        def delete(self, key, *, missing_ok=True):
-            deleted.append(key)
-            objects.pop(key, None)
-
-    monkeypatch.setattr(image_module, "asset_storage", lambda: FakeStorage())
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "build_movie_import_image_tasks",
-        lambda *args: (None, [], {}),
-    )
-    monkeypatch.setattr(service.image_service, "collect_image_tasks", lambda *args: [])
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks_to_temporary_files",
-        lambda tasks: prepared,
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
-    monkeypatch.setattr(
-        service,
-        "_refresh_movie_metadata_records_strict",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("database write failed")),
-    )
-
-    with pytest.raises(RuntimeError, match="database write failed"):
-        service.refresh_movie_metadata_strict(movie, detail)
-
-    assert deleted == []
-    assert len(objects) == 1
-
-
 def test_strict_refresh_post_commit_storage_cleanup_failure_is_nonfatal(
     test_db, monkeypatch
 ):
@@ -911,22 +427,6 @@ def test_strict_refresh_post_commit_storage_cleanup_failure_is_nonfatal(
         summary="new",
     )
     service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "build_movie_import_image_tasks",
-        lambda *args: (None, [], {}),
-    )
-    monkeypatch.setattr(service.image_service, "collect_image_tasks", lambda *args: [])
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks_to_temporary_files",
-        lambda tasks: [],
-    )
-    monkeypatch.setattr(
-        service.image_service,
-        "resolve_thin_cover_from_prepared_images",
-        lambda *args: ThinCoverResolution(),
-    )
     monkeypatch.setattr(
         service,
         "_refresh_movie_metadata_records_strict",
@@ -947,60 +447,6 @@ def test_strict_refresh_post_commit_storage_cleanup_failure_is_nonfatal(
 
     assert result.watched_count == 777
     assert Movie.get_by_id(movie.id).watched_count == 777
-
-
-@pytest.mark.parametrize("failure_stage", ["thin-cover", "hashing"])
-def test_strict_refresh_preparation_failure_cleans_temporary_files(
-    test_db, monkeypatch, tmp_path, failure_stage
-):
-    movie = _create_local_movie(
-        javdb_id=f"javdb-{failure_stage}",
-        movie_number=f"PREP-{failure_stage}",
-        title="old",
-        summary="old",
-    )
-    detail = _build_detail(
-        javdb_id=movie.javdb_id,
-        movie_number=movie.movie_number,
-        title="new",
-        summary="new",
-    )
-    task, path, root = _prepared_file(tmp_path, failure_stage, b"image")
-    prepared = [PreparedImageFile(task, path, root)]
-    service = CatalogImportService()
-    monkeypatch.setattr(
-        service.image_service,
-        "build_movie_import_image_tasks",
-        lambda *args: (None, [], {}),
-    )
-    monkeypatch.setattr(service.image_service, "collect_image_tasks", lambda *args: [])
-    monkeypatch.setattr(
-        service.image_service,
-        "download_image_tasks_to_temporary_files",
-        lambda tasks: prepared,
-    )
-    if failure_stage == "thin-cover":
-        monkeypatch.setattr(
-            service.image_service,
-            "resolve_thin_cover_from_prepared_images",
-            lambda *args: (_ for _ in ()).throw(RuntimeError("generation failed")),
-        )
-    else:
-        monkeypatch.setattr(
-            service.image_service,
-            "resolve_thin_cover_from_prepared_images",
-            lambda *args: ThinCoverResolution(),
-        )
-        monkeypatch.setattr(
-            service.image_service,
-            "version_prepared_image_keys",
-            lambda files: (_ for _ in ()).throw(RuntimeError("hashing failed")),
-        )
-
-    with pytest.raises(RuntimeError, match="failed"):
-        service.refresh_movie_metadata_strict(movie, detail)
-
-    assert not root.exists()
 
 
 def test_update_movie_fields_updates_only_specified_fields_on_existing_movie(test_db):

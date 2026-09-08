@@ -1,4 +1,4 @@
-"""按番号交付完整元数据；图片由插件下载，宿主接管后入库。"""
+"""按番号交付完整元数据；插件交付本地图片文件，宿主接管后入内部存储。"""
 
 from collections.abc import Callable
 from datetime import date

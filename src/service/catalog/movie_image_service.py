@@ -1,11 +1,11 @@
 """影片图片子系统 service。
 
-从 ``CatalogImportService`` 抽出，专门负责影片/演员图片的下载、封面切割、薄封面解析
-与 Image 记录持久化。本 service 只处理图片，不写 Movie 元数据：薄封面记录由本服务
-持久化并返回，``Movie.thin_cover_image`` 的回写留在编排层（CatalogImportService）。
+从 ``CatalogImportService`` 抽出，负责外部图片引用、插件本地图片准备、封面切割、
+薄封面解析与 Image 记录持久化。本 service 只处理图片，不写 Movie 元数据：薄封面
+记录由本服务持久化并返回，``Movie.thin_cover_image`` 的回写留在编排层。
 
-阅读入口建议从图片任务的构建（``build_movie_import_image_tasks``）开始，再看下载、
-薄封面解析（``resolve_thin_cover_*``）和入库 helper（``persist_*``）。
+目录来源图片从 ``build_catalog_direct_image_tasks`` 阅读；插件本地素材从
+``build_movie_import_image_tasks`` 与 ``prepare_metadata_images`` 阅读。
 """
 
 import hashlib
@@ -26,6 +26,10 @@ from peewee import EXCLUDED
 from PIL import Image as PillowImage
 from PIL import UnidentifiedImageError
 
+from src.common.image_references import (
+    is_nonlocal_image_reference,
+    validate_external_image_url,
+)
 from src.common.media_paths import (
     media_image_root_path,
     movie_asset_relative_dir,
@@ -70,10 +74,11 @@ class ThinCoverResolution:
     generated_task: ImagePersistTask | None = None
     generated_prepared_file: PreparedImageFile | None = None
     selected_plot_index: int | None = None
+    use_cover: bool = False
 
 
 class MovieImageService:
-    """影片图片下载、封面切割与 Image 记录持久化。"""
+    """处理目录外部图片引用与插件本地图片素材。"""
 
     # 图片下载重试次数
     IMAGE_DOWNLOAD_MAX_RETRIES = 6
@@ -304,6 +309,8 @@ class MovieImageService:
         plot_links: list[MoviePlotImage],
     ) -> ThinCoverResolution:
         cover_image = movie.cover_image
+        if cover_image is not None and is_nonlocal_image_reference(cover_image.origin):
+            return ThinCoverResolution(use_cover=True)
         if cover_image is not None:
             cover_path = media_image_root_path() / cover_image.origin
             thin_cover_task = self._generate_thin_cover_task_from_cover(
@@ -317,6 +324,7 @@ class MovieImageService:
             [
                 (plot_index, media_image_root_path() / plot_link.image.origin)
                 for plot_index, plot_link in enumerate(plot_links)
+                if not is_nonlocal_image_reference(plot_link.image.origin)
             ]
         )
         return ThinCoverResolution(selected_plot_index=selected_plot_index)
@@ -360,6 +368,43 @@ class MovieImageService:
                 continue
             actor_image_tasks_by_javdb_id[actor_resource.javdb_id] = image_task
         return cover_task, plot_tasks, actor_image_tasks_by_javdb_id
+
+    def build_catalog_direct_image_tasks(
+        self,
+        movie_number: str,
+        cover_image_url: str | None,
+        plot_urls: list[str],
+        actors: list[JavdbMovieActorResource],
+    ) -> tuple[ImagePersistTask | None, list[ImagePersistTask], dict[str, ImagePersistTask]]:
+        """Build provider-reference records without creating local paths or doing I/O."""
+
+        def task(image_type: str, url: str, plot_index: int | None = None) -> ImagePersistTask:
+            validated = validate_external_image_url(url)
+            return ImagePersistTask(image_type, validated, validated, Path(), plot_index)
+
+        cover_task = task("cover", cover_image_url) if cover_image_url else None
+        plot_tasks: list[ImagePersistTask] = []
+        for index, url in enumerate(plot_urls):
+            try:
+                plot_tasks.append(task("plot", url, index))
+            except ValueError:
+                logger.warning(
+                    "Catalog optional image URL skipped image_type=plot movie_number={} index={}",
+                    movie_number,
+                    index,
+                )
+        actor_tasks: dict[str, ImagePersistTask] = {}
+        for actor in actors:
+            if actor.javdb_id in actor_tasks or not actor.avatar_url:
+                continue
+            try:
+                actor_tasks[actor.javdb_id] = task("actor", actor.avatar_url)
+            except ValueError:
+                logger.warning(
+                    "Catalog optional image URL skipped image_type=actor actor_javdb_id={}",
+                    actor.javdb_id,
+                )
+        return cover_task, plot_tasks, actor_tasks
 
     def _build_movie_image_tasks(
         self, movie_number: str, cover_image_url: str | None, plot_urls: list[str]

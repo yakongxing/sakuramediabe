@@ -5,6 +5,7 @@ catalog 目录导入和媒体硬删除都需要这份逻辑，抽出来避免重
 
 from pathlib import Path
 
+from src.common.image_references import is_nonlocal_image_reference
 from src.config.config import settings
 from src.model import Actor, Image, MediaThumbnail, Movie, MoviePlotImage, get_database
 from src.storage import asset_storage
@@ -52,7 +53,12 @@ class ImageCleanupService:
 
     @classmethod
     def delete_obsolete_image_files(cls, relative_paths: set[str]) -> None:
-        if not relative_paths:
+        local_paths = {
+            path
+            for path in relative_paths
+            if path and not is_nonlocal_image_reference(path)
+        }
+        if not local_paths:
             return
         # A cleanup may be retried after a committed publication. A replay can
         # have attached the same content-addressed key again, so fail closed at
@@ -62,10 +68,10 @@ class ImageCleanupService:
             images = Image.select(
                 Image.origin, Image.small, Image.medium, Image.large
             ).where(
-                (Image.origin.in_(relative_paths))
-                | (Image.small.in_(relative_paths))
-                | (Image.medium.in_(relative_paths))
-                | (Image.large.in_(relative_paths))
+                (Image.origin.in_(local_paths))
+                | (Image.small.in_(local_paths))
+                | (Image.medium.in_(local_paths))
+                | (Image.large.in_(local_paths))
             )
             for image in images:
                 referenced_paths.update(
@@ -77,8 +83,11 @@ class ImageCleanupService:
             # Some isolated storage tests intentionally run without a database.
             # Production cleanup is only invoked with an initialized database.
             pass
+        local_paths -= referenced_paths
+        if not local_paths:
+            return
         storage = asset_storage()
-        for relative_path in relative_paths - referenced_paths:
+        for relative_path in local_paths:
             if not relative_path:
                 continue
             storage.delete(relative_path, missing_ok=True)

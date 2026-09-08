@@ -7,8 +7,11 @@ from typing import Literal
 from urllib.parse import quote
 
 from src.api.exception.errors import ApiError
-from src.common.subtitle_paths import ensure_movie_subtitle_path
-from src.common.subtitle_paths import movie_subtitle_storage_key
+from src.common.image_references import is_nonlocal_image_reference
+from src.common.subtitle_paths import (
+    ensure_movie_subtitle_path,
+    movie_subtitle_storage_key,
+)
 from src.config.config import settings
 
 IMAGE_FILE_ROUTE_PREFIX = "/files/images"
@@ -59,7 +62,11 @@ def media_clip_root_path() -> Path:
 
 def _normalize_relative_path(relative_path: str) -> str:
     normalized_input = (relative_path or "").strip().replace("\\", "/")
-    if not normalized_input or normalized_input.startswith("/"):
+    if (
+        not normalized_input
+        or normalized_input.startswith("/")
+        or is_nonlocal_image_reference(normalized_input)
+    ):
         raise ApiError(403, "file_path_invalid", "文件路径非法")
 
     raw_parts = normalized_input.split("/")

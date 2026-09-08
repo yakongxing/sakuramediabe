@@ -24,6 +24,7 @@ from src.start.migrations.runner import (
     ACTOR_METADATA_MIGRATION_NAME,
     CONSOLIDATED_MIGRATION_NAME,
     HOT_REVIEW_ITEM_REMOVAL_MIGRATION_NAME,
+    IMAGE_REFERENCES_MIGRATION_NAME,
     IMAGE_SEARCH_INDEX_SPACE_STATE_MIGRATION_NAME,
     IMAGE_SEARCH_QUEUE_INDEXES_MIGRATION_NAME,
     MEDIA_IMPORT_SOURCE_IDENTITY_MIGRATION_NAME,
@@ -106,6 +107,7 @@ def test_current_migrations_are_discoverable_in_order():
         MEDIA_IMPORT_SOURCE_IDENTITY_MIGRATION_NAME,
         ACTOR_METADATA_MIGRATION_NAME,
         PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
+        IMAGE_REFERENCES_MIGRATION_NAME,
     ]
 
 
@@ -122,6 +124,25 @@ def test_plugin_metadata_migration_preserves_movies_and_allows_multiple_null_ids
     for number in ("NEW-001", "NEW-002"):
         Movie.create(movie_number=number, javdb_id=None, title="Plugin", metadata_source={"plugin_id": "test"})
     assert Movie.select().where(Movie.javdb_id.is_null()).count() == 2
+
+
+def test_image_reference_migration_retires_preexisting_publication_rows(clean_db):
+    clean_db.create_tables(TEST_MODELS)
+    queued = BackgroundTaskRun.create(
+        task_key="image_publication",
+        task_name="legacy publication",
+        trigger_type="internal",
+        state="pending",
+        mutex_key="legacy-image-publication",
+    )
+    module = _load_migration_module(Path(f"{IMAGE_REFERENCES_MIGRATION_NAME}.py"))
+
+    module.migrate(clean_db)
+
+    queued = BackgroundTaskRun.get_by_id(queued.id)
+    assert queued.state == "failed"
+    assert queued.mutex_key is None
+    assert queued.error_message == "catalog_image_publication_retired"
 
 
 def test_run_pending_migrations_rejects_v0421_base(clean_db):
@@ -175,6 +196,7 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         MigrationExecution(name=MEDIA_IMPORT_SOURCE_IDENTITY_MIGRATION_NAME, applied=True),
         MigrationExecution(name=ACTOR_METADATA_MIGRATION_NAME, applied=True),
         MigrationExecution(name=PLUGIN_MOVIE_METADATA_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=IMAGE_REFERENCES_MIGRATION_NAME, applied=True),
     ]
     assert _schema_migration_names(clean_db) == [
         CONSOLIDATED_MIGRATION_NAME,
@@ -189,6 +211,7 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         MEDIA_IMPORT_SOURCE_IDENTITY_MIGRATION_NAME,
         ACTOR_METADATA_MIGRATION_NAME,
         PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
+        IMAGE_REFERENCES_MIGRATION_NAME,
     ]
 
 
@@ -341,7 +364,7 @@ def test_consolidated_migration_upgrades_v0421_schema_and_preserves_required_mem
         SchemaMigration.create(name=CONSOLIDATED_MIGRATION_NAME)
     summary = run_pending_migrations(clean_db)
 
-    assert summary.applied_count == 11
+    assert summary.applied_count == 12
     assert clean_db.execute_sql(
         "SELECT interaction_synced_at FROM movie WHERE id = %s", (movie.id,)
     ).fetchone()[0] == datetime(2026, 8, 20, 1, 2, 3)

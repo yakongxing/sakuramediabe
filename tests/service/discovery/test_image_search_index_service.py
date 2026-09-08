@@ -280,6 +280,60 @@ def test_batch_422_falls_back_to_single_images_and_only_fails_bad_image(
     )
 
 
+@pytest.mark.parametrize(
+    "reference", ["https://[not-an-ipv6]/plot.jpg", " https://example.test/plot.jpg"]
+)
+def test_plot_indexing_skips_malformed_url_like_reference_without_path_access(
+    test_db, monkeypatch, tmp_path, reference
+):
+    _, plot_images, _ = _prepare_images(tmp_path, thumbnail_count=0, plot_count=1)
+    image = plot_images[0].image
+    image.origin = reference
+    image.save(only=[Image.origin])
+    monkeypatch.setattr(
+        "src.service.discovery.image_search_index_service.resolve_image_file_path",
+        lambda origin: pytest.fail(f"malformed reference reached filesystem: {origin}"),
+    )
+
+    service = ImageSearchIndexService(
+        store=_Store("thumbnail"), plot_store=_Store("plot"), embedder=_Embedder()
+    )
+    successful, failed = service._index_plot_image_batch(plot_images, 1)
+
+    assert (successful, failed) == (0, 1)
+    assert (
+        MoviePlotImage.get_by_id(plot_images[0].id).image_search_index_status
+        == MoviePlotImage.IMAGE_SEARCH_INDEX_STATUS_FAILED
+    )
+
+
+@pytest.mark.parametrize(
+    "reference", ["javascript:alert(1)", " https://example.test/a.jpg"]
+)
+def test_thumbnail_indexing_skips_malformed_url_like_reference_without_path_access(
+    test_db, monkeypatch, tmp_path, reference
+):
+    thumbnails, _, _ = _prepare_images(tmp_path, thumbnail_count=1, plot_count=0)
+    image = thumbnails[0].image
+    image.origin = reference
+    image.save(only=[Image.origin])
+    monkeypatch.setattr(
+        "src.service.discovery.image_search_index_service.resolve_image_file_path",
+        lambda origin: pytest.fail(f"malformed reference reached filesystem: {origin}"),
+    )
+
+    service = ImageSearchIndexService(
+        store=_Store("thumbnail"), plot_store=_Store("plot"), embedder=_Embedder()
+    )
+    successful, failed = service._index_thumbnail_batch(thumbnails, 1)
+
+    assert (successful, failed) == (0, 1)
+    assert (
+        MediaThumbnail.get_by_id(thumbnails[0].id).image_search_index_status
+        == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_FAILED
+    )
+
+
 def test_qdrant_failure_leaves_batch_pending(test_db, monkeypatch, tmp_path):
     thumbnails, _, paths = _prepare_images(tmp_path, thumbnail_count=1, plot_count=0)
     monkeypatch.setattr(
