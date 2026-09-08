@@ -209,6 +209,8 @@ class VideoCollectionService:
                 fn.COALESCE(first_media.duration_seconds, 0).alias("first_duration_seconds"),
                 fn.COALESCE(first_media.file_size_bytes, 0).alias("first_file_size_bytes"),
                 fn.COALESCE(first_media.resolution, "").alias("first_resolution"),
+                fn.COALESCE(first_media_id.c.media_count, 0).alias("media_count"),
+                fn.COALESCE(first_media_id.c.valid_count, 0).alias("valid_count"),
                 # 用 COALESCE 包裹才会作为标量挂到 link 上（裸 alias 字段会归到 aliased model）；
                 # 0 作「无媒体」哨兵（media id 恒为正）。
                 fn.COALESCE(first_media.id, 0).alias("play_media_id"),
@@ -228,10 +230,10 @@ class VideoCollectionService:
         if limit is not None:
             query = query.limit(limit)
         links = list(query)
-        stats = VideoItemService._media_stats([link.video_item_id for link in links])
         items: list[VideoCollectionItemResource] = []
         for link in links:
-            media_count, can_play = stats.get(link.video_item_id, (0, False))
+            media_count = link.media_count
+            can_play = bool(link.valid_count)
             play_url = None
             if include_play_url and link.play_media_id:
                 try:

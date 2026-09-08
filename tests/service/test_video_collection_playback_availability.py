@@ -7,29 +7,32 @@ from src.model import VideoCollection, VideoCollectionItem, VideoItem
 from src.plugins.provider_protocol import ProviderUnavailableError
 from src.service.videos import video_collection_service
 from src.service.videos.video_collection_service import VideoCollectionService
-from src.service.videos.video_item_service import VideoItemService
 
 
 def test_collection_keeps_members_when_one_provider_is_missing(monkeypatch):
     # 仅替换数据库查询；保留分页入口、资源组装、签名地址与插件错误语义。
     links = []
     for item_id, provider_key, media_id in [(1, "missing", 101), (2, "local", 102), (3, "", 0)]:
-        links.append(SimpleNamespace(
-            id=item_id,
-            position=item_id - 1,
-            video_item_id=item_id,
-            video_item=VideoItem(
+        links.append(
+            SimpleNamespace(
                 id=item_id,
-                title=f"video-{item_id}",
-                created_at=datetime(2026, 1, 1),
-                updated_at=datetime(2026, 1, 1),
-            ),
-            play_media_id=media_id,
-            play_provider_key=provider_key,
-            first_duration_seconds=10,
-            first_file_size_bytes=100,
-            first_resolution="1920x1080",
-        ))
+                position=item_id - 1,
+                video_item_id=item_id,
+                video_item=VideoItem(
+                    id=item_id,
+                    title=f"video-{item_id}",
+                    created_at=datetime(2026, 1, 1),
+                    updated_at=datetime(2026, 1, 1),
+                ),
+                play_media_id=media_id,
+                play_provider_key=provider_key,
+                first_duration_seconds=10,
+                first_file_size_bytes=100,
+                first_resolution="1920x1080",
+                media_count=0 if media_id == 0 else 1,
+                valid_count=0 if media_id == 0 else 1,
+            )
+        )
     query = MagicMock()
     for method in ("join", "switch", "where", "order_by", "limit"):
         getattr(query, method).return_value = query
@@ -38,9 +41,6 @@ def test_collection_keeps_members_when_one_provider_is_missing(monkeypatch):
     monkeypatch.setattr(VideoCollectionItem, "select", lambda *_args: query)
     monkeypatch.setattr(
         VideoCollectionService, "_require_collection", lambda _id: VideoCollection(id=1)
-    )
-    monkeypatch.setattr(
-        VideoItemService, "_media_stats", lambda _ids: {1: (1, True), 2: (1, True)}
     )
 
     def require(provider_key):

@@ -2,10 +2,16 @@ import pytest
 
 from src.api.exception.errors import ApiError
 from src.common.file_signatures import (
+    build_signed_file_cache_control,
     build_signed_media_url,
     build_signed_merged_media_url,
     verify_media_signature,
 )
+
+
+def test_signed_file_cache_control_never_outlives_signature():
+    assert build_signed_file_cache_control(1_700_003_600) == "public, max-age=3600"
+    assert build_signed_file_cache_control(1_699_999_999) == "public, max-age=0"
 
 
 def test_media_resource_path_accepts_relative_segments():

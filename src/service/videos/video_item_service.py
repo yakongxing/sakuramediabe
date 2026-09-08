@@ -4,7 +4,6 @@
 from peewee import JOIN, Case, fn
 
 from src.api.exception.errors import ApiError
-from src.common import build_signed_media_url
 from src.common.media_formats import normalize_media_resolution
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
@@ -15,22 +14,12 @@ from src.common.service_helpers import (
 from src.model import (
     Image,
     Media,
-    MediaLibrary,
-    MediaPoint,
-    MediaProgress,
-    MediaThumbnail,
     VideoCollection,
     VideoCollectionItem,
     VideoItem,
     get_database,
 )
-from src.plugins.provider_protocol import MEDIA_PROVIDER_REGISTRY
 from src.schema.catalog.actors import ImageResource
-from src.schema.catalog.movies import (
-    MovieMediaPointResource,
-    MovieMediaProgressResource,
-    MovieMediaResource,
-)
 from src.schema.common.pagination import PageResponse
 from src.schema.videos.items import (
     VideoCollectionRef,
@@ -39,13 +28,28 @@ from src.schema.videos.items import (
     VideoItemListItemResource,
     VideoItemUpdateRequest,
 )
+from src.service.media_detail_read_service import MediaDetailReadService
 
 
 class VideoItemService:
     @staticmethod
-    @staticmethod
     def _require_video(video_id: int) -> VideoItem:
         return require_by_id(VideoItem, video_id, "video_item", error_message="Video item not found")
+
+    @staticmethod
+    def _require_video_detail(video_id: int) -> VideoItem:
+        query = VideoItem.select(VideoItem, Image).join(
+            Image,
+            JOIN.LEFT_OUTER,
+            on=(VideoItem.cover_image == Image.id),
+        )
+        return require_by_id(
+            VideoItem,
+            video_id,
+            "video_item",
+            error_message="Video item not found",
+            query=query,
+        )
 
     @staticmethod
     def _parse_resolution(value: str | None) -> tuple[int | None, int | None]:
@@ -62,15 +66,19 @@ class VideoItemService:
 
     @staticmethod
     def _first_media_alias():
-        """构造取「条目第一条媒体」的连接素材：每条目 MIN(Media.id) 分组子查询 + Media 别名。
+        """构造视频媒体统计及「第一条媒体」的分组子查询与 Media 别名。
 
         返回 (first_media 别名, first_media_id 子查询)，两者配合 LEFT JOIN 后，
-        first_media 即每个条目按 Media.id 升序的第一条媒体，其时长/大小同时供排序与展示。
+        first_media 即每个条目按 Media.id 升序的第一条媒体；同一次分组扫描还计算媒体数量
+        和有效媒体数量，避免列表页再执行一次聚合查询。
         """
+        valid_count = fn.SUM(Case(None, [(Media.valid == True, 1)], 0))
         first_media_id = Media.select(
             Media.video_item.alias("owner_id"),
             fn.MIN(Media.id).alias("first_media_id"),
-        ).group_by(Media.video_item)
+            fn.COUNT(Media.id).alias("media_count"),
+            valid_count.alias("valid_count"),
+        ).where(Media.video_item.is_null(False)).group_by(Media.video_item)
         return Media.alias(), first_media_id
 
     @classmethod
@@ -121,27 +129,6 @@ class VideoItemService:
                 raise ApiError(422, "invalid_video_filter", "Invalid video filter", {"query": query})
             video_query = video_query.where(VideoItem.title.contains(normalized))
         return video_query
-
-    @staticmethod
-    def _media_stats(video_ids: list[int]) -> dict[int, tuple[int, bool]]:
-        """批量统计每个视频的媒体数量与是否存在可播放媒体。"""
-        if not video_ids:
-            return {}
-        # 用 CASE 折算 valid 计数，避免 PostgreSQL 不支持 SUM(boolean)。
-        valid_count = fn.SUM(Case(None, [(Media.valid == True, 1)], 0))
-        rows = (
-            Media.select(
-                Media.video_item,
-                fn.COUNT(Media.id).alias("media_count"),
-                valid_count.alias("valid_count"),
-            )
-            .where(Media.video_item.in_(video_ids))
-            .group_by(Media.video_item)
-        )
-        stats: dict[int, tuple[int, bool]] = {}
-        for row in rows:
-            stats[row.video_item_id] = (row.media_count, bool(row.valid_count))
-        return stats
 
     @staticmethod
     def _collections_map(video_ids: list[int]) -> dict[int, list[VideoCollectionRef]]:
@@ -224,6 +211,8 @@ class VideoItemService:
                 fn.COALESCE(first_media.duration_seconds, 0).alias("first_duration_seconds"),
                 fn.COALESCE(first_media.file_size_bytes, 0).alias("first_file_size_bytes"),
                 fn.COALESCE(first_media.resolution, "").alias("first_resolution"),
+                fn.COALESCE(first_media_id.c.media_count, 0).alias("media_count"),
+                fn.COALESCE(first_media_id.c.valid_count, 0).alias("valid_count"),
             )
             .join(Image, JOIN.LEFT_OUTER, on=(VideoItem.cover_image == Image.id))
             .switch(VideoItem)
@@ -234,7 +223,6 @@ class VideoItemService:
             .limit(page_size)
         )
         video_ids = [video.id for video in videos]
-        stats = cls._media_stats(video_ids)
         collections_map = cls._collections_map(video_ids)
         items = []
         for video in videos:
@@ -242,7 +230,8 @@ class VideoItemService:
             items.append(
                 cls._to_list_item(
                     video,
-                    *stats.get(video.id, (0, False)),
+                    video.media_count,
+                    bool(video.valid_count),
                     duration_seconds=video.first_duration_seconds,
                     file_size_bytes=video.first_file_size_bytes,
                     cover_width=cover_width,
@@ -257,65 +246,11 @@ class VideoItemService:
             total=total,
         )
 
-    @staticmethod
-    def _media_items(video: VideoItem) -> list[MovieMediaResource]:
-        """组装视频详情页的媒体列表，复用影片媒体资源结构（进度 + 时刻）。"""
-        media_items = list(
-            Media.select(Media, MediaLibrary)
-            .join(MediaLibrary, JOIN.LEFT_OUTER)
-            .where(Media.video_item == video)
-            .order_by(Media.id)
-        )
-        if not media_items:
-            return []
-        media_ids = [media.id for media in media_items]
-        progress_items = {
-            progress.media_id: progress
-            for progress in MediaProgress.select(MediaProgress).where(MediaProgress.media.in_(media_ids))
-        }
-        points_by_media_id: dict[int, list[MovieMediaPointResource]] = {}
-        point_query = (
-            MediaPoint.select(MediaPoint, MediaThumbnail, Image)
-            .join(MediaThumbnail)
-            .switch(MediaThumbnail)
-            .join(Image)
-            .where(MediaPoint.media.in_(media_ids))
-            .order_by(MediaPoint.media, MediaPoint.id)
-        )
-        for point in point_query:
-            points_by_media_id.setdefault(point.media_id, []).append(
-                MovieMediaPointResource(
-                    point_id=point.id,
-                    thumbnail_id=point.thumbnail_id,
-                    offset_seconds=point.offset_seconds,
-                    image=ImageResource.from_attributes_model(point.thumbnail.image),
-                )
-            )
-        resources: list[MovieMediaResource] = []
-        for media in media_items:
-            progress = progress_items.get(media.id)
-            media.progress = (
-                None
-                if progress is None
-                else MovieMediaProgressResource(
-                    last_position_seconds=progress.position_seconds,
-                    last_watched_at=progress.last_watched_at,
-                )
-            )
-            media.points = points_by_media_id.get(media.id, [])
-            bundle = MEDIA_PROVIDER_REGISTRY.require(media.library.provider_key)
-            media.play_url = build_signed_media_url(
-                media.id, delivery=bundle.playback_deliveries[0]
-            )
-            media.provider_key = media.library.provider_key
-            media.playback_deliveries = list(bundle.playback_deliveries)
-            resources.append(MovieMediaResource.from_attributes_model(media))
-        return resources
-
     @classmethod
     def get_video_detail(cls, video_id: int) -> VideoItemDetailResource:
-        video = cls._require_video(video_id)
-        media_items = cls._media_items(video)
+        video = cls._require_video_detail(video_id)
+        media_batch = MediaDetailReadService.for_video(video)
+        media_items = media_batch.resources
         stats_media_count = len(media_items)
         can_play = any(media.valid for media in media_items)
         # 时长/大小取第一条媒体（media_items 已按 Media.id 升序），无媒体时为 0。

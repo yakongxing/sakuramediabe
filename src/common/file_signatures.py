@@ -37,6 +37,12 @@ def build_signature_expires() -> int:
     return -(-target // window) * window
 
 
+def build_signed_file_cache_control(expires: int) -> str:
+    """Build a public cache policy that never outlives a signed file URL."""
+    max_age = max(0, int(expires) - _now_timestamp())
+    return f"public, max-age={max_age}"
+
+
 def _image_root_path() -> Path:
     image_root_path = Path(settings.media.import_image_root_path).expanduser()
     if not image_root_path.is_absolute():

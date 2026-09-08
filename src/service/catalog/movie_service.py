@@ -12,7 +12,6 @@ from peewee import JOIN, fn
 
 from src.api.exception.errors import ApiError
 from src.common import (
-    build_signed_media_url,
     build_signed_merged_media_url,
     parse_movie_number_from_text,
 )
@@ -33,9 +32,6 @@ from src.model import (
     Image,
     Media,
     MediaLibrary,
-    MediaPoint,
-    MediaProgress,
-    MediaThumbnail,
     Movie,
     MovieActor,
     MoviePlotImage,
@@ -48,7 +44,6 @@ from src.plugins.provider_protocol import (
     ProviderOperationError,
     ProviderUnavailableError,
 )
-from src.schema.catalog.actors import ImageResource
 from src.schema.catalog.movies import (
     MovieBlacklistBatchRequest,
     MovieCollectionMarkResponse,
@@ -58,9 +53,6 @@ from src.schema.catalog.movies import (
     MovieDetailResource,
     MovieListItemResource,
     MovieListStatus,
-    MovieMediaPointResource,
-    MovieMediaProgressResource,
-    MovieMediaResource,
     MovieMergedPlaybackResource,
     MovieMergePlaybackCandidateResource,
     MovieNumberParseResponse,
@@ -74,6 +66,7 @@ from src.schema.catalog.movies import (
 from src.schema.common.pagination import PageResponse
 from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
 from src.service.collections import PlaylistService
+from src.service.media_detail_read_service import MediaDetailReadService
 from src.service.playback.provider_helpers import library_handle_for, media_handle_for
 
 
@@ -342,76 +335,20 @@ class MovieService:
         return [link.image for link in query]
 
     @staticmethod
-    def _media_items(movie: Movie) -> list[MovieMediaResource]:
-        """把媒体、播放进度和打点信息折叠成详情页需要的资源结构。"""
-        media_items = list(
-            Media.select(Media, MediaLibrary)
-            .join(MediaLibrary, JOIN.LEFT_OUTER)
-            .where(Media.movie == movie)
-            .order_by(Media.id)
-        )
-        if not media_items:
-            return []
-
-        media_ids = [media.id for media in media_items]
-        # 进度和打点分开查，避免在一个大 join 里把媒体行放大成笛卡尔展开。
-        progress_items = {
-            progress.media_id: progress
-            for progress in MediaProgress.select(MediaProgress).where(MediaProgress.media.in_(media_ids))
-        }
-
-        points_by_media_id: dict[int, list[MovieMediaPointResource]] = {}
-        point_query = (
-            MediaPoint.select(MediaPoint, MediaThumbnail, Image)
-            .join(MediaThumbnail)
-            .switch(MediaThumbnail)
-            .join(Image)
-            .where(MediaPoint.media.in_(media_ids))
-            .order_by(MediaPoint.media, MediaPoint.id)
-        )
-        for point in point_query:
-            if point.media_id not in points_by_media_id:
-                points_by_media_id[point.media_id] = []
-            points_by_media_id[point.media_id].append(
-                MovieMediaPointResource(
-                    point_id=point.id,
-                    thumbnail_id=point.thumbnail_id,
-                    offset_seconds=point.offset_seconds,
-                    image=ImageResource.from_attributes_model(point.thumbnail.image),
-                )
-            )
-
-        resources: list[MovieMediaResource] = []
-        for media in media_items:
-            # 详情资源需要把播放进度和精彩时间点挂回各自 media 上。
-            progress = progress_items.get(media.id)
-            if progress is None:
-                media.progress = None
-            else:
-                media.progress = MovieMediaProgressResource(
-                    last_position_seconds=progress.position_seconds,
-                    last_watched_at=progress.last_watched_at,
-                )
-            media.points = points_by_media_id.get(media.id, [])
-            bundle = MEDIA_PROVIDER_REGISTRY.require(media.library.provider_key)
-            media.play_url = build_signed_media_url(
-                media.id, delivery=bundle.playback_deliveries[0]
-            )
-            media.provider_key = media.library.provider_key
-            media.playback_deliveries = list(bundle.playback_deliveries)
-            resources.append(MovieMediaResource.from_attributes_model(media))
-        return resources
-
-    @staticmethod
     def _merge_playback_groups(
         movie: Movie,
+        *,
+        media_items: list[Media] | None = None,
+        provider_bundles: dict[str, object] | None = None,
     ) -> list[tuple[MediaLibrary, list[Media], str]]:
-        media_items = list(
-            Media.select(Media, MediaLibrary)
-            .join(MediaLibrary)
-            .where(Media.movie == movie)
-            .order_by(Media.id)
-        )
+        if media_items is None:
+            media_items = list(
+                Media.select(Media, MediaLibrary)
+                .join(MediaLibrary)
+                .where(Media.movie == movie)
+                .order_by(Media.id)
+            )
+        bundle_cache = provider_bundles if provider_bundles is not None else {}
         groups: dict[int, tuple[MediaLibrary, list[Media]]] = {}
         for media in media_items:
             library = media.library
@@ -427,7 +364,10 @@ class MovieService:
             # 合并播放表示同库的完整分段集合；任一段失效时不能悄悄跳过它。
             if len(medias) < 2 or any(not media.valid for media in medias):
                 continue
-            bundle = MEDIA_PROVIDER_REGISTRY.require(library.provider_key)
+            bundle = bundle_cache.get(library.provider_key)
+            if bundle is None:
+                bundle = MEDIA_PROVIDER_REGISTRY.require(library.provider_key)
+                bundle_cache[library.provider_key] = bundle
             playback_format = getattr(bundle, "merged_playback_format", None)
             if playback_format not in {"mp4", "hls"}:
                 continue
@@ -436,7 +376,11 @@ class MovieService:
 
     @classmethod
     def _merge_playback_candidates(
-        cls, movie: Movie
+        cls,
+        movie: Movie,
+        *,
+        media_items: list[Media] | None = None,
+        provider_bundles: dict[str, object] | None = None,
     ) -> list[MovieMergePlaybackCandidateResource]:
         return [
             MovieMergePlaybackCandidateResource(
@@ -445,7 +389,11 @@ class MovieService:
                 provider_key=library.provider_key,
                 segment_count=len(medias),
             )
-            for library, medias, _playback_format in cls._merge_playback_groups(movie)
+            for library, medias, _playback_format in cls._merge_playback_groups(
+                movie,
+                media_items=media_items,
+                provider_bundles=provider_bundles,
+            )
         ]
 
     @classmethod
@@ -505,8 +453,13 @@ class MovieService:
         movie.actors = MovieService._actors(movie)
         movie.tags = tags
         movie.plot_images = MovieService._plot_images(movie)
-        movie.media_items = MovieService._media_items(movie)
-        movie.merge_playback_candidates = MovieService._merge_playback_candidates(movie)
+        media_batch = MediaDetailReadService.for_movie(movie)
+        movie.media_items = media_batch.resources
+        movie.merge_playback_candidates = MovieService._merge_playback_candidates(
+            movie,
+            media_items=media_batch.media,
+            provider_bundles=media_batch.provider_bundles,
+        )
         movie.playlists = PlaylistService.list_movie_playlists(movie)
         movie.can_play = any(media_item.valid for media_item in movie.media_items)
         return MovieDetailResource.from_attributes_model(movie)

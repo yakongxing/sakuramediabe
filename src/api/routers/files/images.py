@@ -1,9 +1,8 @@
-from fastapi import APIRouter
-from fastapi import Request
+from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
 from src.api.routers._utils import require_existing_file, require_signed_params
-from src.common import verify_image_signature
+from src.common import build_signed_file_cache_control, verify_image_signature
 from src.storage import StorageNotFound, asset_storage
 
 router = APIRouter(prefix="/files/images", tags=["files"])
@@ -23,9 +22,17 @@ def get_image_file(
     local_path = storage.local_path(normalized_path)
     if local_path is not None:
         require_existing_file(local_path)
-        return FileResponse(local_path)
+        response = FileResponse(local_path)
+        response.headers["Cache-Control"] = build_signed_file_cache_control(expires)
+        return response
     try:
-        return storage.range_response(normalized_path, request.headers.get("range"), "application/octet-stream")
+        response = storage.range_response(
+            normalized_path,
+            request.headers.get("range"),
+            "application/octet-stream",
+        )
+        response.headers["Cache-Control"] = build_signed_file_cache_control(expires)
+        return response
     except StorageNotFound as exc:
         from src.api.exception.errors import ApiError
         raise ApiError(404, "file_not_found", "文件不存在") from exc
