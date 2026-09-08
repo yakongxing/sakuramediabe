@@ -14,6 +14,43 @@ from src.service.catalog.movie_image_service import (
 )
 
 
+@pytest.mark.parametrize("unknown", [False, True])
+def test_finalize_collects_later_success_after_first_failure(monkeypatch, tmp_path, unknown):
+    from src.service.catalog import movie_image_service as module
+    from src.storage.types import StoragePublicationUnknown, StorageUnavailable
+
+    later_started = threading.Event()
+    failed = threading.Event()
+    uploaded = set()
+
+    class Storage:
+        supports_direct_immutable_put = True
+
+        def put_file(self, key, source, **kwargs):
+            if key == "first.webp":
+                assert later_started.wait(5)
+                failed.set()
+                if unknown:
+                    raise StoragePublicationUnknown(key, "unknown")
+                raise StorageUnavailable("failed")
+            later_started.set()
+            assert failed.wait(5)
+            uploaded.add(key)
+
+    monkeypatch.setattr(module, "asset_storage", Storage)
+    monkeypatch.setattr(module.settings.storage, "webdav_publication_max_workers", 2)
+    prepared = [
+        PreparedImageFile(
+            ImagePersistTask("plot", "unused", key, tmp_path / key), tmp_path / key, tmp_path,
+        )
+        for key in ("first.webp", "later.webp")
+    ]
+    created_keys = set()
+    with pytest.raises(StorageUnavailable):
+        MovieImageService().finalize_prepared_image_files(prepared, created_keys=created_keys, cleanup=False)
+    assert uploaded == created_keys == {"later.webp"}
+
+
 def test_finalize_prepared_image_files_skips_upload_when_size_unchanged(monkeypatch, tmp_path):
     from src.service.catalog import movie_image_service as module
     from src.storage.types import ObjectStat

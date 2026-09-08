@@ -9,6 +9,17 @@ from src.storage.keys import normalize_storage_key
 from src.storage.local import LocalStorageBackend
 
 
+@pytest.fixture(autouse=True)
+def fake_download_adapter(monkeypatch):
+    """Legacy fake clients expose a download hook; HTTP contract tests use real GETs."""
+    from src.storage.webdav import WebDAVStorageBackend
+
+    monkeypatch.setattr(
+        WebDAVStorageBackend, "_download_once",
+        lambda self, key, target: self.client.download_fileobj(self._path(key), target),
+    )
+
+
 @pytest.mark.parametrize("key", ["", "/absolute", "a//b", "a/../b", "a\\b", "a/%2e%2e/b", "a/%252e%252e/b", "a\x00b"])
 def test_storage_key_rejects_unsafe_values(key):
     with pytest.raises(ValueError):
@@ -75,7 +86,6 @@ def test_webdav_put_file_publishes_through_temporary_key(monkeypatch, tmp_path):
 
         def mkdir(self, path):
             calls.append(("mkdir", path))
-            raise module.ResourceAlreadyExists(path)
 
         def upload_fileobj(self, file_obj, to_path, *, overwrite=False, size=None, **kwargs):
             calls.append(("upload", to_path, overwrite, size, file_obj.read()))
@@ -115,7 +125,7 @@ def test_webdav_immutable_put_uploads_directly_to_final_key(monkeypatch, tmp_pat
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def info(self, path):
             assert uploads, "immutable publication must not stat the new final key before PUT"
             return {"size": 5, "type": "file"}
@@ -145,7 +155,7 @@ def test_webdav_immutable_put_rejects_same_size_wrong_content(monkeypatch, tmp_p
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, *args, **kwargs): pass
         def info(self, path): return {"size": 5, "type": "file", "etag": "not-a-hash"}
         def download_fileobj(self, path, target): target.write(b"wrong")
@@ -168,7 +178,7 @@ def test_webdav_put_retries_eventual_temp_visibility_404(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path):
             info_calls.append(path)
@@ -201,7 +211,7 @@ def test_webdav_put_retries_transient_move_423(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): objects.add(to_path)
         def info(self, path):
             if path not in objects:
@@ -239,7 +249,7 @@ def test_webdav_put_accepts_ambiguous_move_that_already_published(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs):
             objects[to_path] = file_obj.read()
         def info(self, path):
@@ -283,7 +293,7 @@ def test_webdav_ambiguous_move_does_not_accept_old_equal_size_destination(monkey
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): objects[to_path] = file_obj.read()
         def info(self, path):
             if path not in objects: raise module.ResourceNotFound(path)
@@ -320,7 +330,7 @@ def test_webdav_concurrent_publish_reconciles_412_when_destination_matches(monke
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs):
             objects[to_path] = file_obj.read()
         def info(self, path):
@@ -361,7 +371,7 @@ def test_webdav_concurrent_publish_rejects_412_when_destination_hash_mismatches(
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs):
             objects[to_path] = file_obj.read()
         def info(self, path):
@@ -400,7 +410,7 @@ def test_webdav_backend_enforces_publication_concurrency_limit(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs):
             nonlocal active, maximum_active
             with lock:
@@ -437,7 +447,7 @@ def test_webdav_put_does_not_retry_permanent_move_error(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path): return {"size": 5, "type": "file"}
         def move(self, src_path, dst_path, *, overwrite=False):
@@ -467,7 +477,7 @@ def test_webdav_cleanup_failure_does_not_mask_publish_error(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path): return {"size": 5, "type": "file"}
         def move(self, src_path, dst_path, *, overwrite=False):
@@ -492,7 +502,7 @@ def test_webdav_put_retries_eventual_final_visibility_404(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path):
             nonlocal final_info_calls
@@ -522,7 +532,7 @@ def test_webdav_final_visibility_uses_separate_realistic_retry_window(monkeypatc
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): objects[to_path] = file_obj.read()
         def info(self, path):
             nonlocal final_info_calls
@@ -551,7 +561,7 @@ def test_webdav_exhausted_final_visibility_reports_possible_publication(monkeypa
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path):
             if ".uploading-" in path: return {"size": 5, "type": "file"}
@@ -578,7 +588,7 @@ def test_webdav_success_opportunistically_wires_bounded_temp_cleanup(monkeypatch
     calls = []
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path): return {"size": 5, "type": "file"}
         def move(self, src_path, dst_path, *, overwrite=False): pass
@@ -603,7 +613,7 @@ def test_webdav_successful_publish_leaves_no_temporary_object(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs):
             objects[to_path] = file_obj.read()
         def info(self, path):
@@ -668,7 +678,7 @@ def test_webdav_failed_publish_preserves_existing_final(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
-        def mkdir(self, path): raise module.ResourceAlreadyExists(path)
+        def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): objects[to_path] = file_obj.read()
         def info(self, path): return {"size": len(objects[path]), "type": "file"}
         def move(self, src_path, dst_path, *, overwrite=False): raise DavError()

@@ -33,6 +33,8 @@ from src.service.discovery.qdrant_thumbnail_store import (
     ThumbnailVectorRecord,
     get_qdrant_thumbnail_store,
 )
+from src.storage import asset_storage
+from src.storage.types import StorageError
 
 
 class ImageSearchIndexService:
@@ -219,12 +221,11 @@ class ImageSearchIndexService:
                     failed_ids.append(thumbnail.id)
                     continue
                 try:
-                    payloads.append(
-                        resolve_image_file_path(thumbnail.image.origin).read_bytes()
-                    )
-                except FileNotFoundError:
+                    with asset_storage().open(thumbnail.image.origin) as stream:
+                        payloads.append(stream.read())
+                except (OSError, StorageError):
                     logger.warning(
-                        "Image search thumbnail file is missing thumbnail_id={} media_id={}",
+                        "Image search thumbnail read failed thumbnail_id={} media_id={}",
                         thumbnail.id,
                         thumbnail.media_id,
                     )

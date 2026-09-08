@@ -672,9 +672,21 @@ class MovieImageService:
             max_workers=min(settings.storage.webdav_publication_max_workers, len(prepared_files)),
             thread_name_prefix="image-publication",
         ) as executor:
-            for key in executor.map(publish, prepared_files):
-                if key is not None and created_keys is not None:
-                    created_keys.add(key)
+            futures = {executor.submit(publish, item): item for item in prepared_files}
+            errors: list[Exception] = []
+            for future in as_completed(futures):
+                try:
+                    key = future.result()
+                except StoragePublicationUnknown as exc:
+                    logger.warning("Catalog image publication unknown key={}", exc.key)
+                    errors.append(exc)
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    if key is not None and created_keys is not None:
+                        created_keys.add(key)
+        if errors:
+            raise errors[0]
 
         if cleanup:
             for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
@@ -703,6 +715,7 @@ class MovieImageService:
         temp_root = Path(tempfile.mkdtemp(prefix="metadata-", dir=root))
         prepared = []
         final_paths = []
+        created_keys: set[str] = set()
         try:
             for task in tasks:
                 path = temp_root / task.relative_path
@@ -726,7 +739,7 @@ class MovieImageService:
                 item.image_task.relative_path = relative.as_posix()
                 item.image_task.absolute_path = root / relative
                 final_paths.append(relative.as_posix())
-            self.finalize_prepared_image_files(prepared)
+            self.finalize_prepared_image_files(prepared, created_keys=created_keys)
             yield cover_task, plot_tasks, actor_tasks, thin
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
@@ -739,7 +752,7 @@ class MovieImageService:
                         Image.origin.in_(final_paths)
                     )
                 }
-                self.delete_obsolete_image_files(set(final_paths) - used)
+                self.delete_obsolete_image_files(created_keys - used)
             except Exception as exc:
                 logger.warning("元数据未引用图片清理失败 detail={}", exc)
 

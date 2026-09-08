@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from loguru import logger
 
-from src.common import resolve_image_file_path
 from src.common.image_references import is_nonlocal_image_reference
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
@@ -40,6 +39,7 @@ from src.service.discovery.qdrant_thumbnail_store import (
     get_qdrant_thumbnail_store,
 )
 from src.service.discovery.recommendation_service import MovieRecommendationService
+from src.storage import asset_storage
 
 MOMENT_RECOMMENDATION_LIMIT = 300
 MOMENT_RECOMMENDATION_SEED_LIMIT = 30
@@ -170,10 +170,8 @@ class MomentRecommendationService:
             )
             return None
         try:
-            image_path = resolve_image_file_path(seed.thumbnail.image.origin)
-            if not image_path.exists() or not image_path.is_file():
-                return None
-            return image_path.read_bytes()
+            with asset_storage().open(seed.thumbnail.image.origin) as stream:
+                return stream.read()
         except Exception as exc:
             logger.warning("Moment recommendation seed image skipped point_id={} detail={}", seed.point.id, exc)
             return None

@@ -21,6 +21,16 @@ from src.service.discovery.image_search_index_space_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def thumbnail_storage(monkeypatch, tmp_path):
+    from src.storage.local import LocalStorageBackend
+
+    monkeypatch.setattr(
+        "src.service.discovery.image_search_index_service.asset_storage",
+        lambda: LocalStorageBackend(tmp_path),
+    )
+
+
 class _PendingQuery:
     def __init__(self, ids: list[int]) -> None:
         self.ids = ids
@@ -101,7 +111,8 @@ def _prepare_images(tmp_path: Path, *, thumbnail_count: int, plot_count: int):
     paths: dict[str, Path] = {}
     for index in range(thumbnail_count):
         origin = f"movies/thumbnail-{index}.jpg"
-        path = tmp_path / f"thumbnail-{index}.jpg"
+        path = tmp_path / origin
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(f"thumbnail-{index}".encode())
         paths[origin] = path
         thumbnails.append(
@@ -138,6 +149,35 @@ def test_pending_queries_apply_work_batch_limit(monkeypatch):
     ]
     assert thumbnail_query.limit_value == 2
     assert plot_query.limit_value == 2
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_thumbnail_index_reads_remote_storage(test_db, tmp_path, monkeypatch, unavailable):
+    import io
+
+    from src.storage.types import StorageUnavailable
+
+    thumbnails, _, paths = _prepare_images(tmp_path, thumbnail_count=1, plot_count=0)
+    payload = paths[thumbnails[0].image.origin].read_bytes()
+    paths[thumbnails[0].image.origin].unlink()
+    stream = io.BytesIO(payload)
+
+    def open_image(key):
+        assert key == thumbnails[0].image.origin
+        if unavailable:
+            raise StorageUnavailable("offline")
+        return stream
+
+    monkeypatch.setattr(
+        "src.service.discovery.image_search_index_service.asset_storage",
+        lambda: SimpleNamespace(open=open_image),
+    )
+    service = ImageSearchIndexService(
+        store=_Store("thumbnail"), plot_store=_Store("plot"), embedder=_Embedder()
+    )
+    assert service._index_thumbnail_batch(thumbnails, 1) == ((0, 1) if unavailable else (1, 0))
+    if not unavailable:
+        assert stream.closed
 
 
 def test_index_task_drains_both_queues_in_bounded_round_robin_batches(

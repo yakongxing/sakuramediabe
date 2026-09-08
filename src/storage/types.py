@@ -3,7 +3,19 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 
-class StorageError(RuntimeError): pass
+class StorageError(RuntimeError):
+    def __init__(
+        self, message: str = "", *, stage: str | None = None,
+        status_code: int | None = None, retryable: bool = False,
+        publication_possible: bool = False,
+    ):
+        super().__init__(message)
+        self.stage = stage
+        self.status_code = status_code
+        self.retryable = retryable
+        self.publication_possible = publication_possible
+
+
 class StorageNotFound(StorageError): pass
 class StorageUnavailable(StorageError): pass
 
@@ -11,10 +23,9 @@ class StorageUnavailable(StorageError): pass
 class StoragePublicationUnknown(StorageUnavailable):
     """A publish may have committed, but the backend could not confirm visibility."""
 
-    def __init__(self, key: str, message: str):
-        super().__init__(message)
+    def __init__(self, key: str, message: str, **kwargs):
+        super().__init__(message, publication_possible=True, **kwargs)
         self.key = key
-        self.publication_possible = True
 
 
 @dataclass(frozen=True)
