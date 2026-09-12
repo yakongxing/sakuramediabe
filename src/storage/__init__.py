@@ -12,8 +12,13 @@ def clip_storage():
     return factory()
 
 
+def subtitle_storage():
+    from .factory import subtitle_storage as factory
+    return factory()
+
+
 def reset_storage_backends():
     from .factory import reset_storage_backends as reset
     return reset()
 
-__all__ = ["ObjectStat", "StorageNotFound", "asset_storage", "clip_storage", "normalize_storage_key", "reset_storage_backends"]
+__all__ = ["ObjectStat", "StorageNotFound", "asset_storage", "clip_storage", "normalize_storage_key", "reset_storage_backends", "subtitle_storage"]

@@ -101,6 +101,8 @@ class Media(BaseModel):
 
 class Storage(BaseModel):
     backend: str = "local"
+    # 字幕可单独落到 media.import_image_root_path，其他资源继续使用 backend。
+    subtitles_backend: str = "inherit"
     webdav_base_url: str = ""
     username: str = ""
     password: str = ""
@@ -121,6 +123,9 @@ class Storage(BaseModel):
 
     @model_validator(mode="after")
     def _validate_storage(self):
+        self.subtitles_backend = self.subtitles_backend.strip().lower()
+        if self.subtitles_backend not in {"inherit", "local"}:
+            raise ValueError("storage.subtitles_backend must be inherit or local")
         self.backend = self.backend.strip().lower()
         if self.backend not in {"local", "webdav"}:
             raise ValueError("storage.backend must be local or webdav")

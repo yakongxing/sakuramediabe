@@ -50,7 +50,7 @@ def test_webdav_subtitle_import_avoids_move_and_recovers_unregistered_upload(
     monkeypatch.setattr(webdav, "Client", Client)
     backend = webdav.WebDAVStorageBackend("https://dav.example", "assets")
     monkeypatch.setattr(backend, "_download_once", lambda key, target: target.write(objects[backend._path(key)]))
-    monkeypatch.setattr(service, "asset_storage", lambda: backend)
+    monkeypatch.setattr(service, "subtitle_storage", lambda: backend)
     content = b"1\n00:00:01,000 --> 00:00:02,000\nsubtitle\n"
     source = tmp_path / "subtitle.SRT"
     source.write_bytes(content)
@@ -76,7 +76,7 @@ def test_failed_subtitle_publication_does_not_register_row(monkeypatch, subtitle
     movie, rows = subtitle_import
     backend = Mock(supports_direct_immutable_put=True)
     backend.put_bytes.side_effect = StorageUnavailable("upload failed")
-    monkeypatch.setattr(service, "asset_storage", lambda: backend)
+    monkeypatch.setattr(service, "subtitle_storage", lambda: backend)
     with pytest.raises(StorageUnavailable):
         service.SubtitleAssetService.import_subtitle_content(movie.movie_number, b"subtitle", "one.srt")
     rows.create.assert_not_called()
@@ -86,7 +86,7 @@ def test_failed_subtitle_publication_does_not_register_row(monkeypatch, subtitle
 def test_local_subtitle_import_preserves_numbered_names(monkeypatch, tmp_path, subtitle_import, from_file):
     movie, rows = subtitle_import
     backend = LocalStorageBackend(tmp_path / "assets")
-    monkeypatch.setattr(service, "asset_storage", lambda: backend)
+    monkeypatch.setattr(service, "subtitle_storage", lambda: backend)
     source = tmp_path / "subtitle.srt"
     source.write_bytes(b"subtitle")
     if from_file:

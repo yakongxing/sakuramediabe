@@ -25,7 +25,8 @@ from src.schema.catalog.subtitles import (
     SubtitleContent,
     SubtitleReadError,
 )
-from src.storage import StorageNotFound, asset_storage
+from src.storage import StorageNotFound, subtitle_storage
+from src.storage.types import StorageError
 
 MAX_SUBTITLE_CONTENT_BYTES = 10 * 1024 * 1024
 
@@ -70,6 +71,8 @@ class MovieSubtitleService:
             raise SubtitleReadError("subtitle_not_found", "该影片下不存在此字幕")
         try:
             path = ensure_movie_subtitle_path(movie, subtitle.file_path)
+        except StorageError:
+            raise SubtitleReadError("subtitle_unavailable", "字幕文件不可访问") from None
         except (ApiError, RuntimeError):
             raise SubtitleReadError("subtitle_path_invalid", "字幕路径非法") from None
         except OSError:
@@ -126,7 +129,7 @@ class MovieSubtitleService:
                 subtitle.delete_instance()
                 deleted_count += 1
                 continue
-            if not asset_storage().exists(normalized_path):
+            if not subtitle_storage().exists(normalized_path):
                 subtitle.delete_instance()
                 deleted_count += 1
                 continue
@@ -163,7 +166,7 @@ class MovieSubtitleService:
             except ApiError:
                 continue
             try:
-                stat = asset_storage().stat(key)
+                stat = subtitle_storage().stat(key)
             except StorageNotFound:
                 continue
             if not stat.is_file: continue
@@ -181,6 +184,6 @@ class MovieSubtitleService:
     def _discover_subtitle_paths(cls, movie: Movie) -> list[str]:
         prefix = movie_asset_relative_dir(normalize_asset_dir_name(movie.movie_number)) / "subtitles"
         return sorted(
-            (item.key for item in asset_storage().list(prefix.as_posix()) if Path(item.key).suffix.lower() in MOVIE_SUBTITLE_EXTENSIONS),
+            (item.key for item in subtitle_storage().list(prefix.as_posix()) if Path(item.key).suffix.lower() in MOVIE_SUBTITLE_EXTENSIONS),
             key=str.lower,
         )

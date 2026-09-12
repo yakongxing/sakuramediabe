@@ -32,6 +32,15 @@ def add_subtitle(movie, path, content=b"subtitle"):
     return Subtitle.create(movie=movie, file_path=str(path))
 
 
+def test_plugin_reads_new_relative_subtitle_keys(library):
+    from src.service.catalog.subtitle_asset_service import SubtitleAssetService
+
+    context, movie, _, _ = library
+    result = SubtitleAssetService.import_subtitle_content(movie.movie_number, b"subtitle", "one.srt")
+    assert context.subtitles.read(movie.id, result.subtitle_id).content == b"subtitle"
+    assert context.subtitles.list(movie.id)[0].subtitle_id == result.subtitle_id
+
+
 def test_list_only_registered_accessible_assets_is_readonly(library):
     context, movie, other, root = library
     first = add_subtitle(movie, root / "one.srt", b"first")

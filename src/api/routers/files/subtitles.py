@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse
 from src.api.routers._utils import require_existing_file, require_signed_params
 from src.common import verify_subtitle_signature
 from src.common.file_signatures import resolve_subtitle_storage_key
-from src.storage import StorageNotFound, asset_storage
+from src.storage import StorageNotFound, subtitle_storage
 
 router = APIRouter(prefix="/files/subtitles", tags=["files"])
 
@@ -20,7 +20,7 @@ def get_subtitle_file(
 
     verify_subtitle_signature(subtitle_id, expires, signature)
     key = resolve_subtitle_storage_key(subtitle_id)
-    storage = asset_storage()
+    storage = subtitle_storage()
     local_path = storage.local_path(key)
     if local_path is not None:
         require_existing_file(local_path)

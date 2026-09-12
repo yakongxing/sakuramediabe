@@ -24,7 +24,8 @@ from src.schema.catalog.subtitles import (
     SubtitleImportResult,
     SubtitleImportStatus,
 )
-from src.storage import StorageNotFound, asset_storage
+from src.storage import StorageNotFound, subtitle_storage
+from src.storage.types import StorageUnavailable
 
 
 def _prepare_movie_subtitle_target_path(
@@ -39,7 +40,7 @@ def _prepare_movie_subtitle_target_path(
         # completed upload whose database registration never committed.
         return f"{prefix.as_posix()}/{movie_number}-{content_hash}{normalized_extension}"
     maximum = 0
-    for item in asset_storage().list(prefix.as_posix()):
+    for item in subtitle_storage().list(prefix.as_posix()):
         stem = Path(item.key).stem
         head = f"{movie_number}-"
         if stem.startswith(head) and stem[len(head):].isdigit():
@@ -66,9 +67,9 @@ class SubtitleAssetService:
                 )
                 continue
             try:
-                with asset_storage().open(key) as handle:
+                with subtitle_storage().open(key) as handle:
                     hashes.add(cls._sha256_stream(handle))
-            except StorageNotFound:
+            except (StorageNotFound, StorageUnavailable):
                 continue
         return hashes
 
@@ -100,7 +101,7 @@ class SubtitleAssetService:
         if content_hash in cls.movie_subtitle_hashes(movie):
             return SubtitleImportResult(status=SubtitleImportStatus.DUPLICATE)
 
-        storage = asset_storage()
+        storage = subtitle_storage()
         immutable = getattr(storage, "supports_direct_immutable_put", False)
         target_path = _prepare_movie_subtitle_target_path(
             movie.movie_number, extension=suffix,
@@ -132,7 +133,7 @@ class SubtitleAssetService:
         if content_hash in hashes:
             return "skipped", "duplicate_fingerprint", source_path.name
 
-        storage = asset_storage()
+        storage = subtitle_storage()
         immutable = getattr(storage, "supports_direct_immutable_put", False)
         target_path = _prepare_movie_subtitle_target_path(
             movie.movie_number,

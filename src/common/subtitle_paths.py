@@ -3,8 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.api.exception.errors import ApiError
-from src.common.media_paths import MOVIE_SUBTITLE_EXTENSIONS, movie_subtitle_dir
-from src.common.media_paths import media_image_root_path, movie_asset_relative_dir, normalize_asset_dir_name
+from src.common.media_paths import (
+    MOVIE_SUBTITLE_EXTENSIONS,
+    media_image_root_path,
+    movie_asset_relative_dir,
+    movie_subtitle_dir,
+    normalize_asset_dir_name,
+)
 from src.storage.keys import normalize_storage_key
 
 
@@ -29,6 +34,14 @@ def _is_path_within_root(file_path: Path, root_path: Path) -> bool:
 
 def ensure_movie_subtitle_path(movie, file_path: str | Path) -> Path:
     """校验字幕绝对路径位于该影片的标准字幕目录内。"""
+    from src.config.config import settings
+    from src.storage import subtitle_storage
+
+    if not Path(file_path).is_absolute() or settings.storage.subtitles_backend == "local":
+        key = movie_subtitle_storage_key(movie, file_path)
+        local_path = subtitle_storage().local_path(key)
+        if local_path is not None:
+            file_path = local_path
     absolute_path = normalize_subtitle_path(file_path)
     if _is_path_within_root(absolute_path, movie_subtitle_dir(movie.movie_number).resolve()):
         return absolute_path
