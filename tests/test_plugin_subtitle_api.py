@@ -37,6 +37,9 @@ def test_plugin_reads_new_relative_subtitle_keys(library):
 
     context, movie, _, _ = library
     result = SubtitleAssetService.import_subtitle_content(movie.movie_number, b"subtitle", "one.srt")
+    assert Subtitle.get_by_id(result.subtitle_id).file_path.endswith(
+        f"/{movie.movie_number}-1.srt"
+    )
     assert context.subtitles.read(movie.id, result.subtitle_id).content == b"subtitle"
     assert context.subtitles.list(movie.id)[0].subtitle_id == result.subtitle_id
 
