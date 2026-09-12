@@ -7,7 +7,15 @@ from pathlib import Path
 
 from src.common.image_references import is_nonlocal_image_reference
 from src.config.config import settings
-from src.model import Actor, Image, MediaThumbnail, Movie, MoviePlotImage, get_database
+from src.model import (
+    Actor,
+    Image,
+    MediaThumbnail,
+    Movie,
+    MoviePlotImage,
+    VideoItem,
+    get_database,
+)
 from src.storage import asset_storage
 
 
@@ -39,15 +47,20 @@ class ImageCleanupService:
                 .where((Movie.cover_image == image) | (Movie.thin_cover_image == image))
                 .exists(),
                 database.table_exists(Actor._meta.table_name)
-                and Actor.select(Actor.id).where(Actor.profile_image == image).exists(),
+                and Actor.select(Actor.id)
+                .where(
+                    (Actor.profile_image == image)
+                    | (Actor.profile_image_override == image)
+                )
+                .exists(),
                 database.table_exists(MoviePlotImage._meta.table_name)
                 and MoviePlotImage.select(MoviePlotImage.id)
                 .where(MoviePlotImage.image == image)
                 .exists(),
                 database.table_exists(MediaThumbnail._meta.table_name)
-                and MediaThumbnail.select(MediaThumbnail.id)
-                .where(MediaThumbnail.image == image)
-                .exists(),
+                and MediaThumbnail.select(MediaThumbnail.id).where(MediaThumbnail.image == image).exists(),
+                database.table_exists(VideoItem._meta.table_name)
+                and VideoItem.select(VideoItem.id).where(VideoItem.cover_image == image).exists(),
             )
         )
 

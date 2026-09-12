@@ -24,6 +24,8 @@ from src.model import (
     ClipCollectionItem,
     DailyRecommendationItem,
     DownloadClient,
+    DownloadResourceBlacklist,
+    DownloadSubmissionRecord,
     DownloadTask,
     Image,
     ImageSearchIndexState,
@@ -36,6 +38,8 @@ from src.model import (
     MediaPoint,
     MediaProgress,
     MediaThumbnail,
+    MomentCollection,
+    MomentCollectionItem,
     MomentRecommendation,
     Movie,
     MovieActor,
@@ -90,6 +94,8 @@ TEST_MODELS = [
     MediaClip,
     ClipCollection,
     ClipCollectionItem,
+    MomentCollection,
+    MomentCollectionItem,
     MomentRecommendation,
     ImageSearchIndexState,
     ImageSearchSession,
@@ -102,6 +108,8 @@ TEST_MODELS = [
     Indexer,
     IndexerDownloadClient,
     DownloadTask,
+    DownloadSubmissionRecord,
+    DownloadResourceBlacklist,
 ]
 
 

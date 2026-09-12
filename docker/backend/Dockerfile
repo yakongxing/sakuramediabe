@@ -1,5 +1,5 @@
 # ── Stage 1: 安装 Python 依赖 ──
-FROM python:3.10-slim-bookworm AS builder
+FROM python:3.10-slim-bookworm@sha256:68d914ec641a0b69267ce65184d000a2bc3a9ee2590ab702b82250ab2385735a AS builder
 WORKDIR /build
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Stage 2: 运行时镜像 ──
-FROM python:3.10-slim-bookworm AS runtime
+FROM python:3.10-slim-bookworm@sha256:68d914ec641a0b69267ce65184d000a2bc3a9ee2590ab702b82250ab2385735a AS runtime
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -47,11 +47,8 @@ RUN chmod +x /docker-entrypoint.sh /usr/local/bin/healthcheck.py \
     && useradd --create-home --shell /bin/bash --gid app app
 
 COPY docker/backend/supervisord.conf /etc/supervisor/supervisord.conf
-COPY docker/backend/package_bundled_providers.py /app/docker/backend/package_bundled_providers.py
 COPY src /app/src
-RUN python /app/docker/backend/package_bundled_providers.py --output /app/bundled-plugins \
-    && rm -rf /app/docker \
-    && chmod -R a+rX /app/src /app/bundled-plugins
+RUN chmod -R a+rX /app/src
 
 ARG SAKURAMEDIA_BACKEND_VERSION=v0.0.1
 ENV SAKURAMEDIA_BACKEND_VERSION=${SAKURAMEDIA_BACKEND_VERSION}

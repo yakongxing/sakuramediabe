@@ -104,12 +104,6 @@ run_database_migrations() {
     su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands migrate" "${APP_USER}"
 }
 
-run_v053_upgrade() {
-    echo "Syncing bundled providers and checking for a v0.5.3 database upgrade..."
-    # 官方 provider 随镜像升级；仅更高版本替换代码，插件 data/ 和启停状态由插件管理器保留。
-    su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands upgrade-v053" "${APP_USER}"
-}
-
 bootstrap_default_data() {
     echo "Bootstrapping default account and system playlists..."
     # 默认数据初始化保持幂等，首装补齐账号/系统播放列表，老库重复执行会自动跳过。
@@ -123,14 +117,19 @@ sync_plugin_dependencies() {
     su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands plugins sync-dependencies" "${APP_USER}"
 }
 
+validate_plugin_installation() {
+    echo "Validating plugin installation..."
+    su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands plugins validate-installation" "${APP_USER}"
+}
+
 if [ "${1:-}" = "start" ]; then
     ensure_app_identity
     bootstrap_data_dirs
     wait_for_database
-    run_v053_upgrade
     run_database_migrations
     bootstrap_default_data
     sync_plugin_dependencies
+    validate_plugin_installation
 
     # 主服务只负责 API 和任务编排，不处理嵌入推理设备映射。
     id "${APP_USER}" || true

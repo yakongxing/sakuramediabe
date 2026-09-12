@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image as PillowImage
 
 from src.common.runtime_time import utc_now_for_db
 from src.model import (
@@ -86,6 +87,7 @@ class _Store:
 class _Embedder:
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []
+        self.payloads: list[bytes] = []
 
     @staticmethod
     def describe():
@@ -93,6 +95,7 @@ class _Embedder:
 
     def embed_images(self, payloads):
         self.batch_sizes.append(len(payloads))
+        self.payloads.extend(payloads)
         return [[0.2, 0.3] for _ in payloads]
 
 
@@ -113,7 +116,7 @@ def _prepare_images(tmp_path: Path, *, thumbnail_count: int, plot_count: int):
         origin = f"movies/thumbnail-{index}.jpg"
         path = tmp_path / origin
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"thumbnail-{index}".encode())
+        PillowImage.new("RGB", (12, 8), (index, 30, 30)).save(path, format="JPEG")
         paths[origin] = path
         thumbnails.append(
             MediaThumbnail.create(
@@ -125,7 +128,7 @@ def _prepare_images(tmp_path: Path, *, thumbnail_count: int, plot_count: int):
     for index in range(plot_count):
         origin = f"movies/plot-{index}.jpg"
         path = tmp_path / f"plot-{index}.jpg"
-        path.write_bytes(f"plot-{index}".encode())
+        PillowImage.new("RGB", (12, 8), (30, index, 30)).save(path, format="JPEG")
         paths[origin] = path
         plot_images.append(
             MoviePlotImage.create(movie=movie, image=_create_image(origin))
@@ -200,12 +203,13 @@ def test_index_task_drains_both_queues_in_bounded_round_robin_batches(
     thumbnail_store = _Store("thumbnail", trace)
     plot_store = _Store("plot", trace)
     embedder = _Embedder()
+    progress = []
 
     stats = ImageSearchIndexService(
         store=thumbnail_store,
         plot_store=plot_store,
         embedder=embedder,
-    ).index_pending_images()
+    ).index_pending_images(progress_callback=progress.append)
 
     assert stats == {
         "processed_thumbnails": 3,
@@ -214,6 +218,10 @@ def test_index_task_drains_both_queues_in_bounded_round_robin_batches(
         "processed_plot_images": 3,
         "successful_plot_images": 3,
         "failed_plot_images": 0,
+        "processed": 6,
+        "succeeded": 6,
+        "failed": 0,
+        "pending": 0,
     }
     assert trace == ["thumbnail", "plot", "thumbnail", "plot"]
     assert [len(batch) for batch in thumbnail_store.batches] == [2, 1]
@@ -221,6 +229,12 @@ def test_index_task_drains_both_queues_in_bounded_round_robin_batches(
     assert embedder.batch_sizes == [1, 1, 1, 1, 1, 1]
     assert thumbnail_store.ensure_table_calls == 1
     assert plot_store.ensure_table_calls == 1
+    assert progress[0]["current"] == 0
+    assert progress[0]["total"] == 0
+    assert progress[1]["current"] == 0
+    assert progress[1]["total"] == 6
+    assert progress[-1]["current"] == progress[-1]["total"] == 6
+    assert progress[-1]["summary_patch"] == stats
     assert all(
         item.image_search_index_status
         == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_SUCCESS
@@ -256,12 +270,13 @@ def test_reset_task_clears_vectors_then_reindexes_current_space(
     trace: list[str] = []
     thumbnail_store = _Store("thumbnail", trace)
     plot_store = _Store("plot", trace)
+    progress = []
 
     stats = ImageSearchIndexService(
         store=thumbnail_store,
         plot_store=plot_store,
         embedder=_Embedder(),
-    ).index_pending_images(reset=True)
+    ).index_pending_images(progress_callback=progress.append, reset=True)
 
     assert trace == ["clear-thumbnail", "clear-plot", "thumbnail", "plot"]
     assert thumbnail_store.clear_count == 1
@@ -271,6 +286,18 @@ def test_reset_task_clears_vectors_then_reindexes_current_space(
     assert stats["sessions_deleted"] == 1
     assert stats["thumbnails_reset"] == 1
     assert stats["plot_images_reset"] == 1
+    assert stats["processed"] == 2
+    assert stats["succeeded"] == 2
+    assert stats["failed"] == 0
+    assert stats["pending"] == 0
+    assert progress[0]["text"] == "阶段 1/2 · 重置旧索引 · 正在清空图像搜索索引"
+    assert any(
+        item["text"].startswith("阶段 1/2 · 重置旧索引 · 已完成") for item in progress
+    )
+    assert any(
+        item["text"].startswith("阶段 2/2 · 构建图像搜索索引")
+        for item in progress
+    )
     assert (
         MediaThumbnail.get_by_id(thumbnails[0].id).image_search_index_status
         == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_SUCCESS
@@ -281,10 +308,14 @@ def test_reset_task_clears_vectors_then_reindexes_current_space(
     )
 
 
-def test_batch_422_falls_back_to_single_images_and_only_fails_bad_image(
-    test_db, monkeypatch, tmp_path
+@pytest.mark.parametrize("rejected_status_code", [422, 413])
+def test_batch_rejection_falls_back_to_single_images_and_only_fails_bad_image(
+    test_db, monkeypatch, tmp_path, rejected_status_code
 ):
     thumbnails, _, paths = _prepare_images(tmp_path, thumbnail_count=2, plot_count=0)
+    PillowImage.new("RGB", (64, 64), (255, 0, 0)).save(
+        paths[thumbnails[1].image.origin], format="JPEG"
+    )
     bad_payload = paths[thumbnails[1].image.origin].read_bytes()
     monkeypatch.setattr(
         "src.service.discovery.image_search_index_service.resolve_image_file_path",
@@ -297,7 +328,9 @@ def test_batch_422_falls_back_to_single_images_and_only_fails_bad_image(
     class _RejectingEmbedder(_Embedder):
         def embed_images(self, payloads):
             if len(payloads) > 1 or payloads[0] == bad_payload:
-                raise EmbeddingClientError(422, "invalid_image", "invalid image")
+                raise EmbeddingClientError(
+                    rejected_status_code, "invalid_image", "invalid image"
+                )
             return [[0.2, 0.3]]
 
     service = ImageSearchIndexService(
@@ -422,4 +455,47 @@ def test_index_task_blocks_mismatched_space_before_writing(
     assert (
         MediaThumbnail.get_by_id(thumbnails[0].id).image_search_index_status
         == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING
+    )
+
+
+def test_png_images_are_normalized_before_embedding(test_db, monkeypatch, tmp_path):
+    thumbnails, _, paths = _prepare_images(tmp_path, thumbnail_count=1, plot_count=0)
+    PillowImage.new("RGBA", (12, 8), (30, 120, 30, 180)).save(
+        paths[thumbnails[0].image.origin], format="PNG"
+    )
+    monkeypatch.setattr(
+        "src.service.discovery.image_search_index_service.resolve_image_file_path",
+        lambda origin: paths[origin],
+    )
+    embedder = _Embedder()
+
+    stats = ImageSearchIndexService(
+        store=_Store("thumbnail"),
+        plot_store=_Store("plot"),
+        embedder=embedder,
+    ).index_pending_images()
+
+    assert stats["successful_thumbnails"] == 1
+    assert embedder.payloads[0].startswith(b"RIFF")
+    assert embedder.payloads[0][8:12] == b"WEBP"
+
+
+def test_invalid_image_is_marked_failed(test_db, monkeypatch, tmp_path):
+    thumbnails, _, paths = _prepare_images(tmp_path, thumbnail_count=1, plot_count=0)
+    paths[thumbnails[0].image.origin].write_bytes(b"not-an-image")
+    monkeypatch.setattr(
+        "src.service.discovery.image_search_index_service.resolve_image_file_path",
+        lambda origin: paths[origin],
+    )
+
+    stats = ImageSearchIndexService(
+        store=_Store("thumbnail"),
+        plot_store=_Store("plot"),
+        embedder=_Embedder(),
+    ).index_pending_images()
+
+    assert stats["failed_thumbnails"] == 1
+    assert (
+        MediaThumbnail.get_by_id(thumbnails[0].id).image_search_index_status
+        == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_FAILED
     )

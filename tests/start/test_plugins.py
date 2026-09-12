@@ -24,6 +24,7 @@ from src.plugins.loader import (
     check_plugin_dir,
     load_enabled_plugins,
 )
+from src.plugins.manager import PluginManager
 from src.scheduler.contracts import JobDefinition
 from src.scheduler.ranking_plugin_adapter import apply_plugin_ranking_sources
 from src.scheduler.registry import _build_job_registry
@@ -73,6 +74,29 @@ def _clear_load_errors():
     PLUGIN_LOAD_ERRORS.clear()
     yield
     PLUGIN_LOAD_ERRORS.clear()
+
+
+def test_plugin_manager_rejects_duplicate_manifest_ids(tmp_path):
+    _write_plugin_dir(tmp_path, "demo_plugin", version="1.0.0")
+    backup_dir = _write_plugin_dir(tmp_path, "demo_plugin-backup", version="0.9.0")
+    manifest_path = backup_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plugin_id"] = "demo_plugin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="插件 plugin_id 重复: demo_plugin"):
+        PluginManager(tmp_path).validate_installation()
+
+
+def test_plugin_manager_rejects_manifest_directory_mismatch(tmp_path):
+    plugin_dir = _write_plugin_dir(tmp_path, "demo_plugin-backup")
+    manifest_path = plugin_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plugin_id"] = "demo_plugin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="目录名与 manifest.plugin_id 不一致"):
+        PluginManager(tmp_path).validate_installation()
 
 
 def test_loader_loads_plugin_with_params_jobs(tmp_path):
@@ -378,6 +402,25 @@ def test_host_api_version_range_enforced():
             display_name="x",
             version="1.0.0",
             host_api_version=HOST_API_VERSION + 1,
+        )
+
+
+def test_plugin_id_length_matches_storage_contract():
+    from src.plugins.manifest import PluginManifest
+
+    plugin_id = "a" + ("b" * 64)
+    with pytest.raises(ValidationError):
+        PluginRegistration(
+            plugin_id=plugin_id,
+            display_name="x",
+            version="1.0.0",
+        )
+    with pytest.raises(ValidationError):
+        PluginManifest(
+            plugin_id=plugin_id,
+            display_name="x",
+            version="1.0.0",
+            host_api_version=HOST_API_VERSION,
         )
 
 

@@ -11,8 +11,6 @@ from src.model import SchemaMigration
 
 VERSIONS_DIR = Path(__file__).resolve().parent / "versions"
 
-# 当前 provider 版只承接精确 v0.5.3；更老版本必须先升级到 v0.5.3。
-SUPPORTED_BASE_MIGRATION_NAME = "20260816_01_add_movie_field_owners"
 CONSOLIDATED_MIGRATION_NAME = "20260821_01_consolidate_task_runtime"
 MOVIE_COLLECTION_OWNER_MIGRATION_NAME = "20260823_01_unify_movie_collection_owner"
 ACTOR_GENDER_BACKFILL_MIGRATION_NAME = "20260823_02_backfill_actor_gender_from_movie_extra"
@@ -25,6 +23,10 @@ MEDIA_IMPORT_SOURCE_IDENTITY_MIGRATION_NAME = "20260903_01_add_media_import_sour
 ACTOR_METADATA_MIGRATION_NAME = "20260905_01_add_actor_metadata"
 PLUGIN_MOVIE_METADATA_MIGRATION_NAME = "20260905_02_add_plugin_movie_metadata"
 IMAGE_REFERENCES_MIGRATION_NAME = "20260907_01_widen_image_references"
+DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME = "20260908_01_add_download_resource_history"
+MOMENT_COLLECTIONS_MIGRATION_NAME = "20260910_01_add_moment_collections"
+ACTOR_LOCAL_PROFILE_MIGRATION_NAME = "20260910_02_add_actor_local_profile"
+PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME = "20260912_01_add_plugin_collection_ownership"
 
 
 @dataclass(frozen=True)
@@ -65,19 +67,13 @@ def _is_empty_schema(database: Database) -> bool:
 
 
 def _validate_migration_source(database: Database, applied_names: set[str]) -> None:
-    from src.start.legacy_v053_upgrade import classify_database_schema
-
-    if classify_database_schema(database) == "legacy_v053":
-        raise ValueError(
-            "legacy_v053_upgrade_required: run the dedicated upgrade-v053 command first"
-        )
     if CONSOLIDATED_MIGRATION_NAME in applied_names:
         return
     if not applied_names and _is_empty_schema(database):
         return
     raise ValueError(
-        "unsupported_migration_source: this release only supports the exact v0.5.3 "
-        "database or a fresh database"
+        "unsupported_migration_source: this release only supports upgrading from "
+        "v0.6.x; fresh databases are also supported"
     )
 
 

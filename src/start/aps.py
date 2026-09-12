@@ -22,6 +22,7 @@ from src.scheduler.contracts import JobDefinition
 from src.scheduler.registry import JOB_REGISTRY, JOB_REGISTRY_BY_KEY
 from src.scheduler.worker import TaskWorker
 from src.service.system.activity import TaskRunConflictError
+from src.service.system.activity.task_catalog import TASK_NAME_REGISTRY
 from src.service.system.task_queue_service import (
     BOOTSTRAP_QUEUE_TASK_KEYS,
     DEFAULT_LEASE_SECONDS,
@@ -47,6 +48,11 @@ def _disabled_scheduled_task_keys() -> set[str]:
             + ", ".join(sorted(unknown))
         )
     return disabled
+
+
+def resolve_job_task_name(job_def: JobDefinition) -> str:
+    """任务展示名：宿主注册表优先，插件任务回退到 cli_help，不落原始 task_key。"""
+    return TASK_NAME_REGISTRY.get(job_def.task_key) or job_def.cli_help
 
 
 def get_job_cron_setting(job_def: JobDefinition) -> str | None:
@@ -109,6 +115,7 @@ def enqueue_scheduled_job(job_def: JobDefinition) -> BackgroundTaskRun | None:
     ensure_database_ready()
     task_run = TaskQueueService.enqueue(
         task_key=job_def.task_key,
+        task_name=resolve_job_task_name(job_def),
         trigger_type="scheduled",
         conflict="skip",
     )
@@ -133,6 +140,7 @@ def submit_manual_job(
     try:
         return TaskQueueService.enqueue(
             task_key=job_def.task_key,
+            task_name=resolve_job_task_name(job_def),
             trigger_type="manual",
             params=params,
             conflict="raise",
@@ -218,6 +226,7 @@ def _schedule_bootstrap_job(
         try:
             task_run = TaskQueueService.enqueue(
                 task_key=job_def.task_key,
+                task_name=resolve_job_task_name(job_def),
                 trigger_type="startup",
                 params=params,
                 conflict="raise",

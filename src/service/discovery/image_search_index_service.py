@@ -23,6 +23,7 @@ from src.service.discovery.embedding_client import (
 from src.service.discovery.image_search_index_space_service import (
     ImageSearchIndexSpaceService,
 )
+from src.service.discovery.image_search_input import normalize_image_search_query
 from src.service.discovery.qdrant_plot_image_store import (
     PlotImageVectorRecord,
     QdrantPlotImageStore,
@@ -73,12 +74,75 @@ class ImageSearchIndexService:
         started_at = time.monotonic()
         work_batch_size = max(1, int(settings.image_search.index_upsert_batch_size))
         inference_batch_size = max(1, int(settings.image_search.inference_batch_size))
-        next_progress_at = 1000
+        stage_count = 2 if reset else 1
         reset_stats: dict[str, int] = {}
 
+        def build_summary(pending: int) -> dict[str, int]:
+            processed = stats["processed_thumbnails"] + stats["processed_plot_images"]
+            succeeded = stats["successful_thumbnails"] + stats["successful_plot_images"]
+            failed = stats["failed_thumbnails"] + stats["failed_plot_images"]
+            return {
+                **reset_stats,
+                **stats,
+                "processed": processed,
+                "succeeded": succeeded,
+                "failed": failed,
+                "pending": pending,
+            }
+
+        def emit_index_progress(
+            pending: int, *, completed: bool = False
+        ) -> dict[str, int]:
+            summary = build_summary(pending)
+            processed = summary["processed"]
+            total = processed + pending
+            emit_progress(
+                progress_callback,
+                current=processed,
+                total=total,
+                text=(
+                    f"阶段 {stage_count}/{stage_count} · 构建图像搜索索引"
+                    f" · {'任务完成' if completed else '正在处理当前批次'}"
+                    f" · 已完成 {processed}/{total} · 成功 {summary['succeeded']}"
+                    f" · 失败 {summary['failed']} · 待处理 {pending}"
+                ),
+                summary_patch=summary,
+            )
+            return summary
+
         if reset:
-            emit_progress(progress_callback, text="正在清空图像搜索索引")
+            emit_progress(
+                progress_callback,
+                current=0,
+                total=0,
+                text="阶段 1/2 · 重置旧索引 · 正在清空图像搜索索引",
+            )
             reset_stats = self._reset_for_rebuild()
+            if progress_callback is not None:
+                emit_progress(
+                    progress_callback,
+                    current=0,
+                    total=0,
+                    text=(
+                        "阶段 1/2 · 重置旧索引 · 已完成"
+                        f" · 缩略图 {reset_stats['thumbnails_reset']} 张"
+                        f" · 剧情图 {reset_stats['plot_images_reset']} 张"
+                    ),
+                    summary_patch=build_summary(self._pending_image_count()),
+                )
+
+        if progress_callback is not None:
+            emit_progress(
+                progress_callback,
+                current=0,
+                total=0,
+                text=(
+                    f"阶段 {stage_count}/{stage_count} · 构建图像搜索索引"
+                    " · 正在统计待处理图片"
+                ),
+            )
+            emit_index_progress(self._pending_image_count())
+            next_progress_at = time.monotonic() + 2
 
         while True:
             thumbnails = self._pending_thumbnails(work_batch_size)
@@ -103,25 +167,15 @@ class ImageSearchIndexService:
                 stats["successful_plot_images"] += successful
                 stats["failed_plot_images"] += failed
 
-            processed = stats["processed_thumbnails"] + stats["processed_plot_images"]
-            if processed >= next_progress_at:
-                emit_progress(
-                    progress_callback,
-                    current=processed,
-                    text=f"已索引 {processed} 张图片",
-                    summary_patch=stats,
-                )
-                while next_progress_at <= processed:
-                    next_progress_at += 1000
+            if (
+                progress_callback is not None
+                and time.monotonic() >= next_progress_at
+            ):
+                emit_index_progress(self._pending_image_count())
+                next_progress_at = time.monotonic() + 2
 
-        processed = stats["processed_thumbnails"] + stats["processed_plot_images"]
-        summary = {**reset_stats, **stats}
-        emit_progress(
-            progress_callback,
-            current=processed,
-            text="图像搜索索引任务完成",
-            summary_patch=summary,
-        )
+        remaining = self._pending_image_count()
+        summary = emit_index_progress(remaining, completed=True)
         logger.info(
             "Finished image search indexing processed_thumbnails={} successful_thumbnails={} "
             "failed_thumbnails={} processed_plot_images={} successful_plot_images={} "
@@ -167,9 +221,9 @@ class ImageSearchIndexService:
         }
 
     @staticmethod
-    def _pending_thumbnails(limit: int) -> list[MediaThumbnail]:
+    def _pending_thumbnail_query():
         # 图像检索只覆盖归属 JAV 影片的缩略图。
-        return list(
+        return (
             MediaThumbnail.select(MediaThumbnail, Image, Media, Movie)
             .join(Image)
             .switch(MediaThumbnail)
@@ -180,13 +234,11 @@ class ImageSearchIndexService:
                 == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING,
                 Media.movie.is_null(False),
             )
-            .order_by(MediaThumbnail.id.asc())
-            .limit(limit)
         )
 
     @staticmethod
-    def _pending_plot_images(limit: int) -> list[MoviePlotImage]:
-        return list(
+    def _pending_plot_image_query():
+        return (
             MoviePlotImage.select(MoviePlotImage, Image, Movie)
             .join(Image)
             .switch(MoviePlotImage)
@@ -195,6 +247,27 @@ class ImageSearchIndexService:
                 MoviePlotImage.image_search_index_status
                 == MoviePlotImage.IMAGE_SEARCH_INDEX_STATUS_PENDING
             )
+        )
+
+    @staticmethod
+    def _pending_image_count() -> int:
+        return int(
+            ImageSearchIndexService._pending_thumbnail_query().count()
+            + ImageSearchIndexService._pending_plot_image_query().count()
+        )
+
+    @staticmethod
+    def _pending_thumbnails(limit: int) -> list[MediaThumbnail]:
+        return list(
+            ImageSearchIndexService._pending_thumbnail_query()
+            .order_by(MediaThumbnail.id.asc())
+            .limit(limit)
+        )
+
+    @staticmethod
+    def _pending_plot_images(limit: int) -> list[MoviePlotImage]:
+        return list(
+            ImageSearchIndexService._pending_plot_image_query()
             .order_by(MoviePlotImage.id.asc())
             .limit(limit)
         )
@@ -222,10 +295,18 @@ class ImageSearchIndexService:
                     continue
                 try:
                     with asset_storage().open(thumbnail.image.origin) as stream:
-                        payloads.append(stream.read())
+                        payloads.append(self._normalize_image_payload(stream.read()))
                 except (OSError, StorageError):
                     logger.warning(
                         "Image search thumbnail read failed thumbnail_id={} media_id={}",
+                        thumbnail.id,
+                        thumbnail.media_id,
+                    )
+                    failed_ids.append(thumbnail.id)
+                    continue
+                except ValueError:
+                    logger.warning(
+                        "Image search thumbnail file is invalid thumbnail_id={} media_id={}",
                         thumbnail.id,
                         thumbnail.media_id,
                     )
@@ -287,11 +368,21 @@ class ImageSearchIndexService:
                     continue
                 try:
                     payloads.append(
-                        resolve_image_file_path(plot_image.image.origin).read_bytes()
+                        self._normalize_image_payload(
+                            resolve_image_file_path(plot_image.image.origin).read_bytes()
+                        )
                     )
                 except FileNotFoundError:
                     logger.warning(
                         "Plot image file is missing plot_image_id={} movie_id={}",
+                        plot_image.id,
+                        plot_image.movie_id,
+                    )
+                    failed_ids.append(plot_image.id)
+                    continue
+                except ValueError:
+                    logger.warning(
+                        "Plot image file is invalid plot_image_id={} movie_id={}",
                         plot_image.id,
                         plot_image.movie_id,
                     )
@@ -329,6 +420,14 @@ class ImageSearchIndexService:
             failed_status=MoviePlotImage.IMAGE_SEARCH_INDEX_STATUS_FAILED,
         )
 
+    @staticmethod
+    def _normalize_image_payload(payload: bytes) -> bytes:
+        if payload.startswith(b"\xff\xd8\xff") or (
+            payload.startswith(b"RIFF") and payload[8:12] == b"WEBP"
+        ):
+            return payload
+        return normalize_image_search_query(payload)
+
     def _embed_image_payloads(
         self, payloads: list[bytes]
     ) -> list[Sequence[float] | None]:
@@ -337,21 +436,22 @@ class ImageSearchIndexService:
         try:
             vectors = self.embedder.embed_images(payloads)
         except EmbeddingClientError as exc:
-            if exc.status_code != 422:
+            if exc.status_code not in (413, 422):
                 raise
             if len(payloads) == 1:
                 return [None]
             logger.warning(
                 "Embedding service rejected an image batch; retrying images individually "
-                "batch_size={}",
+                "batch_size={} status_code={}",
                 len(payloads),
+                exc.status_code,
             )
             vectors = []
             for payload in payloads:
                 try:
                     item_vectors = self.embedder.embed_images([payload])
                 except EmbeddingClientError as item_exc:
-                    if item_exc.status_code == 422:
+                    if item_exc.status_code in (413, 422):
                         vectors.append(None)
                         continue
                     raise

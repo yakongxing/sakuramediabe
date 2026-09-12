@@ -18,21 +18,23 @@ from src.model import (
     SystemNotification,
 )
 from src.start.commands import main
-from src.start.legacy_v053_upgrade import LEGACY_V053_UPGRADE_MIGRATION_NAME
 from src.start.migrations.runner import (
     ACTOR_GENDER_BACKFILL_MIGRATION_NAME,
+    ACTOR_LOCAL_PROFILE_MIGRATION_NAME,
     ACTOR_METADATA_MIGRATION_NAME,
     CONSOLIDATED_MIGRATION_NAME,
+    DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME,
     HOT_REVIEW_ITEM_REMOVAL_MIGRATION_NAME,
     IMAGE_REFERENCES_MIGRATION_NAME,
     IMAGE_SEARCH_INDEX_SPACE_STATE_MIGRATION_NAME,
     IMAGE_SEARCH_QUEUE_INDEXES_MIGRATION_NAME,
     MEDIA_IMPORT_SOURCE_IDENTITY_MIGRATION_NAME,
     MEDIA_SPECIAL_TAGS_REMOVAL_MIGRATION_NAME,
+    MOMENT_COLLECTIONS_MIGRATION_NAME,
     MOVIE_BLACKLIST_MIGRATION_NAME,
     MOVIE_COLLECTION_OWNER_MIGRATION_NAME,
+    PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
     PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
-    SUPPORTED_BASE_MIGRATION_NAME,
     MigrationExecution,
     MigrationRunSummary,
     _list_migration_modules,
@@ -40,6 +42,8 @@ from src.start.migrations.runner import (
     run_pending_migrations,
 )
 from tests.conftest import TEST_MODELS
+
+V0421_BASE_MIGRATION_NAME = "20260816_01_add_movie_field_owners"
 
 
 def _schema_migration_names(database) -> list[str]:
@@ -99,7 +103,6 @@ def test_current_migrations_are_discoverable_in_order():
         MOVIE_COLLECTION_OWNER_MIGRATION_NAME,
         ACTOR_GENDER_BACKFILL_MIGRATION_NAME,
         MOVIE_BLACKLIST_MIGRATION_NAME,
-        LEGACY_V053_UPGRADE_MIGRATION_NAME,
         MEDIA_SPECIAL_TAGS_REMOVAL_MIGRATION_NAME,
         IMAGE_SEARCH_QUEUE_INDEXES_MIGRATION_NAME,
         IMAGE_SEARCH_INDEX_SPACE_STATE_MIGRATION_NAME,
@@ -108,6 +111,10 @@ def test_current_migrations_are_discoverable_in_order():
         ACTOR_METADATA_MIGRATION_NAME,
         PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
         IMAGE_REFERENCES_MIGRATION_NAME,
+        DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME,
+        MOMENT_COLLECTIONS_MIGRATION_NAME,
+        ACTOR_LOCAL_PROFILE_MIGRATION_NAME,
+        PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
     ]
 
 
@@ -145,9 +152,25 @@ def test_image_reference_migration_retires_preexisting_publication_rows(clean_db
     assert queued.error_message == "catalog_image_publication_retired"
 
 
+def test_plugin_collection_ownership_migration_adds_columns_without_losing_rows(clean_db):
+    clean_db.create_tables(TEST_MODELS)
+    existing = Playlist.create(name="existing-plugin-migration")
+    for table in ("playlist", "moment_collection", "clip_collection"):
+        _drop_columns(clean_db, table, ("owner_plugin_id", "plugin_key"))
+
+    migration = _load_migration_module(
+        Path(f"{PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME}.py")
+    )
+    migration.migrate(clean_db)
+
+    for table in ("playlist", "moment_collection", "clip_collection"):
+        assert {"owner_plugin_id", "plugin_key"} <= _column_names(clean_db, table)
+    assert Playlist.get_by_id(existing.id).name == "existing-plugin-migration"
+
+
 def test_run_pending_migrations_rejects_v0421_base(clean_db):
     clean_db.create_tables([SchemaMigration])
-    SchemaMigration.create(name=SUPPORTED_BASE_MIGRATION_NAME)
+    SchemaMigration.create(name=V0421_BASE_MIGRATION_NAME)
 
     with pytest.raises(ValueError, match="unsupported_migration_source"):
         run_pending_migrations(clean_db)
@@ -188,7 +211,6 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         MigrationExecution(name=MOVIE_COLLECTION_OWNER_MIGRATION_NAME, applied=True),
         MigrationExecution(name=ACTOR_GENDER_BACKFILL_MIGRATION_NAME, applied=True),
         MigrationExecution(name=MOVIE_BLACKLIST_MIGRATION_NAME, applied=True),
-        MigrationExecution(name=LEGACY_V053_UPGRADE_MIGRATION_NAME, applied=True),
         MigrationExecution(name=MEDIA_SPECIAL_TAGS_REMOVAL_MIGRATION_NAME, applied=True),
         MigrationExecution(name=IMAGE_SEARCH_QUEUE_INDEXES_MIGRATION_NAME, applied=True),
         MigrationExecution(name=IMAGE_SEARCH_INDEX_SPACE_STATE_MIGRATION_NAME, applied=True),
@@ -197,13 +219,16 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         MigrationExecution(name=ACTOR_METADATA_MIGRATION_NAME, applied=True),
         MigrationExecution(name=PLUGIN_MOVIE_METADATA_MIGRATION_NAME, applied=True),
         MigrationExecution(name=IMAGE_REFERENCES_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=MOMENT_COLLECTIONS_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=ACTOR_LOCAL_PROFILE_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME, applied=True),
     ]
     assert _schema_migration_names(clean_db) == [
         CONSOLIDATED_MIGRATION_NAME,
         MOVIE_COLLECTION_OWNER_MIGRATION_NAME,
         ACTOR_GENDER_BACKFILL_MIGRATION_NAME,
         MOVIE_BLACKLIST_MIGRATION_NAME,
-        LEGACY_V053_UPGRADE_MIGRATION_NAME,
         MEDIA_SPECIAL_TAGS_REMOVAL_MIGRATION_NAME,
         IMAGE_SEARCH_QUEUE_INDEXES_MIGRATION_NAME,
         IMAGE_SEARCH_INDEX_SPACE_STATE_MIGRATION_NAME,
@@ -212,6 +237,10 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         ACTOR_METADATA_MIGRATION_NAME,
         PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
         IMAGE_REFERENCES_MIGRATION_NAME,
+        DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME,
+        MOMENT_COLLECTIONS_MIGRATION_NAME,
+        ACTOR_LOCAL_PROFILE_MIGRATION_NAME,
+        PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
     ]
 
 
@@ -272,7 +301,7 @@ def test_consolidated_migration_upgrades_v0421_schema_and_preserves_required_mem
         trigger_type="manual",
         mutex_key="aps:legacy_task",
     )
-    SchemaMigration.create(name=SUPPORTED_BASE_MIGRATION_NAME)
+    SchemaMigration.create(name=V0421_BASE_MIGRATION_NAME)
 
     _drop_columns(
         clean_db,
@@ -364,7 +393,7 @@ def test_consolidated_migration_upgrades_v0421_schema_and_preserves_required_mem
         SchemaMigration.create(name=CONSOLIDATED_MIGRATION_NAME)
     summary = run_pending_migrations(clean_db)
 
-    assert summary.applied_count == 12
+    assert summary.applied_count == 15
     assert clean_db.execute_sql(
         "SELECT interaction_synced_at FROM movie WHERE id = %s", (movie.id,)
     ).fetchone()[0] == datetime(2026, 8, 20, 1, 2, 3)
@@ -493,6 +522,32 @@ def test_media_import_source_identity_migration_adds_column_and_index(clean_db):
     assert "import_source_identity" in _column_names(clean_db, "media")
     assert "media_library_id_import_source_identity" in {
         index.name for index in clean_db.get_indexes("media")
+    }
+
+
+def test_local_profile_and_moment_collection_migrations_add_runtime_indexes(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    clean_db.execute_sql("DROP TABLE moment_collection_item")
+    clean_db.execute_sql("DROP TABLE moment_collection")
+    _drop_columns(
+        clean_db,
+        "actor",
+        ("display_name_override", "profile_image_override_id"),
+    )
+
+    _load_migration_module(
+        Path(f"{MOMENT_COLLECTIONS_MIGRATION_NAME}.py")
+    ).migrate(clean_db)
+    _load_migration_module(
+        Path(f"{ACTOR_LOCAL_PROFILE_MIGRATION_NAME}.py")
+    ).migrate(clean_db)
+
+    assert "momentcollectionitem_point_id" in {
+        index.name for index in clean_db.get_indexes("moment_collection_item")
+    }
+    assert "actor_profile_image_override_id" in {
+        index.name for index in clean_db.get_indexes("actor")
     }
 
 
