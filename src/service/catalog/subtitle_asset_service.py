@@ -27,11 +27,17 @@ from src.schema.catalog.subtitles import (
 from src.storage import StorageNotFound, asset_storage
 
 
-def _prepare_movie_subtitle_target_path(movie_number: str, *, extension: str = ".srt") -> str:
+def _prepare_movie_subtitle_target_path(
+    movie_number: str, *, extension: str = ".srt", content_hash: str | None = None,
+) -> str:
     normalized_extension = extension.lower()
     if not normalized_extension.startswith(".") or len(normalized_extension) > 16:
         raise ValueError("invalid subtitle extension")
     prefix = movie_asset_relative_dir(normalize_asset_dir_name(movie_number)) / "subtitles"
+    if content_hash is not None:
+        # Direct PUT must use a content-addressed key: retries may encounter a
+        # completed upload whose database registration never committed.
+        return f"{prefix.as_posix()}/{movie_number}-{content_hash}{normalized_extension}"
     maximum = 0
     for item in asset_storage().list(prefix.as_posix()):
         stem = Path(item.key).stem
@@ -94,8 +100,13 @@ class SubtitleAssetService:
         if content_hash in cls.movie_subtitle_hashes(movie):
             return SubtitleImportResult(status=SubtitleImportStatus.DUPLICATE)
 
-        target_path = _prepare_movie_subtitle_target_path(movie.movie_number, extension=suffix)
-        asset_storage().put_bytes(target_path, content, overwrite=False)
+        storage = asset_storage()
+        immutable = getattr(storage, "supports_direct_immutable_put", False)
+        target_path = _prepare_movie_subtitle_target_path(
+            movie.movie_number, extension=suffix,
+            content_hash=content_hash if immutable else None,
+        )
+        storage.put_bytes(target_path, content, overwrite=False, immutable=immutable)
         subtitle = Subtitle.create(movie=movie, file_path=target_path)
         return SubtitleImportResult(
             status=SubtitleImportStatus.IMPORTED,
@@ -121,12 +132,15 @@ class SubtitleAssetService:
         if content_hash in hashes:
             return "skipped", "duplicate_fingerprint", source_path.name
 
+        storage = asset_storage()
+        immutable = getattr(storage, "supports_direct_immutable_put", False)
         target_path = _prepare_movie_subtitle_target_path(
             movie.movie_number,
             extension=source_path.suffix.lower(),
+            content_hash=content_hash if immutable else None,
         )
         del transfer_mode
-        asset_storage().put_file(target_path, source_path, overwrite=False)
+        storage.put_file(target_path, source_path, overwrite=False, immutable=immutable)
         Subtitle.create(movie=movie, file_path=target_path)
 
         hashes.add(content_hash)
