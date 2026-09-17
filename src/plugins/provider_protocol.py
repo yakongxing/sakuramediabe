@@ -457,6 +457,12 @@ class StorageResolutionProbeProvider(Protocol):
     def probe_resolution(self, *, media: MediaHandle) -> str | None: ...
 
 
+class StorageVideoInfoProbeProvider(Protocol):
+    """Optional capability for probing original-file technical metadata."""
+
+    def probe_video_info(self, *, media: MediaHandle) -> JsonObject | None: ...
+
+
 class DownloadComponent(Protocol):
     config_fields: tuple[ConfigField, ...]
 
@@ -683,6 +689,7 @@ __all__ = [
     "StorageMergedPlaybackPreflightProvider",
     "StorageProvider",
     "StorageResolutionProbeProvider",
+    "StorageVideoInfoProbeProvider",
     "ThumbnailArtifact",
     "ThumbnailGeneration",
     "refresh_media_provider_registry",

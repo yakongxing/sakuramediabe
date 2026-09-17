@@ -345,9 +345,6 @@ def _run_cli_job(job_def, params=None):
 
 
 def _register_aps_command(job_def, group):
-    if job_def.manual_only and job_def.params_schema is None:
-        # 无参的 manual_only 任务只能走 HTTP 触发，CLI 无法表达触发参数。
-        return
     if job_def.params_schema is None:
         @group.command(name=job_def.cli_name, help=job_def.cli_help)
         def _cmd():

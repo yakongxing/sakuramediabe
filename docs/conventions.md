@@ -178,3 +178,15 @@ JavDB 与其他远程元数据源提供的影片封面、剧情图和演员头�
 HTTP(S) URL，不经过 WebDAV 或本地图片发布队列，并原样保留查询字符串。通过稳定
 宿主 API 接入的 bundled provider 插件交付的是本地图片文件（没有第三方 URL），
 这些文件仍由宿主导入内部存储。应用生成的媒体缩略图同样使用配置的存储后端。
+
+## 插件下载接口
+
+Host API 7 新增 `context.downloads.list_targets()`，按下载器 ID 升序返回全部已配置
+下载器的只读 `PluginDownloadTarget`（ID、名称、媒体库 ID/名称、provider key），
+无下载器时返回空 tuple，不暴露连接配置或凭据。列表顺序不表示默认路由优先级。
+
+`context.downloads.search_candidates(movie_number=..., download_client_id=None)`
+省略下载器 ID 时沿用宿主路由：搜索有下载器绑定的索引器，每个索引器使用其绑定顺序
+中的首个下载器。显式指定 ID 时仍只搜索绑定到该下载器的索引器。
+每条候选保留自己的下载器和媒体库目标，提交时继续校验目标是否发生变化。
+Host API 版本保持为 7；使用新增能力需要安装包含这些接口的后端版本，旧版插件的显式 ID 调用保持兼容。

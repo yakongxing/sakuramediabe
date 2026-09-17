@@ -38,6 +38,13 @@ from src.schema.collections.playlists import (
 )
 from src.schema.common.pagination import PageResponse
 from src.schema.common.playlists import PlaylistSummaryResource
+from src.service.catalog.movie_list_media_service import attach_movie_list_media
+from src.service.catalog.movie_resolution_service import (
+    RESOLUTION_LEVELS,
+    resolution_exists_expression,
+    resolution_interval,
+    resolution_level_expression,
+)
 
 # 系统列表内部展示次序：最近播放在前，自定义列表在后。
 _SYSTEM_KIND_ORDER = (
@@ -46,16 +53,6 @@ _SYSTEM_KIND_ORDER = (
 
 # 允许空值、排序时统一垫后的字段（added_at/bitrate 走子查询无媒体场景由 COALESCE 兜底，不参与垫后）。
 PLAYLIST_NULLABLE_SORT_FIELDS = {"release_date"}
-# 分辨率筛选档位：归一化标签 -> 高度阈值（Media.resolution 为 "WxH" 字符串，取 height 判定）。
-RESOLUTION_LEVELS = (
-    ("8K", 4320),
-    ("4K", 2160),
-    ("2K", 1440),
-    ("1080P", 1080),
-    ("720P", 720),
-    ("480P", 480),
-    ("360P", 360),
-)
 
 
 class PlaylistService:
@@ -95,54 +92,6 @@ class PlaylistService:
         return Media.select(fn.COALESCE(fn.MAX(bit_rate_text.cast("bigint")), 0)).where(
             Media.movie == Movie.movie_number,
             Media.valid == True,
-        )
-
-    @staticmethod
-    def _resolution_height_expression():
-        """解析 ``WxH`` 分辨率的 height 分量（probe 写入形态），供阈值比较与分桶复用。"""
-        return fn.split_part(Media.resolution, "x", 2).cast("int")
-
-    @classmethod
-    def _resolution_interval(cls, resolution: str | None) -> tuple[int | None, int | None]:
-        """解析分辨率筛选档位为 ``[threshold, upper)`` 高度区间；非法档位抛 422。
-
-        档位互斥：4K 命中 ``[2160, 4320)``，8K 命中 ``[4320, ...)``，8K 影片不会误入 4K。
-        """
-        if resolution is None:
-            return (None, None)
-        normalized = resolution.strip().lower()
-        for index, (label, threshold) in enumerate(RESOLUTION_LEVELS):
-            if label.lower() == normalized:
-                upper = RESOLUTION_LEVELS[index - 1][1] if index > 0 else None
-                return (threshold, upper)
-        raise ApiError(
-            422,
-            "invalid_playlist_filter",
-            "Invalid resolution filter",
-            {"resolution": resolution},
-        )
-
-    @classmethod
-    def _resolution_exists_expression(cls, resolution: str):
-        """构造「影片最高分辨率落在档位区间」的 EXISTS 子查询。
-
-        对 media 分组后按 MAX(height) 归入精确档位，只匹配 ``WxH`` 形态（probe 写入），
-        无法解析的脏值直接排除。
-        """
-        threshold, upper = cls._resolution_interval(resolution)
-        height_expression = cls._resolution_height_expression()
-        having_conditions = [fn.MAX(height_expression) >= threshold]
-        if upper is not None:
-            having_conditions.append(fn.MAX(height_expression) < upper)
-        return fn.EXISTS(
-            Media.select(fn.COUNT(Media.id))
-            .where(
-                Media.movie == Movie.movie_number,
-                Media.valid == True,
-                Media.resolution.regexp(r"^\d+x\d+$"),
-            )
-            .group_by(Media.movie)
-            .having(*having_conditions)
         )
 
     @classmethod
@@ -354,7 +303,7 @@ class PlaylistService:
         """
         playlist = cls._require_playlist(playlist_id)
         # 先校验分辨率档位，避免非法值到查询层才炸出未预期错误。
-        cls._resolution_interval(resolution)
+        resolution_interval(resolution)
         start = max(page - 1, 0) * page_size
         total_query = (
             PlaylistMovie.select()
@@ -362,7 +311,7 @@ class PlaylistService:
             .where(PlaylistMovie.playlist == playlist)
         )
         if resolution is not None:
-            total_query = total_query.where(cls._resolution_exists_expression(resolution))
+            total_query = total_query.where(resolution_exists_expression(resolution))
         total = total_query.count()
         can_play_expression = cls._playable_exists_expression().alias("can_play")
         query, _thin_cover_alias = with_movie_card_relations(
@@ -372,16 +321,16 @@ class PlaylistService:
         )
         query = query.switch(PlaylistMovie).where(PlaylistMovie.playlist == playlist)
         if resolution is not None:
-            query = query.where(cls._resolution_exists_expression(resolution))
+            query = query.where(resolution_exists_expression(resolution))
         order_by = cls._build_playlist_sort(sort)
         if order_by is None:
             order_by = [PlaylistMovie.updated_at.desc(), PlaylistMovie.id.desc()]
         links = list(query.order_by(*order_by).offset(start).limit(page_size))
+        attach_movie_list_media([link.movie for link in links])
         items: list[PlaylistMovieListItemResource] = []
         for link in links:
             # schema 读取的是 Movie 对象，所以把列表关系上的附加信息临时挂回 movie 实例。
             link.movie.playlist_item_updated_at = link.updated_at
-            link.movie.can_play = getattr(link.movie, "can_play", getattr(link, "can_play", False))
             items.append(PlaylistMovieListItemResource.from_attributes_model(link.movie))
         return PageResponse[PlaylistMovieListItemResource](
             items=items,
@@ -391,12 +340,12 @@ class PlaylistService:
         )
 
     @staticmethod
-    def _bucket_for_height(height: int | None) -> str | None:
-        """按高度把影片归入最高命中档位；无法解析的取 None 不计入。"""
-        if height is None:
+    def _bucket_for_level(level: int | None) -> str | None:
+        """按序号把影片归入最高命中档位；无法解析的取 None 不计入。"""
+        if level is None:
             return None
         for label, threshold in RESOLUTION_LEVELS:
-            if height >= threshold:
+            if level >= threshold:
                 return label
         return None
 
@@ -412,17 +361,17 @@ class PlaylistService:
             .join(PlaylistMovie, on=(PlaylistMovie.movie == Movie.id))
             .where(PlaylistMovie.playlist == playlist)
         )
-        max_height = fn.MAX(cls._resolution_height_expression())
-        # SQL 层只按影片聚合最高 height，分桶落在 Python，避免聚合函数进 GROUP BY。
+        max_level = fn.MAX(resolution_level_expression())
+        # SQL 层只按影片聚合最高档位序号，分桶落在 Python，避免聚合函数进 GROUP BY。
         query = (
-            base.select(Movie.id, max_height.alias("max_height"))
+            base.select(Movie.id, max_level.alias("max_level"))
             .join(Media, on=(Media.movie == Movie.movie_number))
             .where(Media.valid == True, Media.resolution.regexp(r"^\d+x\d+$"))
             .group_by(Movie.id)
         )
         counts: dict[str, int] = {}
         for row in query:
-            label = cls._bucket_for_height(row.max_height)
+            label = cls._bucket_for_level(row.max_level)
             if label is not None:
                 counts[label] = counts.get(label, 0) + 1
         options: list[PlaylistResolutionOption] = []

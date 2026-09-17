@@ -115,6 +115,7 @@ class MediaDetailReadService:
             media.play_url = build_signed_media_url(
                 media.id, delivery=bundle.playback_deliveries[0]
             )
+            media.library_name = media.library.name
             media.provider_key = provider_key
             media.playback_deliveries = list(bundle.playback_deliveries)
             resources.append(MovieMediaResource.from_attributes_model(media))

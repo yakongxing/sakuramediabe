@@ -28,11 +28,12 @@ from src.service.discovery import (
     MovieRecommendationService,
 )
 from src.service.playback import (
-    MediaDurationBackfillService,
     MediaFileHashBackfillService,
-    MediaResolutionBackfillService,
     MediaThumbnailService,
     MediaValidityScanService,
+)
+from src.service.playback.media_video_info_backfill_service import (
+    MediaVideoInfoBackfillService,
 )
 from src.service.system import ActivityCleanupService
 from src.service.transfers.downloads.auto_subscribed.auto_download_service import (
@@ -127,22 +128,12 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         ),
     ),
     JobDefinition(
-        task_key=MediaDurationBackfillService.TASK_KEY,
-        log_name="media-duration-backfill",
-        cli_name="backfill-media-durations",
-        cli_help="补齐有效媒体缺失的时长",
+        task_key=MediaVideoInfoBackfillService.TASK_KEY,
+        log_name="media-video-info-backfill",
+        cli_name="backfill-media-video-info",
+        cli_help="媒体信息回填",
         manual_only=True,
-        handler=lambda reporter, _params: MediaDurationBackfillService.backfill_missing_durations(
-            reporter=reporter,
-        ),
-    ),
-    JobDefinition(
-        task_key=MediaResolutionBackfillService.TASK_KEY,
-        log_name="media-resolution-backfill",
-        cli_name="backfill-media-resolutions",
-        cli_help="补齐有效媒体缺失的分辨率",
-        manual_only=True,
-        handler=lambda reporter, _params: MediaResolutionBackfillService.backfill_missing_resolutions(
+        handler=lambda reporter, _params: MediaVideoInfoBackfillService.backfill_missing_video_infos(
             reporter=reporter,
         ),
     ),

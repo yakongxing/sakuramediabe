@@ -24,7 +24,7 @@ def test_create_media_persists_provider_file_hash(test_db):
         receipt={"receipt": "hash"},
         size_bytes=123,
         duration_seconds=60,
-        video_info=None,
+        video_info={"video": {"codec_name": "hevc", "bit_rate": 9000000}},
     )
     file_hash = "media-file-hash-v1:" + "a" * 40
 
@@ -45,6 +45,7 @@ def test_create_media_persists_provider_file_hash(test_db):
     )
 
     persisted = Media.get_by_id(media.id)
+    assert persisted.video_info == staged.video_info
     assert persisted.file_hash == file_hash
     assert persisted.resolution is None
 

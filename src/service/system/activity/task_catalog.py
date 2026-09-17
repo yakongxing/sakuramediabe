@@ -9,6 +9,7 @@ TASK_NAME_REGISTRY = {
     "download_task_auto_import": "已完成下载自动导入",
     "media_file_hash_backfill": "媒体文件哈希补算",
     "media_duration_backfill": "媒体时长回填",
+    "media_video_info_backfill": "媒体信息回填",
     "media_resolution_backfill": "媒体分辨率回填",
     "media_file_scan": "媒体文件巡检",
     "media_thumbnail_generation": "媒体缩略图生成",

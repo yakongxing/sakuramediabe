@@ -103,7 +103,8 @@ def test_movie_list_has_fixed_query_budget(test_db, monkeypatch):
     queries = _count_queries(monkeypatch, test_db)
     movies = MovieService.list_movies(page=1, page_size=20)
 
-    assert len(queries) <= 2
+    # count + movie page + the page-wide media summary batch.
+    assert len(queries) <= 3
     assert movies.items[0].movie_number == movie.movie_number
 
 

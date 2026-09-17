@@ -57,6 +57,7 @@ def test_aps_command_invokes_scheduler_entrypoint(monkeypatch):
         "generate-daily-recommendations",
         "generate-moment-recommendations",
         "auto-download-subscribed-movies",
+        "backfill-media-video-info",
     ],
 )
 def test_aps_cli_commands_run_job(monkeypatch, cli_name):
@@ -1151,3 +1152,15 @@ def test_task_worker_uses_one_job_definition_for_all_params(test_db, monkeypatch
     TaskWorker()._execute(TaskQueueService.claim_next())
 
     assert calls == [{"movie_number": "ABC-123"}, {}, {}]
+
+
+def test_media_info_backfill_is_the_only_metadata_backfill_command():
+    job = JOB_REGISTRY_BY_KEY["media_video_info_backfill"]
+    assert job.manual_only and job.manual_trigger_allowed
+    assert job.cli_help == "媒体信息回填"
+    assert job.cli_name == "backfill-media-video-info"
+    assert "media_duration_backfill" not in JOB_REGISTRY_BY_KEY
+    assert "media_resolution_backfill" not in JOB_REGISTRY_BY_KEY
+    cli_names = {definition.cli_name for definition in JOB_REGISTRY}
+    assert "backfill-media-durations" not in cli_names
+    assert "backfill-media-resolutions" not in cli_names

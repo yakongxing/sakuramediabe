@@ -36,9 +36,12 @@ from src.schema.playback.media import (
     MediaProgressResource,
     MediaProgressUpdateRequest,
     MediaThumbnailGenerationState,
+    MediaThumbnailResetRequest,
+    MediaThumbnailResetResponse,
     MediaThumbnailResource,
+    MultiVersionMovieResource,
 )
-from src.service.playback import MediaService
+from src.service.playback import MediaService, MediaThumbnailService
 from src.service.playback.provider_helpers import library_handle_for, media_handle_for
 
 router = APIRouter(
@@ -128,6 +131,19 @@ def list_media(
     )
 
 
+@router.post(
+    "/thumbnail-generation/reset",
+    response_model=MediaThumbnailResetResponse,
+)
+def reset_terminal_media_thumbnails(
+    payload: MediaThumbnailResetRequest,
+    current_user=Depends(get_current_user),
+):
+    return MediaThumbnailResetResponse(
+        reset_count=MediaThumbnailService.reset_terminal_media(payload.media_ids),
+    )
+
+
 @router.get("/invalid", response_model=PageResponse[InvalidMediaResource])
 def list_invalid_media(
     page: int = 1,
@@ -149,6 +165,19 @@ def list_duplicate_media_groups(
         kind=kind,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/multi-version-movies", response_model=PageResponse[MultiVersionMovieResource])
+def list_multi_version_movies(
+    page: int = 1,
+    page_size: int = 20,
+    include_vr: bool = Query(False, description="包含番号含 VR 或拥有 VR 标签的影片"),
+    include_fc2: bool = Query(False, description="包含番号以 FC2 开头的影片"),
+    current_user=Depends(get_current_user),
+):
+    return MediaService.list_multi_version_movies(
+        page=page, page_size=page_size, include_vr=include_vr, include_fc2=include_fc2,
     )
 
 
