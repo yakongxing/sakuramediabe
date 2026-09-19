@@ -4,6 +4,7 @@ from loguru import logger
 from starlette.responses import JSONResponse
 
 from src.api.exception.errors import ApiError
+from src.model.postgres import DatabaseUnavailable
 
 
 def _error_response(
@@ -33,6 +34,12 @@ async def api_error_handler(request, exc: ApiError):
         exc.message,
         exc.details,
         exc.response_headers,
+    )
+
+
+async def database_unavailable_handler(request, exc: DatabaseUnavailable):
+    return _error_response(
+        503, "database_unavailable", "Database temporarily unavailable"
     )
 
 

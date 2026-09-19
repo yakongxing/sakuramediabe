@@ -10,6 +10,7 @@ from src.api.exception.errors import ApiError
 from src.api.exception.exception import (
     all_exception_handler,
     api_error_handler,
+    database_unavailable_handler,
     http_exception_handler,
     validation_exception_handler,
 )
@@ -57,6 +58,7 @@ from src.api.routers.videos.items import router as videos_router
 from src.common.database import ensure_database_ready
 from src.common.logging import configure_logging
 from src.config.config import ensure_runtime_config, settings
+from src.model.postgres import DatabaseUnavailable
 
 
 def _create_lifespan():
@@ -121,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(video_collections_router)
 
     app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(DatabaseUnavailable, database_unavailable_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(Exception, all_exception_handler)

@@ -55,7 +55,10 @@ class TaskWorker:
         interrupted = TaskQueueService.recover_interrupted_runs()
         recoverable_task_keys = {
             definition.task_key
-            for definition in (*JOB_REGISTRY_BY_KEY.values(), *QUEUE_TASK_REGISTRY.values())
+            for definition in (
+                *JOB_REGISTRY_BY_KEY.values(),
+                *QUEUE_TASK_REGISTRY.values(),
+            )
             if definition.business_recovery is not None
         }
         recoverable_task_keys.update(run.task_key for run in interrupted)
@@ -86,12 +89,12 @@ class TaskWorker:
     # ------------------------------------------------------------------ claim
 
     def _claim_loop(self, lane: str = LANE_DEFAULT) -> None:
-        ensure_database_ready()
         # default 道排除专属道任务；专属道只领取本道任务。
         include_task_keys = None if lane == LANE_DEFAULT else lane_task_keys(lane)
         exclude_task_keys = NON_DEFAULT_LANE_TASK_KEYS if lane == LANE_DEFAULT else None
         while not self._stop.is_set():
             try:
+                ensure_database_ready()
                 task_run = TaskQueueService.claim_next(
                     lease_seconds=self._lease_seconds,
                     include_task_keys=include_task_keys,
@@ -104,7 +107,11 @@ class TaskWorker:
             if task_run is None:
                 self._stop.wait(self._poll_interval)
                 continue
-            self._execute(task_run)
+            try:
+                self._execute(task_run)
+            except Exception:
+                logger.exception("Task worker execution cleanup failed")
+                self._stop.wait(self._poll_interval * 5)
 
     def _execute(self, task_run: BackgroundTaskRun) -> None:
         queue_def = QUEUE_TASK_REGISTRY.get(task_run.task_key)
@@ -146,10 +153,10 @@ class TaskWorker:
     # ----------------------------------------------------------- housekeeping
 
     def _housekeeping_loop(self) -> None:
-        ensure_database_ready()
         interval = max(self._lease_seconds // 3, 5)
         while not self._stop.wait(interval):
             try:
+                ensure_database_ready()
                 self._run_housekeeping_once()
             except Exception:
                 logger.exception("Task worker housekeeping failed")
@@ -162,7 +169,9 @@ class TaskWorker:
         with self._lock:
             in_flight_ids = list(self._in_flight)
         if in_flight_ids:
-            TaskQueueService.renew_leases(in_flight_ids, lease_seconds=self._lease_seconds)
+            TaskQueueService.renew_leases(
+                in_flight_ids, lease_seconds=self._lease_seconds
+            )
 
     def _recover_expired_leases(self) -> None:
         recovered = TaskQueueService.recover_expired_leases()

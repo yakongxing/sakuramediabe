@@ -6,11 +6,11 @@ from peewee import (
     CharField,
     DatabaseProxy,
     Model,
-    PostgresqlDatabase,
     TextField,
 )
 
 from src.config.config import Database, DatabaseEngine
+from src.model.postgres import RecoveringPostgresqlDatabase
 
 database_proxy = DatabaseProxy()
 
@@ -29,8 +29,9 @@ def create_database(config: Database):
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 5432
     connect_options = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    connect_options.setdefault("connect_timeout", 5)
 
-    return PostgresqlDatabase(
+    return RecoveringPostgresqlDatabase(
         database_name,
         user=username,
         password=password,

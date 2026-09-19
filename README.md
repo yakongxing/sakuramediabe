@@ -10,6 +10,16 @@ SakuraMediaBE 是 SakuraMedia 的服务端项目，负责提供媒体库管理�
 
 项目当前基于 Python 3.10、FastAPI、Peewee、Pydantic 2 和 APScheduler 构建，代码结构按 `api -> service -> model` 分层组织，面向单账号场景运行。
 
+## 数据库断线恢复
+
+PostgreSQL 重启后，API 和后台工作线程会在后续数据库操作时自动替换失效连接，无需重启后端。事务外复用连接前执行一次 `SELECT 1` 探测；事务或媒体操作会话锁持有期间不更换连接。
+
+连接不可用时，API 返回 HTTP `503`，错误码为 `database_unavailable`。执行途中断线的业务 SQL、写操作和事务不会自动重放；提交时断线可能无法确认提交结果，客户端不应直接重复提交写请求。后台任务沿用现有失败处理和租约恢复规则。
+
+新连接的 `connect_timeout` 默认为 5 秒，可通过数据库 URL 查询参数覆盖，例如 `?connect_timeout=10`。这个参数限制建立连接的等待时间，不是 SQL 执行超时。
+
+独立 PostgreSQL 停库、启库测试可通过 `SAKURAMEDIA_TEST_PG_BIN=/usr/lib/postgresql/15/bin .venv/bin/pytest -q -n0 --no-testmon tests/common/test_database_restart.py` 运行；测试会自行创建并清理临时数据库实例，不操作已有实例。
+
 ## 重要提示
 
 本项目仅用于技术交流，不提供任何多媒体资源下载，不存储任何非法内容。用户使用本工具产生的一切后果由使用者自行承担，作者不参与任何资源分发。
