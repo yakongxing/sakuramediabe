@@ -5,10 +5,13 @@
 翻译/互动/热度等异步任务见 ``movie_task_service``。
 """
 
+import operator
+import re
 from collections.abc import Sequence
 from datetime import datetime
+from functools import reduce
 
-from peewee import JOIN, fn
+from peewee import JOIN, Case, fn
 
 from src.api.exception.errors import ApiError
 from src.common import (
@@ -24,6 +27,7 @@ from src.common.service_helpers import (
     resolve_sort_expression,
     with_movie_card_relations,
 )
+from src.common.text_search import split_search_terms
 from src.metadata._providers.models import JavdbMovieReviewResource
 from src.metadata.factory import build_javdb_provider
 from src.metadata.provider import MetadataNotFoundError, MetadataRequestError
@@ -70,6 +74,7 @@ from src.service.catalog.movie_list_media_service import attach_movie_list_media
 from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
 from src.service.catalog.movie_resolution_service import resolution_exists_expression
 from src.service.collections import PlaylistService
+from src.service.discovery.ranking_service import RankingCatalogService
 from src.service.media_detail_read_service import MediaDetailReadService
 from src.service.playback.provider_helpers import library_handle_for, media_handle_for
 
@@ -112,6 +117,7 @@ class MovieService:
         heat_max: int | None = None,
         resolution: str | None = None,
         blacklisted: bool = False,
+        search_terms: Sequence[str] = (),
     ):
         """构建影片列表的基础筛选链路，供列表和计数查询复用。"""
         if heat_min is not None and heat_max is not None and heat_min > heat_max:
@@ -180,7 +186,119 @@ class MovieService:
             filtered_query = filtered_query.where(
                 resolution_exists_expression(resolution, error_code="invalid_movie_filter")
             )
+        if search_terms:
+            filtered_query = filtered_query.where(cls._search_conditions(search_terms))
         return filtered_query
+
+    @staticmethod
+    def _number_search_target(term: str):
+        """番号匹配目标：返回 (存储值表达式, 检索键)；不适用时返回 (None, "")。
+
+        - 存储值大小写不敏感（东热 n0646 的规范写法是小写）；
+        - 一般番号去掉 -/_ 后做子串匹配，FC2 的 PPV 段两侧统一折叠；
+        - 纯数字番号保留分隔符（一本道 _ 与加勒比 - 是不同影片）。
+        """
+        normalized = term.strip().upper()
+        if not any(char.isascii() and char.isalnum() for char in normalized):
+            return None, ""
+        if re.fullmatch(r"\d+[-_]\d+", normalized):
+            return Movie.movie_number, normalized
+        key = normalized.replace("-", "").replace("_", "")
+        if key.startswith("FC2PPV"):
+            key = "FC2" + key[len("FC2PPV") :]
+        expression = fn.REPLACE(
+            fn.UPPER(fn.TRANSLATE(Movie.movie_number, "-_", "")), "FC2PPV", "FC2"
+        )
+        return expression, key
+
+    @staticmethod
+    def _matching_actor_ids(term: str) -> list[int]:
+        """按姓名或别名找出命中检索词的演员 ID，供影片查询做关联匹配。"""
+        return [
+            actor.id
+            for actor in Actor.select(Actor.id).where(
+                (Actor.name.contains(term)) | (Actor.alias_name.contains(term))
+            )
+        ]
+
+    @staticmethod
+    def _matching_tag_ids(term: str) -> list[int]:
+        return [tag.id for tag in Tag.select(Tag.id).where(Tag.name.contains(term))]
+
+    @classmethod
+    def _search_term_conditions(cls, term: str) -> list:
+        """单个检索词在各字段上的 OR 条件：片名、番号、演员、标签。"""
+        conditions = [Movie.title.contains(term)]
+        number_expression, number_key = cls._number_search_target(term)
+        if number_expression is not None:
+            conditions.append(number_expression.contains(number_key))
+        actor_ids = cls._matching_actor_ids(term)
+        if actor_ids:
+            conditions.append(
+                Movie.id.in_(
+                    MovieActor.select(MovieActor.movie).where(
+                        MovieActor.actor.in_(actor_ids)
+                    )
+                )
+            )
+        tag_ids = cls._matching_tag_ids(term)
+        if tag_ids:
+            conditions.append(
+                Movie.id.in_(
+                    MovieTag.select(MovieTag.movie).where(MovieTag.tag.in_(tag_ids))
+                )
+            )
+        return conditions
+
+    @classmethod
+    def _search_conditions(cls, search_terms: Sequence[str]):
+        """多词检索：词之间 AND，词内各字段 OR。"""
+        return reduce(
+            operator.and_,
+            (
+                reduce(operator.or_, cls._search_term_conditions(term))
+                for term in search_terms
+            ),
+        )
+
+    @classmethod
+    def _search_score_expression(cls, search_terms: Sequence[str]):
+        """相关度分数：分数越小越靠前；每个词取最高档命中，多词求和。
+
+        分档：完整番号 0、番号前缀 1、片名精确 2、片名前缀 3、
+        片名包含 4、仅演员/标签命中 5。
+        """
+        term_scores = []
+        for term in search_terms:
+            conditions: list[tuple] = []
+            number_expression, number_key = cls._number_search_target(term)
+            if number_expression is not None:
+                conditions.append((number_expression == number_key, 0))
+                conditions.append(
+                    (fn.LEFT(number_expression, len(number_key)) == number_key, 1)
+                )
+            conditions.extend(
+                [
+                    (fn.UPPER(Movie.title) == term.upper(), 2),
+                    (Movie.title.startswith(term), 3),
+                    (Movie.title.contains(term), 4),
+                ]
+            )
+            term_scores.append(Case(None, conditions, default=5))
+        return reduce(operator.add, term_scores)
+
+    @classmethod
+    def _build_movie_search_sort(cls, search_terms: Sequence[str]) -> list:
+        """检索默认排序：相关度优先，其次发行时间与业务 ID 稳定排序。"""
+        return [
+            cls._search_score_expression(search_terms),
+            *build_ordered_expressions(
+                Movie.release_date,
+                "desc",
+                nullable=True,
+                tie_breaker=Movie.id,
+            ),
+        ]
 
     @staticmethod
     def _latest_media_created_at_subquery():
@@ -228,6 +346,7 @@ class MovieService:
         heat_max: int | None = None,
         resolution: str | None = None,
         blacklisted: bool = False,
+        search_terms: Sequence[str] = (),
     ):
         """列表查询统一在这里补齐封面图和 ``can_play`` 计算列。"""
         can_play_expression = cls._playable_exists_expression().alias("can_play")
@@ -247,9 +366,14 @@ class MovieService:
                 heat_max=heat_max,
                 resolution=resolution,
                 blacklisted=blacklisted,
+                search_terms=search_terms,
             ).select(Movie, can_play_expression)
         )
-        return query.order_by(*cls._build_movie_list_sort(sort, status))
+        if search_terms and (sort is None or not sort.strip()):
+            order_by = cls._build_movie_search_sort(search_terms)
+        else:
+            order_by = cls._build_movie_list_sort(sort, status)
+        return query.order_by(*order_by)
 
     @classmethod
     def _latest_movies_query(cls):
@@ -499,6 +623,7 @@ class MovieService:
             provider_bundles=media_batch.provider_bundles,
         )
         movie.playlists = PlaylistService.list_movie_playlists(movie)
+        movie.rankings = RankingCatalogService.list_movie_rankings(movie.id)
         movie.can_play = any(media_item.valid for media_item in movie.media_items)
         return MovieDetailResource.from_attributes_model(movie)
 
@@ -518,10 +643,12 @@ class MovieService:
         heat_max: int | None = None,
         resolution: str | None = None,
         blacklisted: bool = False,
+        query: str | None = None,
         page: int = 1,
         page_size: int = 20,
     ) -> PageResponse[MovieListItemResource]:
         start = max(page - 1, 0) * page_size
+        search_terms = split_search_terms(query, error_code="invalid_movie_filter")
         total = MovieService._filtered_movies(
             actor_id=actor_id,
             tag_ids=tag_ids,
@@ -536,6 +663,7 @@ class MovieService:
             heat_max=heat_max,
             resolution=resolution,
             blacklisted=blacklisted,
+            search_terms=search_terms,
         ).count()
         movies = list(
             MovieService.movie_list_query(
@@ -553,6 +681,7 @@ class MovieService:
                 heat_max=heat_max,
                 resolution=resolution,
                 blacklisted=blacklisted,
+                search_terms=search_terms,
             ).offset(start).limit(page_size)
         )
         attach_movie_list_media(movies)
@@ -638,18 +767,8 @@ class MovieService:
         )
 
     @classmethod
-    def search_local_movies(cls, movie_number: str) -> list[MovieListItemResource]:
-        # 本地搜索只取最匹配的一条，职责是回答“库里有没有这个番号”。
-        movie = find_movie_by_number(movie_number)
-        if movie is None:
-            return []
-        movies = list(cls.movie_list_query().where(Movie.id == movie.id))
-        attach_movie_list_media(movies)
-        return MovieListItemResource.from_items(movies)
-
-    @classmethod
     def get_movie_collection_status(cls, movie_number: str) -> MovieCollectionStatusResource:
-        # 与本地搜索保持同一套匹配（find_movie_by_number），确保不同输入格式能命中同一影片。
+        # 用 find_movie_by_number 统一匹配大小写和分隔符写法，确保不同输入格式能命中同一影片。
         movie = find_movie_by_number(movie_number)
         if movie is None:
             raise ApiError(404, "movie_not_found", "影片不存在", {"movie_number": movie_number})

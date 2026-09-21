@@ -40,6 +40,7 @@ from src.service.discovery.qdrant_thumbnail_store import (
     get_qdrant_thumbnail_store,
 )
 from src.service.discovery.recommendation_service import MovieRecommendationService
+from src.service.system.optional_services import image_search_enabled
 from src.storage import asset_storage
 
 MOMENT_RECOMMENDATION_LIMIT = 300
@@ -208,6 +209,8 @@ class MomentRecommendationService:
         seeds: Sequence[_MomentSeed],
         candidates_by_thumbnail_id: dict[int, _MomentCandidate],
     ) -> int:
+        if not image_search_enabled():
+            return 0
         added_count = 0
         for seed in seeds:
             query_vector = self._infer_seed_vector(seed)
@@ -423,6 +426,7 @@ class MomentRecommendationService:
     ) -> dict[str, int]:
         safe_limit = max(int(limit), 0)
         seeds = self._load_seeds()
+        logger.info("Moment recommendation started seed_points={}", len(seeds))
         emit_progress(progress_callback, current=0, total=0, text="推荐时刻生成 · 正在收集候选")
         candidates_by_thumbnail_id: dict[int, _MomentCandidate] = {}
         visual_candidates = self._collect_visual_candidates(seeds, candidates_by_thumbnail_id) if seeds else 0
@@ -432,6 +436,13 @@ class MomentRecommendationService:
         popular_candidates = 0
         if len(candidates_by_thumbnail_id) < safe_limit:
             popular_candidates = self._collect_popular_candidates(candidates_by_thumbnail_id, safe_limit)
+        logger.info(
+            "Moment recommendation candidates collected visual={} similar={} popular={} total={}",
+            visual_candidates,
+            similar_candidates,
+            popular_candidates,
+            len(candidates_by_thumbnail_id),
+        )
 
         def build_summary(stored_items: int) -> dict[str, int]:
             return {

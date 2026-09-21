@@ -12,7 +12,6 @@ from src.model import (
     MediaLibrary,
     MediaPoint,
     MediaProgress,
-    MediaThumbnail,
 )
 from src.plugins.provider_protocol import MEDIA_PROVIDER_REGISTRY
 from src.schema.catalog.actors import ImageResource
@@ -50,9 +49,7 @@ class MediaDetailReadService:
             return points_by_media_id
 
         point_query = (
-            MediaPoint.select(MediaPoint, MediaThumbnail, Image)
-            .join(MediaThumbnail)
-            .switch(MediaThumbnail)
+            MediaPoint.select(MediaPoint, Image)
             .join(Image)
             .where(MediaPoint.media.in_(media_ids))
             .order_by(MediaPoint.media, MediaPoint.id)
@@ -63,7 +60,7 @@ class MediaDetailReadService:
                     point_id=point.id,
                     thumbnail_id=point.thumbnail_id,
                     offset_seconds=point.offset_seconds,
-                    image=ImageResource.from_attributes_model(point.thumbnail.image),
+                    image=ImageResource.from_attributes_model(point.image),
                 )
             )
         return points_by_media_id

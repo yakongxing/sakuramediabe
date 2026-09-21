@@ -64,6 +64,7 @@ def list_movies(
     heat_max: int | None = Query(default=None, ge=0),
     resolution: str | None = Query(default=None),
     blacklisted: bool = False,
+    query: str | None = Query(default=None),
     page: int = 1,
     page_size: int = 20,
 ):
@@ -86,6 +87,7 @@ def list_movies(
         heat_max=heat_max,
         resolution=resolution,
         blacklisted=blacklisted,
+        query=query,
         page=page,
         page_size=page_size,
     )
@@ -123,11 +125,6 @@ def list_subscribed_actor_latest_movies(page: int = 1, page_size: int = 20):
 @router.post("/search/parse-number", response_model=MovieNumberParseResponse)
 def parse_movie_number(payload: MovieNumberParseRequest):
     return MovieService.parse_movie_number_query(payload.query)
-
-
-@router.get("/search/local", response_model=list[MovieListItemResource])
-def search_local_movies(movie_number: str = Query(..., min_length=1)):
-    return MovieService.search_local_movies(movie_number=movie_number)
 
 
 @router.get("/{movie_number}/collection-status", response_model=MovieCollectionStatusResource)

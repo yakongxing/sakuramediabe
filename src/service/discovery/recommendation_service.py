@@ -27,6 +27,7 @@ from src.service.discovery.qdrant_movie_similarity_store import (
     QdrantMovieSimilarityStore,
     get_qdrant_movie_similarity_store,
 )
+from src.service.system.optional_services import movie_similarity_enabled
 
 SIM_WEIGHT_ACTOR = 0.6
 SIM_WEIGHT_TAG = 0.4
@@ -194,6 +195,7 @@ class MovieRecommendationService:
         total_movies = int(
             Movie.select().where(Movie.is_collection == False).count()
         )
+        logger.info("Movie similarity recompute started total_movies={}", total_movies)
         actor_df = self._load_feature_document_frequencies(
             MovieActor, MovieActor.actor
         )
@@ -224,6 +226,12 @@ class MovieRecommendationService:
             self.store.upsert_sparse_points(collection_name, batch)
             stats["indexed_movies"] += len(batch)
             batch.clear()
+            if (stats["indexed_movies"] // INDEX_BATCH_SIZE) % 10 == 0:
+                logger.info(
+                    "Movie similarity recompute progress indexed={}/{}",
+                    stats["indexed_movies"],
+                    total_movies,
+                )
             emit_progress(
                 progress_callback,
                 current=stats["indexed_movies"],
@@ -298,6 +306,8 @@ class MovieRecommendationService:
         *,
         limit: int = SIM_TOP_N,
     ) -> dict[int, list[MovieSimilaritySearchHit]]:
+        if not movie_similarity_enabled():
+            return {movie_id: [] for movie_id in source_movie_ids}
         return self.store.search_many(source_movie_ids, limit=limit)
 
     def list_similar(

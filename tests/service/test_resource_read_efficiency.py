@@ -46,7 +46,14 @@ def _add_media_detail(owner, library: MediaLibrary, suffix: str) -> Media:
     )
     MediaProgress.create(media=media, position_seconds=12)
     thumbnail = MediaThumbnail.create(media=media, image=_image(f"{suffix}.webp"), offset=12)
-    MediaPoint.create(media=media, thumbnail=thumbnail, offset_seconds=12)
+    MediaPoint.create(
+        media=media,
+        thumbnail=thumbnail,
+        image=thumbnail.image,
+        movie_number=media.movie_number,
+        video_item_id=media.video_item_id,
+        offset_seconds=12,
+    )
     return media
 
 
@@ -71,7 +78,8 @@ def test_movie_detail_has_fixed_query_budget(test_db, monkeypatch):
 
     detail = MovieService.get_movie_detail(movie.movie_number)
 
-    assert len(queries) <= 7
+    # Existing detail reads plus one batched ranking-placement query.
+    assert len(queries) <= 8
     assert len(detail.media_items) == 2
     assert detail.media_items[0].progress.last_position_seconds == 12
     assert len(detail.media_items[0].points) == 1
