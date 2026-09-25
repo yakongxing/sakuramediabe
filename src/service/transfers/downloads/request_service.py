@@ -36,12 +36,13 @@ class DownloadRequestService:
             "invalid_download_request_candidate",
             "candidate source_uri cannot be empty",
         )
-        display_name = validate_non_empty(
+        candidate_title = validate_non_empty(
             payload.candidate.title,
             "invalid_download_request_candidate",
             "candidate title cannot be empty",
         )
         info_hash = resolve_resource_hash(source_uri)
+        display_name = f"{movie_number}-{info_hash[:6]}"
         if DownloadResourceBlacklist.select().where(
             DownloadResourceBlacklist.info_hash == info_hash
         ).exists():
@@ -50,7 +51,7 @@ class DownloadRequestService:
             client_id=client.id,
             movie_number=movie_number,
             indexer_name=payload.candidate.indexer_name,
-            title=display_name,
+            title=candidate_title,
             source_uri=source_uri,
             info_hash=info_hash,
         )

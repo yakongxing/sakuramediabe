@@ -311,6 +311,18 @@ def test_each_submission_is_recorded_when_provider_returns_existing_task(downloa
     }
 
 
+def test_submission_uses_movie_number_and_hash_prefix_as_download_folder_name(downloads):
+    _client, provider = downloads
+    payload = _payload()
+    payload.candidate.title = "TEST-001 1080p uncensored very long indexer description"
+
+    DownloadRequestService().create_request(payload)
+
+    submission = provider.submit.call_args.kwargs["submission"]
+    assert submission.display_name == f"TEST-001-{HASH[:6]}"
+    assert DownloadSubmissionRecord.get().title == payload.candidate.title
+
+
 def test_submission_failure_is_recorded(downloads):
     _client, provider = downloads
     provider.submit.side_effect = ProviderOperationError(

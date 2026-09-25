@@ -7,7 +7,6 @@ from src.storage import StorageNotFound, asset_storage
 
 router = APIRouter(prefix="/files/images", tags=["files"])
 
-
 @router.get("/{file_path:path}", include_in_schema=False)
 def get_image_file(
     request: Request,

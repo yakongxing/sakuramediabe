@@ -8,7 +8,11 @@ from peewee import OperationalError, PostgresqlDatabase
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
 
-class DatabaseUnavailable(OperationalError):
+class _UnwrappedOperationalError(OperationalError):
+    """Keep Peewee's DB-API wrapper from recasting recovery failures."""
+
+
+class DatabaseUnavailable(_UnwrappedOperationalError):
     """A connection failed; the interrupted operation must not be replayed."""
 
 
@@ -112,14 +116,22 @@ class RecoveringPostgresqlDatabase(PostgresqlDatabase):
             self.close()
             self.connect()
 
-    def cursor(self, commit=None, named_cursor=None):
+    def cursor(self, named_cursor=None):
         self._ensure_connection()
         try:
-            cursor = super().cursor(commit=commit, named_cursor=named_cursor)
+            cursor = super().cursor(named_cursor=named_cursor)
         except psycopg2.Error as exc:
             self._raise_if_disconnected(exc, self._state.conn)
             raise
         return _RecoveryCursor(self, cursor)
+
+    def rollback(self):
+        # Peewee 4 attempts rollback after a failed COMMIT, after popping its
+        # transaction. A dead connection has nothing to roll back; reconnect
+        # only when the next independent operation starts.
+        if getattr(self._state, "recovery_needed", False):
+            return
+        return super().rollback()
 
     @contextmanager
     def pinned_connection(self):

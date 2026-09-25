@@ -9,6 +9,7 @@ from peewee import (
     TextField,
 )
 
+from src.common.perf import install_query_hooks
 from src.config.config import Database, DatabaseEngine
 from src.model.postgres import RecoveringPostgresqlDatabase
 
@@ -31,7 +32,7 @@ def create_database(config: Database):
     connect_options = dict(parse_qsl(parsed.query, keep_blank_values=True))
     connect_options.setdefault("connect_timeout", 5)
 
-    return RecoveringPostgresqlDatabase(
+    database = RecoveringPostgresqlDatabase(
         database_name,
         user=username,
         password=password,
@@ -39,6 +40,8 @@ def create_database(config: Database):
         port=port,
         **connect_options,
     )
+    install_query_hooks(database)
+    return database
 
 
 def init_database(config: Database):
