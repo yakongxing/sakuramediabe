@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import site
 import subprocess
@@ -116,6 +117,7 @@ def _install_dependencies(
         # importlib.metadata caches directory scans. A dependency installed into
         # an already-enabled site-packages directory must become visible during
         # this same process, even when the directory mtime has not advanced.
+        importlib.invalidate_caches()
         _invalidate_metadata_caches()
         return None
     details = (result.stderr or result.stdout).strip().splitlines()

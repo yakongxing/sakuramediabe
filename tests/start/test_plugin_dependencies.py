@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -230,11 +231,14 @@ def test_successful_resync_clears_saved_dependency_failure(monkeypatch, tmp_path
 
     def fake_success(command, **_kwargs):
         target = Path(command[command.index("--target") + 1])
+        before = target.stat()
         dist_info = target / "recovering_package-1.0.dist-info"
         dist_info.mkdir()
         (dist_info / "METADATA").write_text(
             "Metadata-Version: 2.1\nName: recovering-package\nVersion: 1.0\n"
         )
+        # 模拟目录时间戳未变化，确保安装前的“包不存在”缓存不会影响恢复。
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("src.plugins.dependencies.subprocess.run", fake_success)

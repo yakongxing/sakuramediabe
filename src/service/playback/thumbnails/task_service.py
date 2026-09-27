@@ -39,6 +39,16 @@ class ThumbnailGenerationOutcome:
     error_code: str | None = None
 
 
+class _TextProgressSink:
+    """让 ThumbnailTaskProgress 的心跳只向调用方转发进度文本。"""
+
+    def __init__(self, callback):
+        self._callback = callback
+
+    def emit(self, *, text: str, **_payload) -> None:
+        self._callback(text)
+
+
 class MediaThumbnailTaskService:
     """Generate one complete thumbnail set per Media through its provider."""
 
@@ -342,14 +352,73 @@ class MediaThumbnailTaskService:
         except MediaOperationBusy:
             return ThumbnailGenerationOutcome("skipped")
 
+    @staticmethod
+    def _has_thumbnails(media: Media) -> bool:
+        return MediaThumbnail.select().where(MediaThumbnail.media == media).exists()
+
+    @classmethod
+    def _reset_for_request(cls, media: Media) -> None:
+        """显式请求等同人工重试：清零失败与延后计数、撤销退避，然后立即生成。"""
+        cls._write_state(
+            media,
+            state=Media.THUMBNAIL_STATE_PENDING,
+            attempt_count=0,
+            deferred_count=0,
+            next_retry_at=None,
+            error_code=None,
+            error_detail=None,
+            terminal_at=None,
+        )
+        # 失败收口按实例上的计数累加，必须与刚写入的状态保持一致。
+        media.thumbnail_generation_state = Media.THUMBNAIL_STATE_PENDING
+        media.thumbnail_attempt_count = 0
+        media.thumbnail_deferred_count = 0
+
+    @classmethod
+    def generate_requested_media(cls, media_id: int, *, progress_callback=None) -> ThumbnailGenerationOutcome:
+        """按显式请求立即为单条媒体生成缩略图，不经过批量候选筛选。
+
+        忽略退避时间与终态；已有缩略图时不会重建。生成失败后沿用常规的重试/终态
+        策略，由定时任务继续接手。``progress_callback(text)`` 接收进度文本，耗时步骤
+        期间会由心跳线程重复回调并追加等待秒数。
+        """
+        ensure_database_ready()
+        try:
+            with media_operation_lock(MEDIA_LOCK, media_id):
+                media = Media.get_or_none(Media.id == media_id)
+                if media is None:
+                    return ThumbnailGenerationOutcome("not_found")
+                if not media.valid:
+                    return ThumbnailGenerationOutcome("invalid")
+                if cls._has_thumbnails(media):
+                    cls._mark_succeeded(media)
+                    return ThumbnailGenerationOutcome("already_exists")
+                cls._reset_for_request(media)
+                if progress_callback is None:
+                    return cls._generate_loaded_media(media)
+                with ThumbnailTaskProgress(_TextProgressSink(progress_callback)) as progress:
+                    progress.emit(text="正在准备视频")
+                    return cls._generate_loaded_media(
+                        media,
+                        lambda action: progress.emit(text=action, force=False),
+                    )
+        except MediaOperationBusy:
+            return ThumbnailGenerationOutcome("busy")
+
     @classmethod
     def _generate_one_locked(cls, media_id: int, progress_callback=None) -> ThumbnailGenerationOutcome:
         media = Media.get_or_none(Media.id == media_id)
         if media is None or not media.valid:
             return ThumbnailGenerationOutcome("skipped")
-        if MediaThumbnail.select().where(MediaThumbnail.media == media).exists():
+        if cls._has_thumbnails(media):
             cls._mark_succeeded(media)
             return ThumbnailGenerationOutcome("skipped")
+        return cls._generate_loaded_media(media, progress_callback)
+
+    @classmethod
+    def _generate_loaded_media(cls, media: Media, progress_callback=None) -> ThumbnailGenerationOutcome:
+        """调用方已持有媒体锁并确认媒体有效且尚无缩略图。"""
+        media_id = media.id
         try:
             generated_count = cls._generate_artifacts(media, progress_callback)
         except ThumbnailBackendUnavailable as exc:
@@ -379,7 +448,7 @@ class MediaThumbnailTaskService:
                 error_code=cls._error_code(exc),
             )
         except Exception as exc:
-            if MediaThumbnail.select().where(MediaThumbnail.media == media).exists():
+            if cls._has_thumbnails(media):
                 cls._mark_succeeded(media)
                 return ThumbnailGenerationOutcome("succeeded")
             terminal = cls._mark_failure(media, exc)

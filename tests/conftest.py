@@ -432,3 +432,18 @@ def enabled_optional_services(monkeypatch):
     """现有业务测试运行完整能力场景；关闭/迁移场景在各用例显式覆盖。"""
     monkeypatch.setattr(settings.qdrant, "enabled", True)
     monkeypatch.setattr(settings.image_search, "enabled", True)
+
+
+@pytest.fixture()
+def isolated_local_storage(tmp_path, monkeypatch):
+    """隔离会缓存路径的资产/切片后端，避免临时目录在测试之间串用。"""
+    from src.storage.factory import reset_storage_backends
+
+    monkeypatch.setattr(settings.storage, "backend", "local")
+    monkeypatch.setattr(settings.media, "import_image_root_path", str(tmp_path / "assets"))
+    monkeypatch.setattr(settings.media, "media_clip_root_path", str(tmp_path / "clips"))
+    reset_storage_backends()
+    try:
+        yield
+    finally:
+        reset_storage_backends()

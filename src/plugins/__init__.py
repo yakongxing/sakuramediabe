@@ -29,6 +29,8 @@ _PUBLIC_EXPORTS = {
     "PluginSubscription": "src.plugins.types",
     "PluginSubscriptionPage": "src.plugins.types",
     "PluginSubscriptionStatusCounts": "src.plugins.types",
+    "PluginThumbnailGenerationResult": "src.plugins.types",
+    "PluginThumbnailStatus": "src.plugins.types",
     "TagSnapshot": "src.plugins.types",
     "PluginRegistration": "src.plugins.contracts",
     "PluginExtension": "src.plugins.contracts",
@@ -68,6 +70,8 @@ __all__ = [
     "PluginSubscription",
     "PluginSubscriptionPage",
     "PluginSubscriptionStatusCounts",
+    "PluginThumbnailGenerationResult",
+    "PluginThumbnailStatus",
     "TagSnapshot",
 ]
 
