@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -30,6 +30,8 @@ from src.plugins.types import (
     PluginSubscription,
     PluginSubscriptionPage,
     PluginSubscriptionStatusCounts,
+    PluginThumbnailGenerationResult,
+    PluginThumbnailStatus,
     SubtitleAsset,
     SubtitleContent,
     TagSnapshot,
@@ -444,6 +446,84 @@ class MediaApi:
             )
             for movie_id, items in items_by_movie_id.items()
         })
+
+
+class ThumbnailApi:
+    """``context.thumbnails``：读取媒体缩略图状态，并按需立即生成缩略图。"""
+
+    def status_for_media(
+        self,
+        media_ids: Collection[int],
+    ) -> Mapping[int, PluginThumbnailStatus]:
+        """批量读取缩略图状态；不存在的媒体不出现在结果中。"""
+        media_ids = tuple(dict.fromkeys(media_ids))
+        for media_id in media_ids:
+            MediaApi._validate_positive_id(media_id, "media_id")
+        if not media_ids:
+            return MappingProxyType({})
+
+        from peewee import fn
+
+        from src.model import Media, MediaThumbnail
+
+        counts = dict(
+            MediaThumbnail.select(MediaThumbnail.media, fn.COUNT(MediaThumbnail.id))
+            .where(MediaThumbnail.media.in_(media_ids))
+            .group_by(MediaThumbnail.media)
+            .tuples()
+        )
+        rows = Media.select(
+            Media.id,
+            Media.thumbnail_generation_state,
+            Media.thumbnail_last_error_code,
+        ).where(Media.id.in_(media_ids))
+        return MappingProxyType({
+            media.id: PluginThumbnailStatus(
+                media_id=media.id,
+                state=media.thumbnail_generation_state,
+                thumbnail_count=int(counts.get(media.id, 0)),
+                last_error_code=media.thumbnail_last_error_code,
+            )
+            for media in rows
+        })
+
+    def generate(
+        self,
+        media_id: int,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> PluginThumbnailGenerationResult:
+        """在当前线程立即为一条媒体生成缩略图，复用定时任务的提供方、校验与状态收口。
+
+        显式请求等同人工重试：先清零失败与延后计数并忽略退避时间；已有缩略图时
+        不会重建。``progress_callback`` 接收进度文本，耗时步骤中会周期性重复回调。
+
+        ``outcome`` 取值：
+
+        - ``succeeded``：本次生成并保存了缩略图；
+        - ``already_exists``：媒体已有缩略图，未重建；
+        - ``not_found`` / ``invalid``：媒体不存在，或已被巡检标记为失效；
+        - ``busy``：媒体正被其他操作占用，未做任何修改；
+        - ``deferred``：媒体源暂未就绪，已按延后策略交由定时任务重试；
+        - ``backend_unavailable``：媒体库的缩略图后端暂不可用，媒体保持待生成；
+        - ``retryable_failed`` / ``terminal_failed``：生成失败，已按失败策略记录。
+        """
+        MediaApi._validate_positive_id(media_id, "media_id")
+        if progress_callback is not None and not callable(progress_callback):
+            raise TypeError("progress_callback 必须可调用")
+
+        from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
+
+        outcome = MediaThumbnailTaskService.generate_requested_media(
+            media_id,
+            progress_callback=progress_callback,
+        )
+        return PluginThumbnailGenerationResult(
+            media_id=media_id,
+            outcome=outcome.state,
+            generated_count=outcome.generated_count,
+            error_code=outcome.error_code,
+        )
 
 
 class PluginDownloadService:
@@ -1001,6 +1081,11 @@ class PluginContext:
     def media(self) -> MediaApi:
         """媒体只读快照与按媒体库的存在性查询。"""
         return MediaApi()
+
+    @property
+    def thumbnails(self) -> ThumbnailApi:
+        """媒体缩略图状态读取与按需生成。"""
+        return ThumbnailApi()
 
     @property
     def downloads(self) -> PluginDownloadService:

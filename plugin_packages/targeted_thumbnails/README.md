@@ -1,0 +1,65 @@
+# 指定番号生成缩略图（targeted_thumbnails）
+
+宿主内建的「媒体缩略图生成」任务按 cron（默认每 30 分钟）批量处理全部缺少缩略图的有效媒体，按媒体 ID 顺序排队，失败后按退避重试，连续失败会停止自动重试。
+
+本插件提供一个手动任务「指定番号生成媒体缩略图」，按番号立即为一部影片的指定媒体生成缩略图，不必等待批量任务轮到它。
+
+## 要求
+
+后端需提供 Host API 9，其中包含 `context.thumbnails`。旧后端会在加载阶段以 Host API 不兼容拒绝本插件。
+
+## 安装
+
+发布 zip 时，`manifest.json` 与 `__init__.py` 必须位于 zip 根目录。也可以在后端仓库根目录直接安装目录：
+
+```bash
+uv run python -m src.start.commands plugins check plugin_packages/targeted_thumbnails
+uv run python -m src.start.commands plugins install plugin_packages/targeted_thumbnails
+```
+
+安装后重启 api 与 aps 服务。本插件没有配置项和额外依赖。
+
+## 参数
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `movie_number` | 是 | 影片番号，大小写不敏感，`-` 与 `_` 可互换 |
+| `media_id` | 否 | 番号有多个媒体时必填，用来指定要生成缩略图的媒体 |
+
+在「后台任务」里手动执行该任务，或使用命令行：
+
+```bash
+uv run python -m src.start.commands aps generate-targeted-thumbnails \
+  --params-json '{"movie_number": "ABC-001"}'
+```
+
+## 多媒体时的选择流程
+
+1. 只填番号执行任务。
+2. 番号只有一个媒体时，任务直接生成缩略图。
+3. 番号有多个媒体时，任务不会生成任何缩略图，而是以 `status=selection_required` 正常完成。任务结果的 `candidates` 和一条「提醒」通知会列出每个媒体的 `media_id`、媒体库、文件名、分辨率、大小、时长和缩略图状态。提醒通知关联到该影片和本次任务。
+4. 填入番号和选中的 `media_id` 再执行一次。
+
+`media_id` 不属于该番号时，任务失败，失败原因会列出可选媒体。
+
+## 生成行为
+
+- 显式请求等同人工重试：生成前清零该媒体的失败与延后计数，忽略退避时间和「已停止自动重试」状态。
+- 已有缩略图的媒体不会重建，任务以 `status=already_exists` 完成。
+- 生成与定时任务共用同一套媒体提供方、产物校验和状态记录。生成失败后，媒体按常规策略交给定时任务继续重试。
+- 媒体正被其他操作占用时（例如定时任务正在处理同一媒体），任务失败并提示稍后重试，不修改媒体状态。
+
+## 任务结果
+
+| 情况 | 任务状态 | 结果 |
+| --- | --- | --- |
+| 生成成功 | 完成 | `status=succeeded`，`generated_thumbnails` 为本次生成数量 |
+| 已有缩略图 | 完成 | `status=already_exists` |
+| 多个媒体且未指定 `media_id` | 完成 | `status=selection_required`，并发送提醒通知 |
+| 番号不存在、影片没有媒体、`media_id` 不属于该影片 | 失败 | 失败原因说明问题 |
+| 媒体失效、被占用、来源未就绪、后端不可用、生成失败 | 失败 | 失败原因说明问题；来源未就绪、后端不可用和生成失败时附带宿主错误码 |
+
+## 限制
+
+- 宿主按任务互斥排队，同一时刻只能有一个该任务在排队或运行，重复提交会返回冲突。
+- 本插件不重建已有缩略图。

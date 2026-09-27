@@ -161,3 +161,17 @@ Host API 7 新增 `context.downloads.list_targets()`，按下载器 ID 升序返
 中的首个下载器。显式指定 ID 时仍只搜索绑定到该下载器的索引器。
 每条候选保留自己的下载器和媒体库目标，提交时继续校验目标是否发生变化。
 Host API 版本保持为 7；使用新增能力需要安装包含这些接口的后端版本，旧版插件的显式 ID 调用保持兼容。
+
+## 插件缩略图接口
+
+Host API 9 新增 `context.thumbnails`，插件无需导入宿主内部服务即可按媒体处理缩略图：
+
+- `status_for_media(media_ids)` 批量返回 `PluginThumbnailStatus`（`state`、`thumbnail_count`、
+  `last_error_code`）；是否已有缩略图以 `thumbnail_count` 为准，不存在的媒体不出现在结果中。
+- `generate(media_id, progress_callback=None)` 在当前任务线程立即生成一条媒体的缩略图，
+  返回 `PluginThumbnailGenerationResult`。它复用定时任务的提供方调用、产物校验与状态收口；
+  显式请求会清零失败与延后计数并忽略退避，已有缩略图时返回 `already_exists` 而不重建。
+  `outcome` 取值为 `succeeded`、`already_exists`、`not_found`、`invalid`、`busy`、`deferred`、
+  `backend_unavailable`、`retryable_failed`、`terminal_failed`。
+
+使用该接口的插件应在 manifest 声明 Host API 9，使旧后端在加载阶段拒绝插件。

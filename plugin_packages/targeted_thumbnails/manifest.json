@@ -1,0 +1,8 @@
+{
+  "plugin_id": "targeted_thumbnails",
+  "display_name": "指定番号生成缩略图",
+  "version": "1.0.0",
+  "host_api_version": 9,
+  "requires_python": ">=3.10,<3.11",
+  "dependencies": []
+}

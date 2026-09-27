@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import site
 import subprocess
 import sys
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import MetadataPathFinder, PackageNotFoundError, version
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -104,6 +105,10 @@ def _install_dependencies(
         check=False,
     )
     if result.returncode == 0:
+        # 安装会新增模块与 dist-info；Python 3.10 的元数据缓存需单独失效，
+        # 避免目录 mtime 未变化时继续命中安装前的“包不存在”结果。
+        importlib.invalidate_caches()
+        MetadataPathFinder().invalidate_caches()
         return None
     details = (result.stderr or result.stdout).strip().splitlines()
     suffix = details[-1] if details else f"pip 退出码 {result.returncode}"

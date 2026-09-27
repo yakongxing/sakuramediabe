@@ -212,6 +212,29 @@ class PluginMediaPresence:
 
 
 @dataclass(frozen=True)
+class PluginThumbnailStatus:
+    """单条媒体的缩略图状态；是否已有缩略图以 thumbnail_count 为准。
+
+    ``state`` 取值为 ``pending``、``retry_wait``、``terminal``、``succeeded``。
+    """
+
+    media_id: int
+    state: str
+    thumbnail_count: int
+    last_error_code: str | None
+
+
+@dataclass(frozen=True)
+class PluginThumbnailGenerationResult:
+    """一次按需缩略图生成的结果；outcome 取值见 ``context.thumbnails.generate``。"""
+
+    media_id: int
+    outcome: str
+    generated_count: int
+    error_code: str | None
+
+
+@dataclass(frozen=True)
 class PluginDownloadTarget:
     """插件可使用的下载器及其媒体库目标快照。"""
 
@@ -270,6 +293,8 @@ __all__ = [
     "PluginSubscription",
     "PluginSubscriptionPage",
     "PluginSubscriptionStatusCounts",
+    "PluginThumbnailGenerationResult",
+    "PluginThumbnailStatus",
     "SubtitleAsset",
     "SubtitleContent",
     "SubtitleImportResult",
