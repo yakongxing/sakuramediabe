@@ -1,5 +1,6 @@
 import io
 import threading
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,11 @@ from src.model import Image, Media, MediaLibrary, MediaThumbnail, Movie, VideoIt
 from src.plugins.provider_protocol import ThumbnailArtifact
 from src.service.playback.thumbnails.artifacts import ThumbnailArtifactService
 from src.storage.local import LocalStorageBackend
-from src.storage.types import StoragePublicationUnknown, StorageUnavailable
+from src.storage.types import (
+    PublicationResult,
+    StoragePublicationUnknown,
+    StorageUnavailable,
+)
 
 
 @pytest.mark.parametrize(
@@ -56,13 +61,18 @@ class RemoteStorage:
     def __init__(self):
         self.objects = {}
         self.failure = None
+        self.attempted = []
 
-    def put_file(self, key, source):
+    def put_file(self, key, source, *, overwrite=True):
+        assert overwrite is False
+        self.attempted.append(key)
         if self.failure and key.endswith("/6.webp"):
             if isinstance(self.failure, StoragePublicationUnknown):
                 self.objects[key] = source.read_bytes()
+                raise StoragePublicationUnknown(key, str(self.failure))
             raise self.failure
         self.objects[key] = source.read_bytes()
+        return PublicationResult(key, len(self.objects[key]), disposition="created")
 
     def open(self, key):
         return io.BytesIO(self.objects[key])
@@ -92,7 +102,10 @@ def test_remote_publication_and_dimensions(thumbnail_batch):
     rows = list(MediaThumbnail.select().order_by(MediaThumbnail.offset))
     assert [row.offset for row in rows] == [3, 6]
     for row in rows:
-        assert row.image.origin.endswith(f"/media/{media.id}/thumbnails/{row.offset}.webp")
+        path = PurePosixPath(row.image.origin)
+        assert path.parent.parent.as_posix() == ThumbnailArtifactService.thumbnail_prefix(media)
+        assert len(path.parent.name) == 32
+        assert path.name == f"{row.offset}.webp"
         assert row.image_search_index_status == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING
         assert ThumbnailArtifactService.read_dimensions(row.image.origin) == (320, 180)
     assert storage.objects["unrelated.webp"] == b"keep"
@@ -108,9 +121,12 @@ def test_upload_failure_cleans_batch_and_can_retry(thumbnail_batch, unknown):
         ThumbnailArtifactService.persist(media, artifacts)
     assert not Image.select().exists()
     assert not MediaThumbnail.select().exists()
+    key = next(key for key in storage.attempted if key.endswith("/6.webp"))
     assert storage.objects == ({key: artifacts[1][1].read_bytes()} if unknown else {})
+    old_keys = set(storage.attempted)
     storage.failure = None
     assert ThumbnailArtifactService.persist(media, artifacts) == 2
+    assert not old_keys.intersection(image.origin for image in Image.select())
 
 
 def test_database_failure_rolls_back_and_cleans_objects(thumbnail_batch, monkeypatch):
@@ -244,7 +260,8 @@ def test_batch_waits_for_later_success_before_compensation(thumbnail_batch, monk
     later_finished = threading.Event()
     original_delete = storage.delete
 
-    def put_file(key, source):
+    def put_file(key, source, *, overwrite):
+        assert overwrite is False
         if key.endswith("/3.webp"):
             assert later_started.wait(5)
             first_failed.set()
@@ -253,6 +270,7 @@ def test_batch_waits_for_later_success_before_compensation(thumbnail_batch, monk
         assert first_failed.wait(5)
         storage.objects[key] = source.read_bytes()
         later_finished.set()
+        return PublicationResult(key, len(storage.objects[key]), disposition="created")
 
     def delete(key, **kwargs):
         assert later_finished.is_set()
@@ -279,3 +297,158 @@ def test_database_writes_start_only_after_all_uploads(thumbnail_batch, monkeypat
 
     monkeypatch.setattr(Image, "create", create)
     assert ThumbnailArtifactService.persist(media, artifacts) == 2
+
+
+@pytest.mark.parametrize("failure_check", [2, 3])
+def test_lost_media_lock_prevents_thumbnail_commit(thumbnail_batch, failure_check):
+    media, artifacts, storage = thumbnail_batch
+    checks = 0
+
+    def check_connection():
+        nonlocal checks
+        checks += 1
+        if checks == failure_check:
+            raise RuntimeError("media operation lock lost")
+
+    with pytest.raises(RuntimeError, match="lock lost"):
+        ThumbnailArtifactService.persist(media, artifacts, check_connection=check_connection)
+    assert checks == failure_check
+    assert not Image.select().exists()
+    assert not MediaThumbnail.select().exists()
+    assert not storage.objects
+
+
+def test_commit_response_loss_retains_published_thumbnails(thumbnail_batch, monkeypatch, test_db):
+    from contextlib import contextmanager
+
+    from peewee import OperationalError
+
+    from src.service.playback.thumbnails import artifacts as module
+
+    media, artifacts, storage = thumbnail_batch
+
+    @contextmanager
+    def atomic():
+        with test_db.atomic():
+            yield
+        raise OperationalError("commit response lost")
+
+    monkeypatch.setattr(module, "get_database", lambda: SimpleNamespace(atomic=atomic))
+    with pytest.raises(OperationalError, match="commit response lost"):
+        ThumbnailArtifactService.persist(media, artifacts)
+    assert MediaThumbnail.select().count() == 2
+    assert {image.origin for image in Image.select()} == set(storage.objects)
+
+
+def test_late_old_generation_does_not_overwrite_retried_batch(thumbnail_batch):
+    media, artifacts, storage = thumbnail_batch
+    storage.failure = StoragePublicationUnknown("pending", "unknown")
+    with pytest.raises(StoragePublicationUnknown):
+        ThumbnailArtifactService.persist(media, artifacts)
+    old_key = next(key for key in storage.attempted if key.endswith("/6.webp"))
+    storage.failure = None
+    assert ThumbnailArtifactService.persist(media, artifacts) == 2
+    storage.objects[old_key] = b"late older request"
+    current_keys = {image.origin for image in Image.select()}
+    assert old_key not in current_keys
+    assert all(storage.objects[key] == artifacts[0][1].read_bytes() for key in current_keys)
+
+
+def test_lost_media_lock_does_not_update_thumbnail_task_state(monkeypatch):
+    from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
+
+    def generate(*args, **kwargs):
+        raise StorageUnavailable("upload unavailable")
+
+    def lost():
+        raise RuntimeError("media operation lock lost")
+
+    monkeypatch.setattr(MediaThumbnailTaskService, "_generate_artifacts", generate)
+    monkeypatch.setattr(MediaThumbnailTaskService, "_has_thumbnails", lambda *_: pytest.fail("stale worker queried state"))
+    monkeypatch.setattr(MediaThumbnailTaskService, "_mark_failure", lambda *_: pytest.fail("stale worker wrote state"))
+    with pytest.raises(RuntimeError, match="lock lost"):
+        MediaThumbnailTaskService._generate_loaded_media(SimpleNamespace(id=1), check_connection=lost)
+
+
+@pytest.mark.parametrize("failure_check", [2, 3])
+def test_lost_lock_prevents_thumbnail_commit(thumbnail_batch, failure_check):
+    media, artifacts, storage = thumbnail_batch
+    calls = []
+
+    def check_connection():
+        calls.append(True)
+        if len(calls) == failure_check:
+            raise RuntimeError("media_operation_connection_lost")
+
+    with pytest.raises(RuntimeError, match="connection_lost"):
+        ThumbnailArtifactService.persist(media, artifacts, check_connection=check_connection)
+    assert not MediaThumbnail.select().exists()
+    assert not Image.select().exists()
+    assert not storage.objects
+
+
+def test_connection_is_checked_before_upload_before_writes_and_before_commit(thumbnail_batch):
+    from src.model import get_database
+
+    media, artifacts, _ = thumbnail_batch
+    checks = []
+    ThumbnailArtifactService.persist(
+        media, artifacts,
+        check_connection=lambda: checks.append(get_database().in_transaction()),
+    )
+    assert checks == [False, False, True]
+
+
+def test_database_connection_failure_retains_published_objects(thumbnail_batch, monkeypatch):
+    from peewee import OperationalError
+
+    media, artifacts, storage = thumbnail_batch
+
+    def create(**kwargs):
+        raise OperationalError("connection lost during database operation")
+
+    monkeypatch.setattr(MediaThumbnail, "create", create)
+    with pytest.raises(OperationalError):
+        ThumbnailArtifactService.persist(media, artifacts)
+    assert not MediaThumbnail.select().exists()
+    assert not Image.select().exists()
+    assert len(storage.objects) == 2
+
+
+def test_late_old_generation_write_cannot_overwrite_current_thumbnail(thumbnail_batch):
+    media, artifacts, storage = thumbnail_batch
+    storage.failure = StoragePublicationUnknown("unknown", "response lost")
+    with pytest.raises(StoragePublicationUnknown):
+        ThumbnailArtifactService.persist(media, artifacts)
+    old_keys = set(storage.attempted)
+    storage.failure = None
+    assert ThumbnailArtifactService.persist(media, artifacts) == 2
+    new_keys = {image.origin for image in Image.select()}
+    assert not old_keys.intersection(new_keys)
+    # Simulate the previous remote request finishing only after the retry committed.
+    for key in old_keys:
+        storage.objects[key] = b"late old bytes"
+    for key in new_keys:
+        assert storage.objects[key] == artifacts[0][1].read_bytes()
+
+
+@pytest.mark.parametrize("generation_failed", [False, True])
+def test_worker_that_lost_lock_cannot_update_task_state(monkeypatch, generation_failed):
+    from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
+
+    def generate(media, progress_callback, *, check_connection):
+        if generation_failed:
+            raise StorageUnavailable("upload failed")
+        return 2
+
+    def lost_connection():
+        raise RuntimeError("media_operation_connection_lost")
+
+    monkeypatch.setattr(MediaThumbnailTaskService, "_generate_artifacts", generate)
+    monkeypatch.setattr(MediaThumbnailTaskService, "_mark_succeeded", lambda *args: pytest.fail("stale success write"))
+    monkeypatch.setattr(MediaThumbnailTaskService, "_mark_failure", lambda *args: pytest.fail("stale failure write"))
+    monkeypatch.setattr(MediaThumbnailTaskService, "_has_thumbnails", lambda *args: pytest.fail("stale database read"))
+    with pytest.raises(RuntimeError, match="connection_lost"):
+        MediaThumbnailTaskService._generate_loaded_media(
+            SimpleNamespace(id=1), check_connection=lost_connection,
+        )

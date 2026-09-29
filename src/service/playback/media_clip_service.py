@@ -5,6 +5,7 @@
 """
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -30,6 +31,7 @@ from src.model import (
     Media,
     MediaClip,
     MediaThumbnail,
+    get_database,
 )
 from src.plugins.provider_protocol import (
     MEDIA_PROVIDER_REGISTRY,
@@ -48,12 +50,15 @@ from src.schema.playback.clips import (
 )
 from src.service.playback.media_metadata_probe_service import MediaMetadataProbeService
 from src.service.playback.operation_locks import (
+    CLIP_LOCK,
     MEDIA_LOCK,
+    MediaOperationBusy,
     media_operation_lock,
 )
 from src.service.playback.provider_helpers import media_handle_for
 from src.service.playback.search_filters import keyword_conditions
 from src.storage import StorageNotFound, clip_storage, normalize_storage_key
+from src.storage.types import StorageError
 
 
 class MediaClipService:
@@ -90,7 +95,9 @@ class MediaClipService:
             error_details_key="clip_id",
         )
         if not MediaClipService._has_valid_artifact(clip):
-            MediaClipService._discard_invalid_clip(clip)
+            refreshed = MediaClipService._discard_invalid_clip(clip)
+            if refreshed is not None:
+                return refreshed
             raise ApiError(
                 404,
                 "media_clip_not_found",
@@ -214,10 +221,36 @@ class MediaClipService:
             return False
 
     @classmethod
-    def _discard_invalid_clip(cls, clip: MediaClip) -> None:
-        key = clip.file_path or cls._clip_relative_path(clip.movie_number, clip.id)
-        clip.delete_instance()
-        cls._delete_clip_key(key)
+    @contextmanager
+    def _locked_clip(cls, clip: MediaClip):
+        # 删除来源媒体会将 media_id 置空；锁定后复查，转为片段自己的锁。
+        for _ in range(2):
+            namespace = MEDIA_LOCK if clip.media_id is not None else CLIP_LOCK
+            resource_id = clip.media_id if clip.media_id is not None else clip.id
+            with media_operation_lock(namespace, resource_id) as check_connection:
+                current = MediaClip.get_or_none(MediaClip.id == clip.id)
+                if current is not None and current.media_id != clip.media_id:
+                    clip = current
+                    continue
+                yield current, check_connection
+                return
+        raise RuntimeError("media_clip_lock_identity_changed")
+
+    @classmethod
+    def _discard_invalid_clip(cls, clip: MediaClip) -> MediaClip | None:
+        with cls._locked_clip(clip) as (current, check_connection):
+            if current is None:
+                return None
+            # 判为无效到取得锁之间，生成任务可能已经提交了完整片段。
+            if cls._has_valid_artifact(current):
+                return current
+            check_connection()
+            current.delete_instance()
+            check_connection()
+            if current.file_path:
+                cls._delete_clip_key(current.file_path)
+            # 空路径占位可能来自结果不明的上传；不能推测 final 尚未在写入。
+            return None
 
     @classmethod
     def valid_clips(cls, clips: Sequence[MediaClip]) -> list[MediaClip]:
@@ -225,8 +258,14 @@ class MediaClipService:
         for clip in clips:
             if cls._has_valid_artifact(clip):
                 valid.append(clip)
-            else:
-                cls._discard_invalid_clip(clip)
+                continue
+            try:
+                refreshed = cls._discard_invalid_clip(clip)
+            except MediaOperationBusy:
+                # 正在生成的占位项暂不展示，绝不将其作为损坏记录删除。
+                continue
+            if refreshed is not None:
+                valid.append(refreshed)
         return valid
 
     @classmethod
@@ -235,7 +274,7 @@ class MediaClipService:
         media_id: int,
         payload: MediaClipCreateRequest,
     ) -> tuple[MediaClipResource, bool]:
-        with media_operation_lock(MEDIA_LOCK, media_id):
+        with media_operation_lock(MEDIA_LOCK, media_id) as check_connection:
             media = cls._require_media(media_id)
             start_thumbnail = cls._require_thumbnail_for_media(media, payload.start_thumbnail_id)
             end_thumbnail = cls._require_thumbnail_for_media(media, payload.end_thumbnail_id)
@@ -296,6 +335,7 @@ class MediaClipService:
                     cls._discard_invalid_clip(existing)
                 raise
             relative_path = cls._clip_relative_path(movie_number, clip.id)
+            publication = None
             try:
                 with TemporaryDirectory(prefix=f"media-clip-{media.id}-") as workspace_name:
                     workspace = Path(workspace_name)
@@ -334,18 +374,32 @@ class MediaClipService:
                     if file_size <= 0:
                         raise RuntimeError("clip_output_empty")
                     probe = MediaMetadataProbeService.probe_file(source_path)
-                    clip_storage().put_file(relative_path, source_path)
-                clip.file_path = relative_path
-                clip.file_size_bytes = file_size
-                clip.duration_seconds = probe.duration_seconds or (end - start)
-                clip.save()
+                    check_connection()
+                    publication = clip_storage().put_file(
+                        relative_path, source_path, overwrite=False
+                    )
+                check_connection()
+                with get_database().atomic():
+                    clip.file_path = relative_path
+                    clip.file_size_bytes = file_size
+                    clip.duration_seconds = probe.duration_seconds or (end - start)
+                    if clip.save() != 1:
+                        raise RuntimeError("media_clip_disappeared")
+                    check_connection()
             except Exception as exc:
-                # 切片失败：清掉占位记录与半成品文件，保持数据与磁盘一致。
-                clip.delete_instance()
-                cls._delete_clip_key(relative_path)
+                cls._cleanup_failed_clip(
+                    clip, relative_path, publication, exc, check_connection
+                )
                 logger.warning("Media clip generation failed media_id={} detail={}", media.id, exc)
                 if isinstance(exc, ApiError):
                     raise
+                if isinstance(exc, StorageError):
+                    raise ApiError(
+                        503 if exc.retryable or exc.publication_possible else 502,
+                        getattr(exc, "error_code", "storage_publication_failed"),
+                        "片段上传未能确认成功，请稍后重试",
+                        {"media_id": media.id, "stage": exc.stage},
+                    ) from exc
                 raise ApiError(
                     500,
                     "media_clip_generation_failed",
@@ -355,6 +409,27 @@ class MediaClipService:
 
             return cls.build_clip_resource(clip, cls._resolve_single_cover(clip)), True
 
+
+    @classmethod
+    def _cleanup_failed_clip(cls, clip, key, publication, error, check_connection):
+        try:
+            check_connection()
+            current = MediaClip.get_or_none(MediaClip.id == clip.id)
+            # 提交响应可能丢失。已落库的有效指针和无法查询的数据库都必须保留。
+            if current is not None and current.file_path:
+                return
+            if current is not None:
+                current.delete_instance()
+                check_connection()
+            if getattr(error, "publication_possible", False):
+                return
+            if getattr(publication, "created", False):
+                cls._delete_clip_key(key)
+        except Exception as cleanup_error:
+            logger.warning(
+                "Media clip compensation deferred clip_id={} key={} detail={}",
+                clip.id, key, cleanup_error,
+            )
 
     # ------------------------------------------------------------------ 查询
 
@@ -517,10 +592,15 @@ class MediaClipService:
             error_message="Media clip not found",
             error_details_key="clip_id",
         )
-        key = clip.file_path or cls._clip_relative_path(clip.movie_number, clip.id)
-        # 单条删除本身原子，依赖 DB 外键 CASCADE 自动清 ClipCollectionItem，无需再包事务。
-        clip.delete_instance()
-        cls._delete_clip_key(key)
+        with cls._locked_clip(clip) as (current, check_connection):
+            if current is None:
+                raise ApiError(404, "media_clip_not_found", "Media clip not found")
+            key = current.file_path or cls._clip_relative_path(current.movie_number, current.id)
+            check_connection()
+            # 单条删除本身原子，依赖 DB 外键 CASCADE 自动清 ClipCollectionItem。
+            current.delete_instance()
+            check_connection()
+            cls._delete_clip_key(key)
 
     @staticmethod
     def _delete_clip_key(key: str) -> None:

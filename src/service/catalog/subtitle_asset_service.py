@@ -11,6 +11,7 @@ import hashlib
 from pathlib import Path
 
 from loguru import logger
+from peewee import IntegrityError
 
 from src.common.media_paths import (
     MOVIE_SUBTITLE_EXTENSIONS,
@@ -19,24 +20,34 @@ from src.common.media_paths import (
 )
 from src.common.service_helpers import find_movie_by_number
 from src.common.subtitle_paths import movie_subtitle_storage_key
-from src.model import Subtitle
+from src.model import Movie, Subtitle, get_database
 from src.schema.catalog.subtitles import (
     SubtitleImportResult,
     SubtitleImportStatus,
 )
+from src.service.playback.operation_locks import subtitle_operation_lock
 from src.storage import StorageNotFound, subtitle_storage
+from src.storage.subtitles import LocalSubtitleStorage
 from src.storage.types import StorageUnavailable
 
 
-def _prepare_movie_subtitle_target_path(movie_number: str, *, extension: str = ".srt") -> str:
+def _prepare_movie_subtitle_target_path(
+    movie_number: str, *, extension: str = ".srt", reserved_paths=(), movie=None,
+) -> str:
     normalized_extension = extension.lower()
-    if not normalized_extension.startswith(".") or len(normalized_extension) > 16:
+    if normalized_extension not in MOVIE_SUBTITLE_EXTENSIONS:
         raise ValueError("invalid subtitle extension")
     prefix = movie_asset_relative_dir(normalize_asset_dir_name(movie_number)) / "subtitles"
+    paths = [item.key for item in subtitle_storage().list(prefix.as_posix())]
+    paths.extend(reserved_paths)
+    if movie is not None:
+        paths.extend(
+            row.file_path for row in Subtitle.select(Subtitle.file_path).where(Subtitle.movie == movie)
+        )
     maximum = 0
-    for item in subtitle_storage().list(prefix.as_posix()):
-        stem = Path(item.key).stem
-        head = f"{movie_number}-"
+    head = f"{movie_number}-"
+    for path in paths:
+        stem = Path(path).stem
         if stem.startswith(head) and stem[len(head):].isdigit():
             maximum = max(maximum, int(stem[len(head):]))
     return f"{prefix.as_posix()}/{movie_number}-{maximum + 1}{normalized_extension}"
@@ -45,27 +56,82 @@ def _prepare_movie_subtitle_target_path(movie_number: str, *, extension: str = "
 class SubtitleAssetService:
     """字幕资产写入/登记的唯一实现入口。"""
 
+    CREATE_ATTEMPTS = 3
+
     @classmethod
     def movie_subtitle_hashes(cls, movie) -> set[str]:
-        """该影片已登记字幕的内容指纹集合。"""
+        """该影片已登记字幕的内容指纹集合；存储不可用不能当作缺失。"""
         hashes: set[str] = set()
+        storage = subtitle_storage()
         for subtitle in Subtitle.select().where(Subtitle.movie == movie):
             try:
                 key = movie_subtitle_storage_key(movie, subtitle.file_path)
             except Exception as exc:
                 logger.warning(
                     "Subtitle path invalid movie_id={} subtitle_id={} detail={}",
-                    movie.id,
-                    subtitle.id,
-                    exc,
+                    movie.id, subtitle.id, exc,
                 )
                 continue
             try:
-                with subtitle_storage().open(key) as handle:
+                with storage.open(key) as handle:
                     hashes.add(cls._sha256_stream(handle))
-            except (StorageNotFound, StorageUnavailable):
+            except StorageNotFound:
                 continue
+            except StorageUnavailable:
+                if not isinstance(storage, LocalSubtitleStorage):
+                    raise
+                # 本地覆盖模式允许旧远端副本暂不可用，不影响新字幕写本地。
         return hashes
+
+    @classmethod
+    def _publish_subtitle(cls, movie, suffix, publish, check_connection):
+        storage = subtitle_storage()
+        reserved: set[str] = set()
+        for attempt in range(cls.CREATE_ATTEMPTS):
+            target = _prepare_movie_subtitle_target_path(
+                movie.movie_number, extension=suffix, reserved_paths=reserved, movie=movie,
+            )
+            reserved.add(target)
+            check_connection()
+            try:
+                publication = publish(storage, target)
+            except FileExistsError:
+                if attempt + 1 == cls.CREATE_ATTEMPTS:
+                    raise
+                continue
+            try:
+                check_connection()
+                with get_database().atomic():
+                    subtitle = Subtitle.create(movie=movie, file_path=target)
+                    check_connection()
+            except IntegrityError:
+                # 兼容绕过本锁的登记者；相同指针只能有一条记录，文件仍保留。
+                check_connection()
+                existing = Subtitle.get_or_none(
+                    (Subtitle.movie == movie) & (Subtitle.file_path == target)
+                )
+                if existing is not None:
+                    return existing, target
+                cls._cleanup_unregistered(storage, target, publication, check_connection)
+                raise
+            except Exception:
+                cls._cleanup_unregistered(storage, target, publication, check_connection)
+                raise
+            return subtitle, target
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _cleanup_unregistered(storage, key, publication, check_connection):
+        if not getattr(publication, "created", False):
+            return
+        try:
+            check_connection()
+            if Subtitle.select().where(Subtitle.file_path == key).exists():
+                return
+            # 仅本次严格创建且登记回滚的对象可补偿；锁/数据库不确定时保留。
+            storage.delete(key, missing_ok=True)
+        except Exception as exc:
+            logger.warning("Subtitle compensation deferred key={} detail={}", key, exc)
 
     @classmethod
     def import_subtitle_content(
@@ -83,25 +149,31 @@ class SubtitleAssetService:
                 status=SubtitleImportStatus.MOVIE_NOT_FOUND,
                 reason=f"影片不存在: {movie_number}",
             )
-
         suffix = Path(filename or "").suffix.lower()
         if suffix not in MOVIE_SUBTITLE_EXTENSIONS:
             return SubtitleImportResult(
                 status=SubtitleImportStatus.INVALID_FORMAT,
                 reason=f"不支持的扩展名: {suffix or '无'}（支持 {', '.join(MOVIE_SUBTITLE_EXTENSIONS)}）",
             )
-
         content_hash = cls._sha256_bytes(content)
-        if content_hash in cls.movie_subtitle_hashes(movie):
-            return SubtitleImportResult(status=SubtitleImportStatus.DUPLICATE)
-
-        target_path = _prepare_movie_subtitle_target_path(movie.movie_number, extension=suffix)
-        subtitle_storage().put_bytes(target_path, content, overwrite=False)
-        subtitle = Subtitle.create(movie=movie, file_path=target_path)
-        return SubtitleImportResult(
-            status=SubtitleImportStatus.IMPORTED,
-            subtitle_id=subtitle.id,
-        )
+        with subtitle_operation_lock(movie.id) as check_connection:
+            movie = Movie.get_or_none(Movie.id == movie.id)
+            if movie is None:
+                return SubtitleImportResult(
+                    status=SubtitleImportStatus.MOVIE_NOT_FOUND,
+                    reason=f"影片不存在: {movie_number}",
+                )
+            if content_hash in cls.movie_subtitle_hashes(movie):
+                return SubtitleImportResult(status=SubtitleImportStatus.DUPLICATE)
+            subtitle, _ = cls._publish_subtitle(
+                movie, suffix,
+                lambda storage, target: storage.put_bytes(target, content, overwrite=False),
+                check_connection,
+            )
+            return SubtitleImportResult(
+                status=SubtitleImportStatus.IMPORTED,
+                subtitle_id=subtitle.id,
+            )
 
     @classmethod
     def register_subtitle_file(
@@ -113,33 +185,28 @@ class SubtitleAssetService:
         transfer_mode: str = "auto",
     ) -> tuple[str, str, str]:
         """登记一个本地字幕文件（目录导入场景），返回 (status, reason, detail)。"""
+        del transfer_mode
         content_hash = cls._sha256_file(source_path)
-        hashes = existing_hashes.get(movie.id) if existing_hashes else None
-        if hashes is None:
+        with subtitle_operation_lock(movie.id) as check_connection:
+            movie = Movie.get_by_id(movie.id)
+            # 外部批次缓存可能早于另一个进程的写入，必须在锁内刷新。
             hashes = cls.movie_subtitle_hashes(movie)
             if existing_hashes is not None:
                 existing_hashes[movie.id] = hashes
-        if content_hash in hashes:
-            return "skipped", "duplicate_fingerprint", source_path.name
-
-        target_path = _prepare_movie_subtitle_target_path(
-            movie.movie_number,
-            extension=source_path.suffix.lower(),
-        )
-        del transfer_mode
-        subtitle_storage().put_file(target_path, source_path, overwrite=False)
-        Subtitle.create(movie=movie, file_path=target_path)
-
-        hashes.add(content_hash)
-        return "imported", "", str(target_path)
+            if content_hash in hashes:
+                return "skipped", "duplicate_fingerprint", source_path.name
+            _, target = cls._publish_subtitle(
+                movie, source_path.suffix.lower(),
+                lambda storage, key: storage.put_file(key, source_path, overwrite=False),
+                check_connection,
+            )
+            hashes.add(content_hash)
+            return "imported", "", target
 
     @staticmethod
     def _sha256_file(file_path: Path) -> str:
-        digest = hashlib.sha256()
-        with open(file_path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+        with file_path.open("rb") as handle:
+            return SubtitleAssetService._sha256_stream(handle)
 
     @staticmethod
     def _sha256_stream(handle) -> str:

@@ -5,6 +5,8 @@ catalog 目录导入和媒体硬删除都需要这份逻辑，抽出来避免重
 
 from pathlib import Path
 
+from loguru import logger
+
 from src.common.image_references import is_nonlocal_image_reference
 from src.config.config import settings
 from src.model import (
@@ -76,29 +78,27 @@ class ImageCleanupService:
         }
         if not local_paths:
             return
-        # A cleanup may be retried after a committed publication. A replay can
-        # have attached the same content-addressed key again, so fail closed at
-        # the last possible moment rather than deleting a live object.
+        # Physical removal must not precede the transaction that drops its references.
+        if get_database().in_transaction():
+            logger.warning("Image file cleanup deferred until database transaction commits")
+            return
+        # Callers own the lifecycle of these keys. A reference check alone cannot
+        # make deleting a shared key safe against another publisher's future commit.
         referenced_paths: set[str] = set()
-        try:
-            images = Image.select(
-                Image.origin, Image.small, Image.medium, Image.large
-            ).where(
-                (Image.origin.in_(local_paths))
-                | (Image.small.in_(local_paths))
-                | (Image.medium.in_(local_paths))
-                | (Image.large.in_(local_paths))
+        images = Image.select(
+            Image.origin, Image.small, Image.medium, Image.large
+        ).where(
+            (Image.origin.in_(local_paths))
+            | (Image.small.in_(local_paths))
+            | (Image.medium.in_(local_paths))
+            | (Image.large.in_(local_paths))
+        )
+        for image in images:
+            referenced_paths.update(
+                path
+                for path in (image.origin, image.small, image.medium, image.large)
+                if path
             )
-            for image in images:
-                referenced_paths.update(
-                    path
-                    for path in (image.origin, image.small, image.medium, image.large)
-                    if path
-                )
-        except (AttributeError, RuntimeError):
-            # Some isolated storage tests intentionally run without a database.
-            # Production cleanup is only invoked with an initialized database.
-            pass
         local_paths -= referenced_paths
         if not local_paths:
             return

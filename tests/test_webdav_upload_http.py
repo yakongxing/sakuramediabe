@@ -110,17 +110,16 @@ def test_directory_cache_and_normal_move_request_counts(dav):
     assert backend.client.chunk_size == 65536
 
 
-def test_immutable_success_uses_one_final_stat_and_full_get(dav):
+def test_immutable_success_verifies_full_content_before_atomic_move(dav):
     backend, server, _ = dav
     backend.put_bytes("movies/hash.webp", b"image", immutable=True, overwrite=False)
     methods = [method for method, _, _ in server.requests]
-    # webdav4 checks existence before PUT; the only post-PUT metadata query is ours.
-    assert methods[methods.index("PUT") + 1:] == ["PROPFIND", "GET"]
-    assert "MOVE" not in methods
+    assert methods[methods.index("PUT") + 1:] == ["PROPFIND", "GET", "MOVE", "PROPFIND"]
+    assert all(".uploading-" in path for method, path, _ in server.requests if method in {"PUT", "GET"})
 
 
 @pytest.mark.parametrize("immutable", [False, True])
-def test_put_timeout_rewinds_and_reuses_key(dav, immutable):
+def test_put_timeout_rewinds_into_an_isolated_attempt_key(dav, immutable):
     backend, server, sleeps = dav
     attempted = []
 
@@ -132,7 +131,8 @@ def test_put_timeout_rewinds_and_reuses_key(dav, immutable):
 
     server.fault = fault
     assert backend.put_bytes("movies/a.webp", b"complete image", immutable=immutable, overwrite=not immutable).size == 14
-    assert attempted[0] == attempted[1]
+    assert attempted[0][0] != attempted[1][0]
+    assert attempted[0][1] == attempted[1][1] == b"complete image"
     assert len(attempted) == 2
     assert len(sleeps) == 1
 
@@ -170,7 +170,7 @@ def test_missing_cached_parent_is_recreated_once(dav):
     assert "/dav/assets/movies" in server.directories
     put_paths = [path for method, path, _ in server.requests if method == "PUT"]
     assert len(put_paths) == 3
-    assert put_paths[-1] == put_paths[-2]
+    assert put_paths[-1] != put_paths[-2]
 
 
 def test_mkdir_409_is_not_accepted_as_success(dav):
@@ -220,11 +220,13 @@ def test_move_response_lost_is_confirmed_by_hash(dav):
 def test_verification_download_failure_is_not_content_mismatch(dav):
     backend, server, _ = dav
     server.fault = lambda request: httpx.Response(503) if request.method == "GET" else None
-    with pytest.raises(StoragePublicationUnknown) as caught:
+    with pytest.raises(StorageUnavailable) as caught:
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
-    assert caught.value.stage == "verify"
+    assert not isinstance(caught.value, StoragePublicationUnknown)
+    assert caught.value.stage == "temporary_verify"
     assert sum(method == "GET" for method, _, _ in server.requests) == 3
-    assert server.objects["/dav/assets/a.webp"] == b"image"
+    assert "/dav/assets/a.webp" not in server.objects
+    assert not any(method == "MOVE" for method, _, _ in server.requests)
 
 
 def test_equal_size_wrong_content_fails_full_verification(dav):
@@ -303,20 +305,21 @@ def test_broken_verification_stream_has_bounded_retries_and_is_closed(dav):
             return httpx.Response(200, stream=stream, headers={"Accept-Ranges": "bytes"})
 
     server.fault = fault
-    with pytest.raises(StoragePublicationUnknown):
+    with pytest.raises(StorageUnavailable):
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
     assert len(streams) == 3
     assert all(stream.closed for stream in streams)
     assert len(sleeps) == 2
+    assert not any(method == "MOVE" for method, _, _ in server.requests)
 
 
 def test_conflict_with_unreadable_destination_is_unknown(dav):
     backend, server, _ = dav
     server.objects["/dav/assets/a.webp"] = b"image"
-    server.fault = lambda request: httpx.Response(503) if request.method == "GET" else None
+    server.fault = lambda request: httpx.Response(503) if request.method == "GET" and request.url.path == "/dav/assets/a.webp" else None
     with pytest.raises(StoragePublicationUnknown):
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
-    assert not any(method == "PUT" for method, _, _ in server.requests)
+    assert all(path != "/dav/assets/a.webp" for method, path, _ in server.requests if method == "PUT")
     assert server.objects["/dav/assets/a.webp"] == b"image"
 
 
@@ -350,3 +353,188 @@ def test_metadata_retries_are_not_multiplied_by_webdav4(dav, method):
             backend.delete("a.webp")
     assert sum(verb == method for verb, _, _ in server.requests) == 3
     assert len(sleeps) == 2
+
+
+def test_immutable_publish_is_atomic_create_and_returns_receipt(dav):
+    backend, server, _ = dav
+    result = backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert result.created
+    assert result.operation_id
+    assert any(method == "MOVE" for method, _, _ in server.requests)
+    assert all(path != "/dav/assets/a.webp" for method, path, _ in server.requests if method == "PUT")
+
+
+def test_immutable_existing_content_is_reused_without_ownership(dav):
+    backend, server, _ = dav
+    backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    result = backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert not result.created
+    assert result.disposition == "reused"
+    assert server.objects == {"/dav/assets/a.webp": b"image"}
+
+
+def test_strict_create_never_reuses_existing_identical_content(dav):
+    backend, server, _ = dav
+    backend.put_bytes("a.webp", b"image")
+    with pytest.raises(FileExistsError):
+        backend.put_bytes("a.webp", b"image", overwrite=False)
+    assert server.objects == {"/dav/assets/a.webp": b"image"}
+
+
+def test_upload_backoff_releases_network_slot(dav):
+    backend, server, _ = dav
+    import threading
+
+    backend._publication_semaphore = threading.BoundedSemaphore(1)
+    waits = []
+
+    def sleep(delay):
+        assert backend._publication_semaphore.acquire(blocking=False)
+        backend._publication_semaphore.release()
+        waits.append(delay)
+
+    backend._sleep = sleep
+    server.fault = lambda request: httpx.Response(503) if request.method == "PUT" else None
+    with pytest.raises(StorageUnavailable):
+        backend.put_bytes("a.webp", b"image")
+    assert waits
+
+
+@pytest.mark.parametrize("status", [200, 202, 207])
+def test_unexpected_move_response_preserves_possible_source_and_final(dav, status):
+    backend, server, _ = dav
+    server.objects["/dav/assets/a.webp"] = b"older"
+
+    def fault(request):
+        if request.method == "MOVE":
+            if status == 207:
+                return httpx.Response(207, text='<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/assets/a.webp</d:href><d:status>HTTP/1.1 500 Internal Server Error</d:status></d:response></d:multistatus>')
+            return httpx.Response(status)
+
+    server.fault = fault
+    with pytest.raises(StoragePublicationUnknown):
+        backend.put_bytes("a.webp", b"image")
+    assert server.objects["/dav/assets/a.webp"] == b"older"
+    assert any(".uploading-" in key for key in server.objects)
+    assert not any(method == "DELETE" for method, _, _ in server.requests)
+
+
+@pytest.mark.parametrize("content", [b"image", b"other"])
+def test_competing_create_during_move_is_never_overwritten(dav, content):
+    backend, server, _ = dav
+
+    def fault(request):
+        if request.method == "MOVE":
+            assert request.headers["Overwrite"] == "F"
+            server.objects["/dav/assets/a.webp"] = content
+
+    server.fault = fault
+    with pytest.raises(FileExistsError):
+        backend.put_bytes("a.webp", b"image", overwrite=False)
+    assert server.objects == {"/dav/assets/a.webp": content}
+
+
+def test_late_timed_out_put_cannot_change_published_bytes(dav):
+    backend, server, _ = dav
+    stalled = []
+
+    def fault(request):
+        if request.method == "PUT" and not stalled:
+            stalled.append(request.url.path)
+            raise httpx.ReadTimeout("still executing on server", request=request)
+
+    server.fault = fault
+    backend.put_bytes("a.webp", b"image", overwrite=False)
+    server.objects[stalled[0]] = b"late partial bytes"
+    assert server.objects["/dav/assets/a.webp"] == b"image"
+    assert not any(method == "DELETE" and path == stalled[0] for method, path, _ in server.requests)
+
+
+def test_move_budget_exhaustion_keeps_unknown_classification(dav):
+    backend, server, _ = dav
+
+    def fault(request):
+        if request.method == "MOVE":
+            server.normal(request)
+            raise httpx.ReadTimeout("lost response", request=request)
+        if request.method == "PROPFIND" and request.url.path == "/dav/assets/a.webp":
+            return httpx.Response(404)
+
+    def expire(_delay):
+        webdav._budget.get().deadline = time.monotonic() - 1
+
+    backend._sleep = expire
+    server.fault = fault
+    with pytest.raises(StoragePublicationUnknown) as caught:
+        backend.put_bytes("a.webp", b"image")
+    assert caught.value.publication_possible
+    assert server.objects["/dav/assets/a.webp"] == b"image"
+    assert not any(method == "DELETE" for method, _, _ in server.requests)
+
+
+def test_slow_small_verification_chunks_check_deadline_and_close(dav):
+    backend, server, _ = dav
+
+    class SlowStream(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self):
+            yield b"i"
+            webdav._budget.get().deadline = time.monotonic() - 1
+            yield b"m"
+            pytest.fail("verification read past its deadline")
+
+        def close(self):
+            self.closed = True
+
+    stream = SlowStream()
+    server.fault = lambda request: httpx.Response(200, stream=stream) if request.method == "GET" else None
+    with pytest.raises(StorageUnavailable):
+        backend.put_bytes("a.webp", b"image", overwrite=False, immutable=True)
+    assert stream.closed
+    assert not any(method == "MOVE" for method, _, _ in server.requests)
+
+
+def test_modified_source_is_rejected_before_publication(dav, monkeypatch, tmp_path):
+    backend, server, _ = dav
+    source = tmp_path / "image.webp"
+    source.write_bytes(b"image")
+    ensure_parents = backend._ensure_parents
+
+    def change_source(key, repaired):
+        ensure_parents(key, repaired)
+        source.write_bytes(b"other content")
+
+    monkeypatch.setattr(backend, "_ensure_parents", change_source)
+    with pytest.raises(StorageUnavailable, match="source changed"):
+        backend.put_file("a.webp", source)
+    assert not any(method in {"PUT", "MOVE"} for method, _, _ in server.requests)
+
+
+def test_zero_byte_upload_is_not_missing_length(dav):
+    backend, server, _ = dav
+    result = backend.put_bytes("empty.srt", b"", overwrite=False, immutable=True)
+    assert result.size == 0 and result.created
+    assert server.objects["/dav/assets/empty.srt"] == b""
+
+
+def test_metadata_confirmation_uses_depth_zero(dav):
+    backend, server, _ = dav
+
+    def inspect(request):
+        if request.method == "PROPFIND":
+            assert request.headers["Depth"] == "0"
+
+    server.fault = inspect
+    backend.put_bytes("a.webp", b"image")
+    backend._directory_cache.clear()
+    backend.put_bytes("b.webp", b"image")
+
+
+def test_cleanup_requires_explicit_writer_pause(dav):
+    from datetime import datetime, timezone
+
+    backend, server, _ = dav
+    with pytest.raises(ValueError, match="pause"):
+        backend.cleanup_expired_uploads("movies", older_than=datetime.now(timezone.utc))
+    assert not server.requests

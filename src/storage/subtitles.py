@@ -56,6 +56,10 @@ class LocalSubtitleStorage:
     def put_bytes(self, key, content, **kwargs):
         return self.local.put_bytes(key, content, **kwargs)
 
+    def delete(self, key, *, missing_ok=True):
+        # New publications belong to the local override; old remote files are read-only.
+        return self.local.delete(key, missing_ok=missing_ok)
+
     def list(self, prefix):
         # Include old remote names during discovery and sequence allocation.
         try:

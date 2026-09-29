@@ -17,7 +17,7 @@ from src.common.subtitle_paths import (
     ensure_movie_subtitle_path,
     movie_subtitle_storage_key,
 )
-from src.model import Movie, Subtitle
+from src.model import Movie, Subtitle, get_database
 from src.schema.catalog.subtitles import (
     MovieSubtitleItemResource,
     MovieSubtitleListResource,
@@ -25,6 +25,7 @@ from src.schema.catalog.subtitles import (
     SubtitleContent,
     SubtitleReadError,
 )
+from src.service.playback.operation_locks import subtitle_operation_lock
 from src.storage import StorageNotFound, subtitle_storage
 from src.storage.types import StorageError
 
@@ -116,38 +117,44 @@ class MovieSubtitleService:
 
     @classmethod
     def sync_movie_subtitles(cls, movie: Movie) -> dict[str, int]:
-        discovered_paths = cls._discover_subtitle_paths(movie)
-        existing_items = list(cls._subtitle_query(movie))
-        existing_by_path: dict[str, Subtitle] = {}
-        deleted_count = 0
+        with subtitle_operation_lock(movie.id) as check_connection:
+            movie = Movie.get_by_id(movie.id)
+            discovered_paths = cls._discover_subtitle_paths(movie)
+            existing_items = list(cls._subtitle_query(movie))
+            existing_by_path: dict[str, Subtitle] = {}
+            obsolete: list[Subtitle] = []
+            storage = subtitle_storage()
 
-        # 先清理已经失效的字幕记录，避免后续列表继续暴露坏链接。
-        for subtitle in existing_items:
-            try:
-                normalized_path = movie_subtitle_storage_key(movie, subtitle.file_path)
-            except ApiError:
-                subtitle.delete_instance()
-                deleted_count += 1
-                continue
-            if not subtitle_storage().exists(normalized_path):
-                subtitle.delete_instance()
-                deleted_count += 1
-                continue
-            existing_by_path[normalized_path] = subtitle
+            # 所有远端检查完成后才修改 DB；中途断网不能留下半次清理结果。
+            for subtitle in existing_items:
+                try:
+                    normalized_path = movie_subtitle_storage_key(movie, subtitle.file_path)
+                except ApiError:
+                    obsolete.append(subtitle)
+                    continue
+                if not storage.exists(normalized_path):
+                    obsolete.append(subtitle)
+                    continue
+                existing_by_path[normalized_path] = subtitle
 
-        created_count = 0
-        for subtitle_path in discovered_paths:
-            key = str(subtitle_path)
-            if key in existing_by_path:
-                continue
-            existing_by_path[key] = Subtitle.create(movie=movie, file_path=key)
-            created_count += 1
+            created_count = 0
+            check_connection()
+            with get_database().atomic():
+                for subtitle in obsolete:
+                    subtitle.delete_instance()
+                for key in discovered_paths:
+                    if key in existing_by_path:
+                        continue
+                    subtitle, created = Subtitle.get_or_create(movie=movie, file_path=key)
+                    existing_by_path[key] = subtitle
+                    created_count += int(created)
+                check_connection()
 
-        return {
-            "created_subtitles": created_count,
-            "deleted_subtitles": deleted_count,
-            "total_subtitles": len(existing_by_path),
-        }
+            return {
+                "created_subtitles": created_count,
+                "deleted_subtitles": len(obsolete),
+                "total_subtitles": len(existing_by_path),
+            }
 
     @staticmethod
     def _subtitle_query(movie: Movie):

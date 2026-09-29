@@ -12,8 +12,33 @@ from src.storage.local import LocalStorageBackend
 @pytest.fixture(autouse=True)
 def fake_download_adapter(monkeypatch):
     """Legacy fake clients expose a download hook; HTTP contract tests use real GETs."""
+    from src.storage.types import StorageNotFound
     from src.storage.webdav import WebDAVStorageBackend
 
+    monkeypatch.setattr(WebDAVStorageBackend, "_info_once", lambda self, path: self.client.info(path))
+    monkeypatch.setattr(WebDAVStorageBackend, "_upload_once", lambda self, key, stream, size, digest: self.client.upload_fileobj(stream, self._path(key), overwrite=True, size=size))
+
+    def mkdir(self, path):
+        with self._network():
+            self.client.mkdir(path)
+
+    def move(self, source, destination, overwrite):
+        self.client.move(self._path(source), self._path(destination), overwrite=overwrite)
+        return 201
+
+    def remove(self, key, *, missing_ok):
+        try:
+            with self._network():
+                self.client.remove(self._path(key))
+        except Exception as exc:
+            if self._status_code(exc) != 404:
+                raise
+            if not missing_ok:
+                raise StorageNotFound(key) from exc
+
+    monkeypatch.setattr(WebDAVStorageBackend, "_mkdir_once", mkdir)
+    monkeypatch.setattr(WebDAVStorageBackend, "_move_once", move)
+    monkeypatch.setattr(WebDAVStorageBackend, "_remove_once", remove)
     monkeypatch.setattr(
         WebDAVStorageBackend, "_download_once",
         lambda self, key, target: self.client.download_fileobj(self._path(key), target),
@@ -117,7 +142,7 @@ def test_webdav_put_file_publishes_through_temporary_key(monkeypatch, tmp_path):
     assert all(call[1] != "tenant/assets/movies/cover.jpg" for call in uploads)
 
 
-def test_webdav_immutable_put_uploads_directly_to_final_key(monkeypatch, tmp_path):
+def test_webdav_immutable_put_uses_temporary_key_and_no_overwrite_move(monkeypatch, tmp_path):
     from src.storage import webdav as module
 
     uploads = []
@@ -146,8 +171,10 @@ def test_webdav_immutable_put_uploads_directly_to_final_key(monkeypatch, tmp_pat
     )
 
     assert result.size == 5
-    assert uploads == [("assets/movies/a/cover-deadbeef.jpg", False, 5, b"image")]
-    assert moves == []
+    assert len(uploads) == 1
+    assert uploads[0][0].startswith("assets/movies/a/.cover-deadbeef.jpg.uploading-")
+    assert uploads[0][1:] == (True, 5, b"image")
+    assert moves == [((uploads[0][0], "assets/movies/a/cover-deadbeef.jpg"), {"overwrite": False})]
 
 
 def test_webdav_immutable_put_rejects_same_size_wrong_content(monkeypatch, tmp_path):
@@ -351,16 +378,16 @@ def test_webdav_concurrent_publish_reconciles_412_when_destination_matches(monke
     second = module.WebDAVStorageBackend("https://dav.example/root", "assets")
 
     first.put_bytes("movies/cover.jpg", b"image")
-    result = second.put_bytes("movies/cover.jpg", b"image")
+    result = second.put_bytes("movies/cover.jpg", b"image", immutable=True, overwrite=False)
 
     assert result.size == 5
+    assert result.disposition == "reused"
     assert move_calls == 2
     assert objects == {"assets/movies/cover.jpg": b"image"}
 
 
 def test_webdav_concurrent_publish_rejects_412_when_destination_hash_mismatches(monkeypatch):
     from src.storage import webdav as module
-    from src.storage.types import StorageUnavailable
 
     objects = {}
     move_calls = 0
@@ -394,8 +421,8 @@ def test_webdav_concurrent_publish_rejects_412_when_destination_hash_mismatches(
     )
 
     first.put_bytes("movies/cover.jpg", b"image")
-    with pytest.raises(StorageUnavailable, match=r"move failed \(412\)"):
-        second.put_bytes("movies/cover.jpg", b"other")
+    with pytest.raises(FileExistsError, match="content mismatch"):
+        second.put_bytes("movies/cover.jpg", b"other", immutable=True, overwrite=False)
 
     assert move_calls == 2
     assert objects == {"assets/movies/cover.jpg": b"image"}
@@ -582,7 +609,7 @@ def test_webdav_exhausted_final_visibility_reports_possible_publication(monkeypa
     assert raised.value.publication_possible is True
 
 
-def test_webdav_success_opportunistically_wires_bounded_temp_cleanup(monkeypatch):
+def test_webdav_success_does_not_scan_directories_for_cleanup(monkeypatch):
     from src.storage import webdav as module
 
     calls = []
@@ -603,7 +630,7 @@ def test_webdav_success_opportunistically_wires_bounded_temp_cleanup(monkeypatch
     )
     backend.put_bytes("movies/a/cover.jpg", b"image")
     backend.put_bytes("movies/a/plot.jpg", b"image")
-    assert calls == ["assets/movies/a"]
+    assert calls == []
 
 
 def test_webdav_successful_publish_leaves_no_temporary_object(monkeypatch):
@@ -660,7 +687,7 @@ def test_webdav_cleanup_removes_only_expired_upload_temps(monkeypatch):
     backend = module.WebDAVStorageBackend("https://dav.example/root", "assets", sleep=lambda _: None)
 
     deleted = backend.cleanup_expired_uploads(
-        "movies/ab/ABC-001", older_than=now - timedelta(hours=1)
+        "movies/ab/ABC-001", older_than=now - timedelta(hours=1), uploads_paused=True
     )
 
     assert deleted == [f"movies/ab/ABC-001/.old.jpg.uploading-{'a' * 32}"]

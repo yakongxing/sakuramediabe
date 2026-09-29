@@ -114,12 +114,27 @@ class Storage(BaseModel):
     pool_timeout_seconds: float = Field(default=10.0, gt=0)
     upload_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
     download_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024)
-    # Global WebDAV PUT bound, shared by publication jobs and independent of HTTP downloads.
+    # Per-process publication network bound, shared by assets and clips.
     webdav_publication_max_workers: int = Field(default=4, ge=1, le=16)
+    webdav_publication_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
+    webdav_upload_retry_seconds: tuple[float, ...] = (0.1, 0.25, 0.5, 1.0)
     webdav_final_visibility_retry_seconds: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+    # Kept for explicit paused-writer maintenance; no scanning on upload success.
     webdav_temp_cleanup_interval_seconds: float = Field(default=3600, ge=60)
     webdav_temp_cleanup_age_seconds: float = Field(default=86400, ge=3600)
     webdav_temp_cleanup_max_deletes: int = Field(default=16, ge=1, le=256)
+
+    @field_validator("webdav_upload_retry_seconds", "webdav_final_visibility_retry_seconds", mode="before")
+    @classmethod
+    def _parse_retry_delays(cls, value):
+        return json.loads(value) if isinstance(value, str) else value
+
+    @field_validator("webdav_upload_retry_seconds", "webdav_final_visibility_retry_seconds")
+    @classmethod
+    def _validate_retry_delays(cls, value):
+        if len(value) > 16 or any(not math.isfinite(delay) or delay < 0 or delay > 60 for delay in value):
+            raise ValueError("WebDAV retry delays require at most 16 finite values between 0 and 60")
+        return value
 
     @model_validator(mode="after")
     def _validate_storage(self):
@@ -131,8 +146,11 @@ class Storage(BaseModel):
             raise ValueError("storage.backend must be local or webdav")
         if self.backend == "webdav":
             parsed = urlparse(self.webdav_base_url.strip())
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("storage.webdav_base_url must be an http(s) URL")
+            if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+                raise ValueError("storage.webdav_base_url must not contain credentials, query or fragment")
+            self.webdav_base_url = self.webdav_base_url.strip().rstrip("/")
         return self
 
 class Metadata(BaseModel):
@@ -330,6 +348,9 @@ _STORAGE_ENV_MAP = {
     "STORAGE__UPLOAD_CHUNK_SIZE": "upload_chunk_size",
     "STORAGE__DOWNLOAD_CHUNK_SIZE": "download_chunk_size",
     "STORAGE__WEBDAV_PUBLICATION_MAX_WORKERS": "webdav_publication_max_workers",
+    "STORAGE__WEBDAV_PUBLICATION_TIMEOUT_SECONDS": "webdav_publication_timeout_seconds",
+    "STORAGE__WEBDAV_UPLOAD_RETRY_SECONDS": "webdav_upload_retry_seconds",
+    "STORAGE__WEBDAV_FINAL_VISIBILITY_RETRY_SECONDS": "webdav_final_visibility_retry_seconds",
 }
 
 

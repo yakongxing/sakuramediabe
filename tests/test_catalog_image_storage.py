@@ -1,5 +1,4 @@
 import hashlib
-import io
 import threading
 import time
 from pathlib import Path
@@ -12,6 +11,7 @@ from src.service.catalog.movie_image_service import (
     MovieImageService,
     PreparedImageFile,
 )
+from src.storage.types import PublicationResult, StorageConflict
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -36,12 +36,13 @@ def test_finalize_collects_later_success_after_first_failure(monkeypatch, tmp_pa
             later_started.set()
             assert failed.wait(5)
             uploaded.add(key)
+            return PublicationResult(key, 1, disposition="created")
 
     monkeypatch.setattr(module, "asset_storage", Storage)
     monkeypatch.setattr(module.settings.storage, "webdav_publication_max_workers", 2)
     prepared = [
         PreparedImageFile(
-            ImagePersistTask("plot", "unused", key, tmp_path / key), tmp_path / key, tmp_path,
+            ImagePersistTask("plot", "unused", key, tmp_path / key, exclusive_key=key), tmp_path / key, tmp_path,
         )
         for key in ("first.webp", "later.webp")
     ]
@@ -51,25 +52,23 @@ def test_finalize_collects_later_success_after_first_failure(monkeypatch, tmp_pa
     assert uploaded == created_keys == {"later.webp"}
 
 
-def test_finalize_prepared_image_files_skips_upload_when_size_unchanged(monkeypatch, tmp_path):
+def test_finalize_delegates_deduplication_and_preserves_reused_object(monkeypatch, tmp_path):
     from src.service.catalog import movie_image_service as module
-    from src.storage.types import ObjectStat
 
     class FakeStorage:
         def __init__(self):
             self.put_calls = []
 
-        def exists(self, key):
-            return True
-
         def stat(self, key):
-            return ObjectStat(key=key, size=5)
+            pytest.fail("service must not duplicate backend verification")
 
         def open(self, key):
-            return io.BytesIO(b"image")
+            pytest.fail("service must not download for a second hash check")
 
         def put_file(self, key, source, *, overwrite=True, immutable=False):
+            assert immutable and not overwrite
             self.put_calls.append((key, source))
+            return PublicationResult(key, 5, disposition="reused")
 
     storage = FakeStorage()
     monkeypatch.setattr(module, "asset_storage", lambda: storage)
@@ -77,49 +76,63 @@ def test_finalize_prepared_image_files_skips_upload_when_size_unchanged(monkeypa
     temp_root.mkdir()
     temp_path = temp_root / "plot-0.jpg"
     temp_path.write_bytes(b"image")
+    key = "movies/ab/ABC-001/plot-0.jpg"
     prepared = PreparedImageFile(
-        image_task=ImagePersistTask(
-            image_type="plot",
-            image_url="https://example.invalid/plot-0.jpg",
-            relative_path="movies/ab/ABC-001/plot-0.jpg",
-            absolute_path=Path("/unused/plot-0.jpg"),
-            plot_index=0,
-        ),
-        temp_path=temp_path,
-        temp_root=temp_root,
+        ImagePersistTask("plot", "unused", key, Path("/unused"), exclusive_key=key),
+        temp_path, temp_root,
     )
+    created_keys = set()
 
-    MovieImageService().finalize_prepared_image_files([prepared])
+    MovieImageService().finalize_prepared_image_files([prepared], created_keys=created_keys)
 
-    assert storage.put_calls == []
+    assert storage.put_calls == [(key, temp_path)]
+    assert prepared.image_task.publication.disposition == "reused"
+    assert not created_keys
     assert not temp_root.exists()
 
 
-def test_finalize_prepared_image_files_uploads_same_size_different_content(monkeypatch, tmp_path):
+def test_finalize_preserves_backend_content_conflict(monkeypatch, tmp_path):
     from src.service.catalog import movie_image_service as module
-    from src.storage.types import ObjectStat
 
-    class FakeStorage:
-        def __init__(self): self.put_calls = []
-        def stat(self, key): return ObjectStat(key=key, size=5)
-        def open(self, key): return io.BytesIO(b"other")
-        def put_file(self, key, source, *, overwrite=True, immutable=False): self.put_calls.append((key, source.read_bytes()))
+    error = StorageConflict("immutable key contains different bytes")
 
-    storage = FakeStorage()
-    monkeypatch.setattr(module, "asset_storage", lambda: storage)
-    temp_root = tmp_path / "refresh"
-    temp_root.mkdir()
-    temp_path = temp_root / "cover.jpg"
-    temp_path.write_bytes(b"image")
+    def put_file(key, source, *, overwrite, immutable):
+        assert not overwrite and immutable
+        raise error
+
+    monkeypatch.setattr(module, "asset_storage", lambda: SimpleNamespace(put_file=put_file))
+    source = tmp_path / "cover.jpg"
+    source.write_bytes(b"image")
     prepared = PreparedImageFile(
-        ImagePersistTask("cover", "https://example.invalid/cover.jpg", "movies/a/cover.jpg", Path("/unused")),
-        temp_path,
-        temp_root,
+        ImagePersistTask("cover", "unused", "movies/a/cover.jpg", Path("/unused")),
+        source, tmp_path,
     )
+    with pytest.raises(StorageConflict) as caught:
+        MovieImageService().finalize_prepared_image_files([prepared])
+    assert caught.value is error
+    assert prepared.image_task.publication is None
 
-    MovieImageService().finalize_prepared_image_files([prepared])
 
-    assert storage.put_calls == [("movies/a/cover.jpg", b"image")]
+@pytest.mark.parametrize("exclusive", [False, True])
+@pytest.mark.parametrize("disposition", ["created", "reused", "published"])
+def test_finalize_only_compensates_confirmed_exclusive_creation(
+    monkeypatch, tmp_path, exclusive, disposition,
+):
+    from src.service.catalog import movie_image_service as module
+
+    key = "movies/a/cover-digest.jpg"
+    result = PublicationResult(key, 5, disposition=disposition)
+    monkeypatch.setattr(module, "asset_storage", lambda: SimpleNamespace(put_file=lambda *a, **k: result))
+    task = ImagePersistTask("cover", "unused", key, tmp_path / "cover.jpg")
+    if exclusive:
+        task.exclusive_key = key
+    created_keys = set()
+    MovieImageService().finalize_prepared_image_files(
+        [PreparedImageFile(task, task.absolute_path, tmp_path)],
+        created_keys=created_keys, cleanup=False,
+    )
+    assert task.publication is result
+    assert created_keys == ({key} if exclusive and disposition == "created" else set())
 
 
 def test_version_prepared_image_keys_uses_full_sha256_digest(tmp_path):
@@ -157,6 +170,8 @@ def test_delete_obsolete_image_files_uses_storage_backend(monkeypatch):
 
     storage = FakeStorage()
     monkeypatch.setattr(module, "asset_storage", lambda: storage, raising=False)
+    monkeypatch.setattr(module, "get_database", lambda: SimpleNamespace(in_transaction=lambda: False))
+    monkeypatch.setattr(module.Image, "select", lambda *args: SimpleNamespace(where=lambda *args: []))
 
     module.ImageCleanupService.delete_obsolete_image_files({"movies/ab/ABC-001/plot-0.jpg"})
 
@@ -300,3 +315,83 @@ def test_optional_image_publication_failure_is_not_swallowed(monkeypatch, tmp_pa
 
     with pytest.raises(StorageUnavailable, match="publish failed"):
         service.download_image_tasks([task])
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_confirmed_publication_skips_remote_probe_during_persistence(monkeypatch, tmp_path, batch):
+    from src.service.catalog import movie_image_service as module
+
+    key = "movies/a/cover-uuid.jpg"
+    task = ImagePersistTask("cover", "unused", key, tmp_path / "cover.jpg")
+    task.publication = PublicationResult(key, 5, disposition="created")
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("unexpected remote probe"))
+    service = MovieImageService()
+    monkeypatch.setattr(service, "_upsert_image_record", lambda path: path)
+    monkeypatch.setattr(service, "_upsert_image_records", lambda paths: paths)
+    if batch:
+        assert service.persist_prepared_images([task]) == [key]
+    else:
+        assert service.persist_prepared_image(task) == key
+
+
+def test_publication_proof_cannot_be_reused_for_changed_key(monkeypatch, tmp_path):
+    from src.service.catalog import movie_image_service as module
+
+    calls = []
+    task = ImagePersistTask("cover", "unused", "new.jpg", tmp_path / "cover.jpg")
+    task.publication = PublicationResult("old.jpg", 5, disposition="created")
+    monkeypatch.setattr(module, "asset_storage", lambda: SimpleNamespace(
+        exists=lambda key: calls.append(key) or False,
+    ))
+    assert MovieImageService().persist_prepared_image(task) is None
+    assert calls == ["new.jpg"]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("database offline"), AttributeError("database unbound")])
+def test_cleanup_fails_closed_when_database_query_fails(monkeypatch, error):
+    from src.service.catalog import image_cleanup_service as module
+
+    def select(*args):
+        raise error
+
+    monkeypatch.setattr(module, "get_database", lambda: SimpleNamespace(in_transaction=lambda: False))
+    monkeypatch.setattr(module.Image, "select", select)
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("unsafe deletion"))
+    with pytest.raises(type(error)) as caught:
+        module.ImageCleanupService.delete_obsolete_image_files({"movies/a/cover.jpg"})
+    assert caught.value is error
+
+
+def test_cleanup_does_not_delete_before_database_commit(monkeypatch):
+    from src.service.catalog import image_cleanup_service as module
+
+    monkeypatch.setattr(module, "get_database", lambda: SimpleNamespace(in_transaction=lambda: True))
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("uncommitted deletion"))
+    module.ImageCleanupService.delete_obsolete_image_files({"movies/a/cover.jpg"})
+
+
+def test_metadata_compensation_retains_objects_after_database_connection_error(monkeypatch, tmp_path):
+    from peewee import OperationalError
+    from PIL import Image as PillowImage
+
+    from src.service.catalog import movie_image_service as module
+
+    source = tmp_path / "input.jpg"
+    PillowImage.new("RGB", (20, 10)).save(source)
+    monkeypatch.setattr(module, "media_image_root_path", lambda: tmp_path / "assets")
+    service = MovieImageService()
+    monkeypatch.setattr(service, "_split_image", lambda *args, **kwargs: False)
+
+    def finalize(prepared, *, created_keys):
+        for item in prepared:
+            task = item.image_task
+            assert task.exclusive_key == task.relative_path
+            created_keys.add(task.relative_path)
+
+    monkeypatch.setattr(service, "finalize_prepared_image_files", finalize)
+    monkeypatch.setattr(service, "delete_obsolete_image_files", lambda keys: pytest.fail("uncertain COMMIT deletion"))
+    with (
+        pytest.raises(OperationalError, match="commit connection lost"),
+        service.prepare_metadata_images("TEST-001", str(source), [], local=True),
+    ):
+        raise OperationalError("commit connection lost")

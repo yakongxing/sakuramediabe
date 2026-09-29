@@ -6,7 +6,7 @@ from PIL import Image as PillowImage
 from src.model import Image
 from src.service.catalog import movie_image_service as module
 from src.service.catalog.movie_image_service import ImagePersistTask, MovieImageService
-from src.storage.types import StoragePublicationUnknown
+from src.storage.types import PublicationResult, StoragePublicationUnknown
 
 
 def test_metadata_compensation_preserves_unknown_publication(test_db, tmp_path, monkeypatch):
@@ -26,6 +26,7 @@ def test_metadata_compensation_preserves_unknown_publication(test_db, tmp_path, 
             objects[key] = source.read_bytes()
             if "/unknown-" in key:
                 raise StoragePublicationUnknown(key, "visibility unknown")
+            return PublicationResult(key, len(objects[key]), disposition="created")
 
         def delete(self, key, **kwargs):
             removed.append(key)

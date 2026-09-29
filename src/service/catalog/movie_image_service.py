@@ -22,7 +22,7 @@ from uuid import uuid4
 
 import httpx
 from loguru import logger
-from peewee import EXCLUDED
+from peewee import EXCLUDED, InterfaceError, OperationalError
 from PIL import Image as PillowImage
 from PIL import UnidentifiedImageError
 
@@ -42,11 +42,8 @@ from src.metadata._providers.models import JavdbMovieActorResource
 from src.model import Image, Movie, MoviePlotImage
 from src.service.catalog.image_cleanup_service import ImageCleanupService
 from src.storage import asset_storage
-from src.storage.types import (
-    StorageNotFound,
-    StoragePublicationUnknown,
-    StorageUnavailable,
-)
+from src.storage.batch import publish_batch
+from src.storage.types import ObjectStat, StorageUnavailable
 
 
 class ImageDownloadError(Exception):
@@ -60,6 +57,16 @@ class ImagePersistTask:
     relative_path: str
     absolute_path: Path
     plot_index: int | None = None
+    publication: ObjectStat | None = None
+    # Only operation-generated UUID keys can be synchronously compensated.
+    exclusive_key: str | None = None
+
+    def has_confirmed_publication(self) -> bool:
+        return (
+            self.publication is not None
+            and self.publication.key == self.relative_path
+            and self.publication.is_file
+        )
 
 
 @dataclass
@@ -570,7 +577,7 @@ class MovieImageService:
                 self.image_downloader(image_task.image_url, prepared)
             except Exception as exc:
                 raise ImageDownloadError(f"download_failed:{image_task.image_url}:{exc}") from exc
-            storage.put_file(image_task.relative_path, prepared)
+            image_task.publication = storage.put_file(image_task.relative_path, prepared)
 
     def download_image_tasks_to_temporary_files(
         self,
@@ -622,17 +629,6 @@ class MovieImageService:
         return digest.hexdigest()
 
     @classmethod
-    def _prepared_matches_storage(cls, storage, key: str, temp_path: Path) -> bool:
-        try:
-            existing = storage.stat(key)
-        except StorageNotFound:
-            return False
-        if existing.size != temp_path.stat().st_size:
-            return False
-        with temp_path.open("rb") as prepared_stream, storage.open(key) as stored_stream:
-            return cls._sha256_stream(prepared_stream) == cls._sha256_stream(stored_stream)
-
-    @classmethod
     def version_prepared_image_keys(cls, prepared_files: list[PreparedImageFile]) -> None:
         """Give strict-refresh objects immutable content-derived keys before publication."""
         for prepared_file in prepared_files:
@@ -642,6 +638,8 @@ class MovieImageService:
             prepared_file.image_task.relative_path = str(
                 current.with_name(f"{current.stem}-{content_id}{current.suffix}")
             )
+            prepared_file.image_task.publication = None
+            prepared_file.image_task.exclusive_key = None
 
     def finalize_prepared_image_files(
         self,
@@ -653,40 +651,37 @@ class MovieImageService:
         if not prepared_files:
             return
         storage = asset_storage()
-        def publish(prepared_file: PreparedImageFile) -> str | None:
-            key = prepared_file.image_task.relative_path
-            if not getattr(storage, "supports_direct_immutable_put", False) and self._prepared_matches_storage(storage, key, prepared_file.temp_path):
-                logger.debug("Catalog image unchanged, skip upload key={}", key)
-                return None
-            try:
-                storage.put_file(key, prepared_file.temp_path, overwrite=False, immutable=True)
-            except StoragePublicationUnknown:
-                raise
-            except FileExistsError:
-                if self._prepared_matches_storage(storage, key, prepared_file.temp_path):
-                    return None
-                raise StorageUnavailable(f"Immutable image key collision key={key}") from None
-            return key
 
-        with ThreadPoolExecutor(
+        def publish(prepared_file: PreparedImageFile) -> ObjectStat:
+            task = prepared_file.image_task
+            task.publication = None
+            return storage.put_file(
+                task.relative_path, prepared_file.temp_path, overwrite=False, immutable=True,
+            )
+
+        batch = publish_batch(
+            prepared_files,
+            publish,
             max_workers=min(settings.storage.webdav_publication_max_workers, len(prepared_files)),
             thread_name_prefix="image-publication",
-        ) as executor:
-            futures = {executor.submit(publish, item): item for item in prepared_files}
-            errors: list[Exception] = []
-            for future in as_completed(futures):
-                try:
-                    key = future.result()
-                except StoragePublicationUnknown as exc:
-                    logger.warning("Catalog image publication unknown key={}", exc.key)
-                    errors.append(exc)
-                except Exception as exc:
-                    errors.append(exc)
-                else:
-                    if key is not None and created_keys is not None:
-                        created_keys.add(key)
-        if errors:
-            raise errors[0]
+        )
+        for prepared_file, result in batch.published:
+            task = prepared_file.image_task
+            task.publication = result
+            if (
+                created_keys is not None
+                and task.exclusive_key == task.relative_path
+                and getattr(result, "created", False)
+            ):
+                created_keys.add(task.relative_path)
+        for prepared_file, error in batch.errors:
+            logger.warning(
+                "Catalog image publication failed key={} stage={} publication_possible={}",
+                prepared_file.image_task.relative_path,
+                getattr(error, "stage", None),
+                getattr(error, "publication_possible", False),
+            )
+        batch.raise_for_errors()
 
         if cleanup:
             for temp_root in {prepared_file.temp_root for prepared_file in prepared_files}:
@@ -714,8 +709,8 @@ class MovieImageService:
         root.mkdir(parents=True, exist_ok=True)
         temp_root = Path(tempfile.mkdtemp(prefix="metadata-", dir=root))
         prepared = []
-        final_paths = []
         created_keys: set[str] = set()
+        cleanup_allowed = True
         try:
             for task in tasks:
                 path = temp_root / task.relative_path
@@ -738,23 +733,20 @@ class MovieImageService:
                 relative = path.with_name(f"{path.stem}-{token}{path.suffix}")
                 item.image_task.relative_path = relative.as_posix()
                 item.image_task.absolute_path = root / relative
-                final_paths.append(relative.as_posix())
+                item.image_task.exclusive_key = relative.as_posix()
             self.finalize_prepared_image_files(prepared, created_keys=created_keys)
             yield cover_task, plot_tasks, actor_tasks, thin
+        except (InterfaceError, OperationalError):
+            # A disconnected COMMIT is not proof that its new references rolled back.
+            cleanup_allowed = False
+            raise
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
-            # 事务回滚或并发查重跳过时，不留下本次未使用的目标图片。
-            # 查询失败时保留文件，避免把提交状态不明的图片删掉。
-            try:
-                used = {
-                    item.origin
-                    for item in Image.select(Image.origin).where(
-                        Image.origin.in_(final_paths)
-                    )
-                }
-                self.delete_obsolete_image_files(created_keys - used)
-            except Exception as exc:
-                logger.warning("元数据未引用图片清理失败 detail={}", exc)
+            if cleanup_allowed and created_keys:
+                try:
+                    self.delete_obsolete_image_files(created_keys)
+                except Exception as exc:
+                    logger.warning("元数据未引用图片清理失败 detail={}", exc)
 
     def persist_image(
         self,
@@ -773,7 +765,7 @@ class MovieImageService:
         if image_task is None:
             return None
 
-        if not asset_storage().exists(image_task.relative_path):
+        if not image_task.has_confirmed_publication() and not asset_storage().exists(image_task.relative_path):
             logger.debug("Persist image downloading url={} target={}", image_task.image_url, str(image_task.absolute_path))
             self._download_movie_image_task(image_task)
         else:
@@ -785,7 +777,7 @@ class MovieImageService:
         if image_task is None:
             return None
         # 非致命图片下载失败时不会落地文件，这里直接跳过数据库记录，避免脏路径。
-        if not asset_storage().exists(image_task.relative_path):
+        if not image_task.has_confirmed_publication() and not asset_storage().exists(image_task.relative_path):
             logger.warning(
                 "Persist image skipped because local file is missing image_type={} url={} target={}",
                 image_task.image_type,
@@ -808,7 +800,7 @@ class MovieImageService:
         for image_task in image_tasks:
             if image_task is None:
                 continue
-            if not asset_storage().exists(image_task.relative_path):
+            if not image_task.has_confirmed_publication() and not asset_storage().exists(image_task.relative_path):
                 logger.warning(
                     "Persist image skipped because local file is missing image_type={} url={} target={}",
                     image_task.image_type,

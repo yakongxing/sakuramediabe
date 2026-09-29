@@ -1,7 +1,9 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
+from uuid import uuid4
 
 from loguru import logger
+from peewee import InterfaceError, OperationalError
 from PIL import Image as PILImage
 
 from src.common.image_references import is_nonlocal_image_reference
@@ -17,7 +19,7 @@ from src.schema.catalog.actors import ImageResource
 from src.schema.playback.media import MediaThumbnailResource
 from src.service.catalog.image_cleanup_service import ImageCleanupService
 from src.storage import asset_storage
-from src.storage.types import StoragePublicationUnknown
+from src.storage.batch import publish_batch
 
 
 class ThumbnailArtifactService:
@@ -76,8 +78,11 @@ class ThumbnailArtifactService:
         cls,
         media: Media,
         artifacts: list[tuple[ThumbnailArtifact, Path]],
+        *,
+        check_connection: Callable[[], None] | None = None,
     ) -> int:
-        prefix = cls.thumbnail_prefix(media)
+        # A late response from an older generation must never replace this batch.
+        prefix = f"{cls.thumbnail_prefix(media)}/{uuid4().hex}"
         storage = asset_storage()
         initial_index_status = (
             MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING
@@ -87,33 +92,35 @@ class ThumbnailArtifactService:
         published: list[tuple[ThumbnailArtifact, str]] = []
         cleanup_keys: set[str] = set()
         try:
-            # Publish outside the transaction; readers only see complete batches.
-            errors: list[Exception] = []
+            if check_connection is not None:
+                check_connection()
             if artifacts:
-                with ThreadPoolExecutor(
+                def publish(item):
+                    artifact, source = item
+                    key = f"{prefix}/{artifact.offset_seconds}.webp"
+                    return storage.put_file(key, source, overwrite=False)
+
+                batch = publish_batch(
+                    artifacts,
+                    publish,
                     max_workers=min(settings.storage.webdav_publication_max_workers, len(artifacts)),
                     thread_name_prefix="thumbnail-publication",
-                ) as executor:
-                    futures = {
-                        executor.submit(storage.put_file, f"{prefix}/{artifact.offset_seconds}.webp", source): artifact
-                        for artifact, source in artifacts
-                    }
-                    for future in as_completed(futures):
-                        artifact = futures[future]
-                        key = f"{prefix}/{artifact.offset_seconds}.webp"
-                        try:
-                            future.result()
-                        except StoragePublicationUnknown as exc:
-                            logger.warning("Thumbnail publication unknown media_id={} key={}", media.id, key)
-                            errors.append(exc)
-                        except Exception as exc:
-                            errors.append(exc)
-                        else:
-                            cleanup_keys.add(key)
-                            published.append((artifact, key))
-                if errors:
-                    raise errors[0]
+                )
+                for (artifact, _), result in batch.published:
+                    key = f"{prefix}/{artifact.offset_seconds}.webp"
+                    published.append((artifact, key))
+                    if getattr(result, "created", False):
+                        cleanup_keys.add(key)
+                for (artifact, _), error in batch.errors:
+                    logger.warning(
+                        "Thumbnail publication failed media_id={} key={} publication_possible={}",
+                        media.id, f"{prefix}/{artifact.offset_seconds}.webp",
+                        getattr(error, "publication_possible", False),
+                    )
+                batch.raise_for_errors()
             published.sort(key=lambda item: item[0].offset_seconds)
+            if check_connection is not None:
+                check_connection()
             with get_database().atomic():
                 for artifact, relative_path in published:
                     image = Image.create(
@@ -128,6 +135,11 @@ class ThumbnailArtifactService:
                         offset=artifact.offset_seconds,
                         image_search_index_status=initial_index_status,
                     )
+                if check_connection is not None:
+                    check_connection()
+        except (InterfaceError, OperationalError):
+            # COMMIT may have succeeded before its response was lost. Retain objects.
+            raise
         except Exception:
             for key in cleanup_keys:
                 try:

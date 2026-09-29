@@ -2,9 +2,10 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 from .keys import normalize_storage_key
-from .types import ObjectStat, StorageNotFound
+from .types import ObjectStat, PublicationResult, StorageConflict, StorageNotFound
 
 
 class LocalStorageBackend:
@@ -27,27 +28,47 @@ class LocalStorageBackend:
         except StorageNotFound: return False
         return True
 
-    def put_file(self, key: str, source: Path, *, overwrite: bool = True, immutable: bool = False) -> ObjectStat:
+    def put_file(self, key: str, source: Path, *, overwrite: bool = True, immutable: bool = False) -> PublicationResult:
+        if immutable and overwrite:
+            raise ValueError("immutable publication requires overwrite=False")
         target = self.local_path(key)
         target.parent.mkdir(parents=True, exist_ok=True)
-        if not overwrite and target.exists(): raise FileExistsError(key)
         fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         os.close(fd)
+        disposition = "published" if overwrite else "created"
         try:
             shutil.copyfile(source, temporary)
             if overwrite:
                 os.replace(temporary, target)
             else:
-                # Atomic create-if-absent; the earlier exists check is only a
-                # fast path and must not permit a concurrent overwrite.
-                os.link(temporary, target)
-                os.unlink(temporary)
+                try:
+                    os.link(temporary, target)
+                except FileExistsError as exc:
+                    if not immutable or not self._same_content(Path(temporary), target):
+                        raise StorageConflict(key) from exc
+                    disposition = "reused"
+            stat = self.stat(key)
+            return PublicationResult(
+                stat.key, stat.size, stat.is_file, stat.etag,
+                operation_id=uuid4().hex, disposition=disposition,
+            )
         finally:
             try: os.unlink(temporary)
             except FileNotFoundError: pass
-        return self.stat(key)
 
-    def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True, immutable: bool = False) -> ObjectStat:
+    @staticmethod
+    def _same_content(source: Path, target: Path) -> bool:
+        if not target.is_file() or source.stat().st_size != target.stat().st_size:
+            return False
+        with source.open("rb") as left, target.open("rb") as right:
+            while True:
+                chunk = left.read(1024 * 1024)
+                if chunk != right.read(1024 * 1024):
+                    return False
+                if not chunk:
+                    return True
+
+    def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True, immutable: bool = False) -> PublicationResult:
         with tempfile.NamedTemporaryFile() as source:
             source.write(content); source.flush()
             return self.put_file(key, Path(source.name), overwrite=overwrite, immutable=immutable)

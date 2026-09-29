@@ -31,4 +31,37 @@ PostgreSQL 重启后，API 和后台工作线程会在后续数据库操作时�
 
 切换存储后不会自动迁移历史本地缩略图，也不会回退读取本地副本；已有缩略图记录不会因此自动重新生成。
 
-WebDAV 上传默认最多同时发布 4 个文件（`storage.webdav_publication_max_workers`），图片和缩略图共享并发上限。已确认的目录缓存 10 分钟，上传分块使用 `storage.upload_chunk_size`；不可变图片仍保留完整下载哈希校验。短暂网络故障会有限重试，429/503 的 `Retry-After` 单次最多等待 60 秒。无法确认是否发布成功的对象会保留并记录日志，同一后端实例的后续重试先检查远端内容，再决定是否重新上传。
+### WebDAV 上传与失败处理
+
+图片、缩略图、字幕（未单独选择本地存储时）和媒体片段使用同一上传协议：先写本次操作独有的临时对象，校验后再用 WebDAV `MOVE` 发布。不可变图片保留完整 SHA-256 校验，直接流式计算，不再为校验下载一份磁盘副本；普通上传校验长度和文件类型。需要“不覆盖”时使用 `Overwrite: F`，不以“上传前检查不存在”代替原子创建。服务端必须正确实现 `MOVE` 和覆盖条件，不支持时会明确失败，不降级为无条件写入 final。
+
+- **确定失败**：认证/权限错误、空间不足、冲突和内容损坏不会盲目重试。短暂网络故障及部分 5xx 有限退避；429/503 的 `Retry-After` 单次最多等待 60 秒，并受剩余预算约束。
+- **结果不明**：MOVE 响应丢失或对象暂不可见时，通过远端长度和完整内容核对确认结果；无法确认则返回 `storage_publication_unknown`，保留可能已经发布的对象。超时 PUT 的后续尝试使用另一个临时 key，避免旧请求晚到后破坏重试结果。
+- **安全补偿**：回执区分本次创建、复用和已发布但所有权未证实；不会因为一次任务失败就删除复用的文件。数据库提交或引用状态不明时保留对象，清理错误不掩盖最初的上传错误。
+- **业务竞争**：缩略图的新批次使用独立 generation key，历史 key 继续可读；片段生成、删除和失效清理使用一致的媒体锁；同影片字幕分配和同步通过 PostgreSQL 会话锁协调。文件发布不等于数据库事务，不能保证两者同时原子提交。
+
+### 上传配置与并发范围
+
+```toml
+[storage]
+webdav_publication_max_workers = 4
+webdav_publication_timeout_seconds = 600
+webdav_upload_retry_seconds = [0.1, 0.25, 0.5, 1.0]
+webdav_final_visibility_retry_seconds = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+upload_chunk_size = 1048576
+download_chunk_size = 1048576
+```
+
+`webdav_publication_max_workers` 限制**每个进程**中同一 WebDAV 端点/账号的发布网络请求，assets 与 clips 共享额度，不是整个部署的全局限额。等待同名对象锁、计算本地哈希或退避时不占用网络额度；批量上传的在途任务也有上限。多个 API/worker 进程的总请求数可能更高，部署时需按进程数和服务端容量配置。
+
+`webdav_publication_timeout_seconds` 是一次发布调用的时间预算，包含排队、校验和重试；现有 connect/read/write/pool 分项超时继续生效。重试间隔允许空列表以关闭该阶段重试，最多 16 项，每项为 0～60 秒的有限数值。上述新配置支持 `SAKURAMEDIA_STORAGE__...` 环境变量；部署用的 `STORAGE__WEBDAV_PUBLICATION_TIMEOUT_SECONDS`、`STORAGE__WEBDAV_UPLOAD_RETRY_SECONDS` 和 `STORAGE__WEBDAV_FINAL_VISIBILITY_RETRY_SECONDS` 也可直接使用，间隔列表用 JSON 字符串。
+
+已确认的目录缓存 10 分钟，缓存失效会有限修复；目录确认使用 Depth: 0，避免枚举全部子对象。连接池会复用，配置重载后旧后端在已有上传/响应流结束后关闭。
+
+### 恢复与临时文件维护
+
+本实现只保证**单次调用内的有限重试**。重试耗尽后由现有任务策略或人工重试接手；没有持久上传队列，不支持重启后自动接续，也不承诺自动清除所有孤儿对象。同一后端实例对相同内容的未知结果重试会先核对远端，不以一条存在性缓存作为成功依据。
+
+成功上传不再顺便扫描目录删除历史临时文件。进程崩溃、请求超时或结果不明时，可能留下 `.文件名.uploading-<uuid>` 对象；日志会记录 key、操作和阶段，供排查。
+
+`cleanup_expired_uploads(prefix, older_than=..., max_deletes=..., uploads_paused=True)` 仅作为显式维护入口。调用前必须暂停**所有进程和实例**的相关写入，并确认没有仍在执行的远端请求；`uploads_paused=True` 是操作者声明，不会自动停止其他实例。维护只针对指定目录、符合临时文件命名规则且超过截止时间的对象，不会扫描整个存储或删除 final。原 `webdav_temp_cleanup_*` 配置保留兼容，但不再触发上传后的自动清理；维护调用需显式提供目录、时间和数量上限。

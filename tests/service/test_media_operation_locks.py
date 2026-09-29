@@ -14,8 +14,11 @@ from src.service.playback.media_validity_scan_service import MediaValidityScanSe
 from src.service.playback.operation_locks import (
     LIBRARY_LOCK,
     MEDIA_LOCK,
+    SUBTITLE_LOCK,
     MediaOperationBusy,
+    SubtitleOperationBusy,
     media_operation_lock,
+    subtitle_operation_lock,
 )
 from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
 
@@ -60,6 +63,16 @@ def test_media_lock_releases_after_exception_and_blocks_other_session(test_db):
         raise ValueError("injected")
     with other_session_lock(MEDIA_LOCK, 123):
         pass
+
+
+def test_subtitle_lock_is_independent_and_has_bounded_wait(test_db):
+    with other_session_lock(SUBTITLE_LOCK, 123):
+        with pytest.raises(SubtitleOperationBusy), subtitle_operation_lock(123, timeout_seconds=0):
+            pytest.fail("must not enter")
+        with media_operation_lock(MEDIA_LOCK, 123):
+            pass
+    with subtitle_operation_lock(123) as check:
+        check()
 
 
 def test_connection_loss_invalidates_owner_and_releases_lock(test_db):

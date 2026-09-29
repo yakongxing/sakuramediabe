@@ -158,7 +158,7 @@ class MediaThumbnailTaskService:
         return max(1, int(expected_count * 0.85))
 
     @classmethod
-    def _generate_artifacts(cls, media: Media, progress_callback=None) -> int:
+    def _generate_artifacts(cls, media: Media, progress_callback=None, *, check_connection=None) -> int:
         handle = media_handle_for(media)
         with tempfile.TemporaryDirectory(prefix=f"media-thumbnails-{media.id}-") as workspace_name:
             workspace = Path(workspace_name)
@@ -218,7 +218,11 @@ class MediaThumbnailTaskService:
                     f"expected={expected_count} minimum={minimum_count} "
                     f"actual={len(valid_artifacts)}"
                 )
-            return ThumbnailArtifactService.persist(media, valid_artifacts)
+            if check_connection is None:
+                return ThumbnailArtifactService.persist(media, valid_artifacts)
+            return ThumbnailArtifactService.persist(
+                media, valid_artifacts, check_connection=check_connection,
+            )
 
     @staticmethod
     def _error_code(exc: Exception) -> str:
@@ -347,8 +351,10 @@ class MediaThumbnailTaskService:
     def _generate_one(cls, media_id: int, progress_callback=None) -> ThumbnailGenerationOutcome:
         ensure_database_ready()
         try:
-            with media_operation_lock(MEDIA_LOCK, media_id):
-                return cls._generate_one_locked(media_id, progress_callback)
+            with media_operation_lock(MEDIA_LOCK, media_id) as check_connection:
+                return cls._generate_one_locked(
+                    media_id, progress_callback, check_connection=check_connection,
+                )
         except MediaOperationBusy:
             return ThumbnailGenerationOutcome("skipped")
 
@@ -384,7 +390,7 @@ class MediaThumbnailTaskService:
         """
         ensure_database_ready()
         try:
-            with media_operation_lock(MEDIA_LOCK, media_id):
+            with media_operation_lock(MEDIA_LOCK, media_id) as check_connection:
                 media = Media.get_or_none(Media.id == media_id)
                 if media is None:
                     return ThumbnailGenerationOutcome("not_found")
@@ -395,32 +401,41 @@ class MediaThumbnailTaskService:
                     return ThumbnailGenerationOutcome("already_exists")
                 cls._reset_for_request(media)
                 if progress_callback is None:
-                    return cls._generate_loaded_media(media)
+                    return cls._generate_loaded_media(media, check_connection=check_connection)
                 with ThumbnailTaskProgress(_TextProgressSink(progress_callback)) as progress:
                     progress.emit(text="正在准备视频")
                     return cls._generate_loaded_media(
                         media,
                         lambda action: progress.emit(text=action, force=False),
+                        check_connection=check_connection,
                     )
         except MediaOperationBusy:
             return ThumbnailGenerationOutcome("busy")
 
     @classmethod
-    def _generate_one_locked(cls, media_id: int, progress_callback=None) -> ThumbnailGenerationOutcome:
+    def _generate_one_locked(
+        cls, media_id: int, progress_callback=None, *, check_connection=None,
+    ) -> ThumbnailGenerationOutcome:
         media = Media.get_or_none(Media.id == media_id)
         if media is None or not media.valid:
             return ThumbnailGenerationOutcome("skipped")
         if cls._has_thumbnails(media):
             cls._mark_succeeded(media)
             return ThumbnailGenerationOutcome("skipped")
-        return cls._generate_loaded_media(media, progress_callback)
+        return cls._generate_loaded_media(
+            media, progress_callback, check_connection=check_connection,
+        )
 
     @classmethod
-    def _generate_loaded_media(cls, media: Media, progress_callback=None) -> ThumbnailGenerationOutcome:
+    def _generate_loaded_media(
+        cls, media: Media, progress_callback=None, *, check_connection=None,
+    ) -> ThumbnailGenerationOutcome:
         """调用方已持有媒体锁并确认媒体有效且尚无缩略图。"""
         media_id = media.id
         try:
-            generated_count = cls._generate_artifacts(media, progress_callback)
+            generated_count = cls._generate_artifacts(
+                media, progress_callback, check_connection=check_connection,
+            )
         except ThumbnailBackendUnavailable as exc:
             logger.warning(
                 "Media thumbnail backend unavailable media_id={} code={} detail={}",
@@ -430,6 +445,8 @@ class MediaThumbnailTaskService:
             )
             return ThumbnailGenerationOutcome("backend_unavailable", error_code=exc.error_code)
         except ProviderUnavailableError:
+            if check_connection is not None:
+                check_connection()
             deferred = ThumbnailDeferred(
                 "媒体提供方暂不可用",
                 error_code="provider_not_installed",
@@ -442,12 +459,17 @@ class MediaThumbnailTaskService:
                 error_code=deferred.error_code,
             )
         except ThumbnailDeferred as exc:
+            if check_connection is not None:
+                check_connection()
             terminal = cls._mark_deferred(media, exc)
             return ThumbnailGenerationOutcome(
                 "terminal_failed" if terminal else "deferred",
                 error_code=cls._error_code(exc),
             )
         except Exception as exc:
+            # An old worker that lost its advisory-lock session cannot write state.
+            if check_connection is not None:
+                check_connection()
             if cls._has_thumbnails(media):
                 cls._mark_succeeded(media)
                 return ThumbnailGenerationOutcome("succeeded")
@@ -463,6 +485,8 @@ class MediaThumbnailTaskService:
                 "terminal_failed" if terminal else "retryable_failed",
                 error_code=cls._error_code(exc),
             )
+        if check_connection is not None:
+            check_connection()
         cls._mark_succeeded(media)
         return ThumbnailGenerationOutcome("succeeded", generated_count=generated_count)
 
