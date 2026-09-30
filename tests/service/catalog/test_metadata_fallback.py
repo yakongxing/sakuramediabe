@@ -1,4 +1,5 @@
 import json
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
@@ -11,6 +12,11 @@ import pytest
 from PIL import Image as PillowImage
 from pydantic import ValidationError
 
+from src.common.image_store import read_image_bytes
+from src.common.media_paths import (
+    movie_asset_relative_dir,
+    normalize_asset_dir_name,
+)
 from src.common.runtime_time import utc_now_for_db
 from src.config.config import Plugins, settings
 from src.metadata._providers.javdb import JavdbProvider
@@ -53,6 +59,14 @@ from src.service.catalog.movie_metadata_refresh_service import (
 from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
 from src.service.catalog.movie_service import MovieService
 from src.storage import reset_storage_backends
+
+
+def asset_bytes(origin: str) -> bytes | None:
+    """按生产读取入口取图片字节（包优先）；不存在返回 None。"""
+    try:
+        return read_image_bytes(origin)
+    except FileNotFoundError:
+        return None
 
 
 def remote_detail(**changes):
@@ -291,8 +305,8 @@ def test_import_zero_statistics_images_and_repeat_lookup(metadata_env, monkeypat
         for field in MovieInteractionSyncService.INTERACTION_FIELDS
     )
     assert movie.javdb_next_check_at > utc_now_for_db()
-    cover = metadata_env.root / "assets" / movie.cover_image.origin
-    assert cover.is_file()
+    assert asset_bytes(movie.cover_image.origin)
+    assert not (metadata_env.root / "assets" / movie.cover_image.origin).exists()
     assert not list((metadata_env.root / "plugins").rglob("cover.png"))
     assert Tag.select().count() == 1
     resource = MovieService.get_movie_detail(movie.movie_number)
@@ -381,7 +395,7 @@ def test_backfill_replaces_lists_and_images_after_preparation(
     metadata_env, monkeypatch
 ):
     movie = import_plugin(metadata_env, monkeypatch, actors=[])
-    old_cover = metadata_env.root / "assets" / movie.cover_image.origin
+    old_cover_origin = movie.cover_image.origin
     detail = remote_detail(
         cover_image="https://example.com/new.png",
         tags=[],
@@ -392,9 +406,28 @@ def test_backfill_replaces_lists_and_images_after_preparation(
     result = metadata_env.service.backfill_plugin_movie(movie, detail)
     assert result.cover_image.origin == detail.cover_image
     assert result.thin_cover_image_id == result.cover_image_id
-    assert not old_cover.exists()
+    assert asset_bytes(old_cover_origin) is None
     assert MovieTag.select().where(MovieTag.movie == movie).count() == 0
     assert MovieActor.get(MovieActor.movie == movie).actor.javdb_id == "new-actor"
+
+
+def test_strict_refresh_replaces_packed_cover_with_external_reference(metadata_env, monkeypatch):
+    movie = import_plugin(metadata_env, monkeypatch)
+    old_cover_origin = movie.cover_image.origin
+    detail = remote_detail(cover_image="https://example.com/new.png")
+
+    result = metadata_env.service.refresh_movie_metadata_strict(movie, detail)
+
+    new_cover_origin = result.cover_image.origin
+    assert new_cover_origin == detail.cover_image
+    assert new_cover_origin != old_cover_origin
+    assert asset_bytes(old_cover_origin) is None
+    movie_dir = (
+        metadata_env.root
+        / "assets"
+        / movie_asset_relative_dir(normalize_asset_dir_name("TEST-001"))
+    )
+    assert not (movie_dir / "assets.zip").exists()
 
 
 @pytest.mark.parametrize("method", ["backfill_plugin_movie", "refresh_movie_metadata_strict"])
@@ -692,18 +725,20 @@ def test_concurrent_imports_keep_one_movie_and_its_images(
     assert results[0][0].id == results[1][0].id
     assert sum(created for _, created in results) == 1
     assert Movie.select().count() == 1
-    files = {
-        p.relative_to(metadata_env.root / "assets").as_posix()
-        for p in (metadata_env.root / "assets").rglob("*")
-        if p.is_file()
-    }
     from src.model import Image
 
-    assert files == {image.origin for image in Image.select()}
-    assert all(
-        not image.origin.startswith(("http://", "https://"))
-        for image in Image.select()
+    origins = {image.origin for image in Image.select()}
+    assert origins
+    # 打包后：所有活跃图片都能从生产入口读到，影片目录只剩唯一的 assets.zip。
+    assert all(asset_bytes(origin) is not None for origin in origins)
+    movie_dir = (
+        metadata_env.root
+        / "assets"
+        / movie_asset_relative_dir(normalize_asset_dir_name("TEST-001"))
     )
+    assert [p.name for p in movie_dir.iterdir() if p.is_file()] == ["assets.zip"]
+    with zipfile.ZipFile(movie_dir / "assets.zip") as archive:
+        assert len(archive.namelist()) == len(origins)
     assert not list((metadata_env.root / "plugins").rglob("cover.png"))
 
 
@@ -780,3 +815,25 @@ def test_plugin_import_keeps_numeric_movies_separate(metadata_env, monkeypatch, 
     assert created and movie.id != existing.id
     assert movie.movie_number == number
     assert {row.movie_number for row in Movie.select()} == {number, other}
+
+
+def test_match_actors_ignores_merged_tombstones(test_db):
+    from src.model import get_database
+    from src.plugins.extensions.metadata import PluginMetadataActor
+
+    canonical = Actor.create(javdb_id="candidate-canonical", name="Canon")
+    tombstone = Actor.create(javdb_id="candidate-ghost", name="Ghost")
+    get_database().execute_sql(
+        "UPDATE actor SET merged_into_id = %s WHERE id = %s",
+        [canonical.id, tombstone.id],
+    )
+    provider = SimpleNamespace(search_actors=Mock(return_value=[]))
+
+    matched = MetadataSourceService.match_actors(
+        [PluginMetadataActor(name="Ghost")],
+        provider,
+        CatalogImportService(),
+    )
+
+    assert matched == []
+    provider.search_actors.assert_called_once_with("Ghost")

@@ -26,6 +26,7 @@ from src.common.media_paths import media_image_root_path
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
     build_ordered_expressions,
+    playable_exists_expression,
     require_by_id,
     resolve_sort_expression,
 )
@@ -101,6 +102,24 @@ class ActorService:
         )
 
     @staticmethod
+    def _playable_movie_count_expression():
+        """按 movie_actor 关联实时计算演员可播放影片数量。"""
+        return (
+            MovieActor.select(fn.COUNT(MovieActor.id))
+            .join(Movie, on=(MovieActor.movie == Movie.id))
+            .where(MovieActor.actor == Actor.id, playable_exists_expression())
+        )
+
+    @staticmethod
+    def _has_playable_movie_expression():
+        """演员是否存在可播放影片。"""
+        return fn.EXISTS(
+            MovieActor.select(MovieActor.id)
+            .join(Movie, on=(MovieActor.movie == Movie.id))
+            .where(MovieActor.actor == Actor.id, playable_exists_expression())
+        )
+
+    @staticmethod
     def _normalized_cup_expression():
         return fn.NULLIF(fn.UPPER(fn.BTRIM(Actor.cup)), "")
 
@@ -114,6 +133,7 @@ class ActorService:
             "subscribed_at": Actor.subscribed_at,
             "name": Actor.name,
             "movie_count": cls._movie_count_expression(),
+            "playable_movie_count": cls._playable_movie_count_expression(),
             "age": Actor.birthday,
             "height_cm": Actor.height_cm,
             "bust_cm": Actor.bust_cm,
@@ -239,6 +259,7 @@ class ActorService:
         height_min: int | None = None,
         height_max: int | None = None,
         cups: Sequence[str] | None = None,
+        has_playable_movies: bool = False,
         search_terms: Sequence[str] = (),
     ):
         """演员列表筛选统一收口到这里，保证 count 和 items 逻辑一致。"""
@@ -262,6 +283,7 @@ class ActorService:
             )
 
         query = cls._actor_query()
+        query = query.where(Actor.merged_into.is_null())
         scope_conditions = cls._actor_scope_conditions(gender, subscription_status)
         if scope_conditions:
             query = query.where(*scope_conditions)
@@ -276,6 +298,8 @@ class ActorService:
             query = query.where(Actor.height_cm <= height_max)
         if cups:
             query = query.where(cls._normalized_cup_expression().in_(cups))
+        if has_playable_movies:
+            query = query.where(cls._has_playable_movie_expression())
         if search_terms:
             query = query.where(cls._actor_search_conditions(search_terms))
 
@@ -283,13 +307,19 @@ class ActorService:
 
     @classmethod
     def _require_actor(cls, actor_id: int) -> Actor:
-        return require_by_id(
+        actor = require_by_id(
             Actor,
             actor_id,
             "actor",
             error_message="演员不存在",
             query=cls._actor_query(),
         )
+        if actor.merged_into_id is None:
+            return actor
+        canonical = (
+            cls._actor_query().where(Actor.id == actor.merged_into_id).get_or_none()
+        )
+        return canonical or actor
 
     @staticmethod
     def _year_expression():
@@ -305,6 +335,7 @@ class ActorService:
         height_min: int | None = None,
         height_max: int | None = None,
         cups: Sequence[str] | None = None,
+        has_playable_movies: bool = False,
         sort: str | None = None,
         query: str | None = None,
         page: int = 1,
@@ -320,6 +351,7 @@ class ActorService:
             "height_min": height_min,
             "height_max": height_max,
             "cups": cups,
+            "has_playable_movies": has_playable_movies,
             "search_terms": search_terms,
         }
         total = cls._filtered_actors(**filter_kwargs).count()
@@ -344,6 +376,7 @@ class ActorService:
     ) -> ActorFilterOptionsResource:
         today = utc_now_for_db().date()
         scope_conditions = cls._actor_scope_conditions(gender, subscription_status)
+        scope_conditions.append(Actor.merged_into.is_null())
         aggregate_query = (
             Actor.select(
                 fn.COUNT(Actor.id).alias("actor_count"),
@@ -529,6 +562,16 @@ class ActorService:
                     }
                 )
 
+        # JavDB 的不同演员条目可能都已合并到同一保留记录，这里按 canonical id 再去重一次。
+        deduplicated_actors: list[ActorResource] = []
+        seen_actor_ids: set[int] = set()
+        for actor in imported_actors:
+            if actor.id in seen_actor_ids:
+                continue
+            seen_actor_ids.add(actor.id)
+            deduplicated_actors.append(actor)
+        imported_actors = deduplicated_actors
+
         stats = {
             "total": total,
             "created_count": created_count,
@@ -571,7 +614,7 @@ class ActorService:
         actor_id: int,
         payload: ActorUpdateRequest,
     ) -> ActorDetailResource:
-        cls._require_actor(actor_id)
+        actor = cls._require_actor(actor_id)
         changes = payload.model_dump(
             exclude_unset=True,
         )
@@ -603,7 +646,7 @@ class ActorService:
         if scalar_fields:
             assignments.append("mutation_revision = mutation_revision + 1")
         assignments.append("updated_at = now()")
-        params.append(actor_id)
+        params.append(actor.id)
         cursor = get_database().execute_sql(
             f"""
             UPDATE actor SET {", ".join(assignments)}
@@ -613,7 +656,7 @@ class ActorService:
         )
         if cursor.rowcount != 1:
             raise ApiError(404, "actor_not_found", "演员不存在")
-        return cls.get_actor_detail(actor_id)
+        return cls.get_actor_detail(actor.id)
 
     @classmethod
     def upload_profile_image(
@@ -663,12 +706,7 @@ class ActorService:
             final_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path.replace(final_path)
             with get_database().atomic():
-                image = Image.create(
-                    origin=relative_path.as_posix(),
-                    small=relative_path.as_posix(),
-                    medium=relative_path.as_posix(),
-                    large=relative_path.as_posix(),
-                )
+                image = Image.create(origin=relative_path.as_posix())
                 cursor = get_database().execute_sql(
                     """
                     UPDATE actor
@@ -676,7 +714,7 @@ class ActorService:
                         updated_at = now()
                     WHERE id = %s
                     """,
-                    [image.id, actor_id],
+                    [image.id, actor.id],
                 )
                 if cursor.rowcount != 1:
                     raise ApiError(404, "actor_not_found", "演员不存在")
@@ -698,7 +736,7 @@ class ActorService:
         if old_override is not None:
             obsolete_paths = ImageCleanupService.delete_image_record_if_unused(old_override)
             ImageCleanupService.delete_obsolete_image_files(obsolete_paths)
-        return cls.get_actor_detail(actor_id)
+        return cls.get_actor_detail(actor.id)
 
     @classmethod
     def clear_profile_image(
@@ -708,7 +746,7 @@ class ActorService:
         actor = cls._require_actor(actor_id)
         old_override = actor.profile_image_override if actor.profile_image_override_id else None
         if old_override is None:
-            return cls.get_actor_detail(actor_id)
+            return cls.get_actor_detail(actor.id)
         cursor = get_database().execute_sql(
             """
             UPDATE actor
@@ -716,17 +754,17 @@ class ActorService:
                 updated_at = now()
             WHERE id = %s
             """,
-            [actor_id],
+            [actor.id],
         )
         if cursor.rowcount != 1:
             raise ApiError(404, "actor_not_found", "演员不存在")
         obsolete_paths = ImageCleanupService.delete_image_record_if_unused(old_override)
         ImageCleanupService.delete_obsolete_image_files(obsolete_paths)
-        return cls.get_actor_detail(actor_id)
+        return cls.get_actor_detail(actor.id)
 
     @classmethod
     def set_subscription(cls, actor_id: int, subscribed: bool) -> None:
-        actor = require_by_id(Actor, actor_id, "actor", error_message="演员不存在")
+        actor = cls._require_actor(actor_id)
 
         if subscribed:
             actor.is_subscribed = True
@@ -739,24 +777,24 @@ class ActorService:
 
     @classmethod
     def get_actor_movie_ids(cls, actor_id: int) -> list[int]:
-        cls._require_actor(actor_id)
+        actor = cls._require_actor(actor_id)
         query = (
             Movie.select(Movie.id)
             .join(MovieActor, JOIN.INNER, on=(MovieActor.movie == Movie.id))
-            .where(MovieActor.actor == actor_id)
+            .where(MovieActor.actor == actor.id)
             .order_by(Movie.id)
         )
         return [movie.id for movie in query]
 
     @classmethod
     def get_actor_tags(cls, actor_id: int) -> list[TagResource]:
-        cls._require_actor(actor_id)
+        actor = cls._require_actor(actor_id)
         query = (
             Tag.select(Tag)
             .join(MovieTag)
             .join(Movie, on=(MovieTag.movie == Movie.id))
             .join(MovieActor, on=(MovieActor.movie == Movie.id))
-            .where(MovieActor.actor == actor_id)
+            .where(MovieActor.actor == actor.id)
             .distinct()
             .order_by(Tag.name)
         )
@@ -764,7 +802,7 @@ class ActorService:
 
     @classmethod
     def get_actor_years(cls, actor_id: int) -> list[YearResource]:
-        cls._require_actor(actor_id)
+        actor = cls._require_actor(actor_id)
         year_expression = cls._year_expression()
         query = (
             Movie.select(
@@ -773,7 +811,7 @@ class ActorService:
             )
             .join(MovieActor, JOIN.INNER, on=(MovieActor.movie == Movie.id))
             .where(
-                MovieActor.actor == actor_id,
+                MovieActor.actor == actor.id,
                 Movie.release_date.is_null(False),
             )
             .group_by(year_expression)

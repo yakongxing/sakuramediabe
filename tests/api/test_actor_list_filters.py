@@ -2,7 +2,7 @@ from datetime import date, datetime
 
 import pytest
 
-from src.model import Actor
+from src.model import Actor, Media, MediaLibrary, Movie, MovieActor
 
 
 def _headers(client, account_user):
@@ -134,6 +134,34 @@ def test_list_actors_filters_profiles_and_sorts_nullable_values(
     ]
 
 
+def test_list_actors_returns_profile_fields_for_hover(
+    client, account_user, actors, monkeypatch
+):
+    young, _, _ = actors
+    monkeypatch.setattr(
+        "src.model.catalog.actors.utc_now_for_db",
+        lambda: datetime(2026, 9, 10),
+    )
+
+    response = client.get(
+        "/actors",
+        headers=_headers(client, account_user),
+        params={"query": "年轻"},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["id"] == young.id
+    assert item["birthday"] == "2004-09-11"
+    assert item["age"] == 21
+    assert item["height_cm"] == 160
+    assert item["bust_cm"] == 82
+    assert item["waist_cm"] == 60
+    assert item["hips_cm"] == 90
+    assert item["cup"] == "B"
+    assert item["movie_count"] == 0
+
+
 def test_actor_filter_options_follow_scope_and_report_populated_values(
     client, account_user, actors
 ):
@@ -179,3 +207,98 @@ def test_actor_list_rejects_reversed_ranges(client, account_user, actors):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_actor_filter"
+
+
+def test_actor_list_filters_playable_movies_and_sorts_by_count(
+    client, account_user, test_db
+):
+    library = MediaLibrary.create(name="Playable", provider_key="not-installed")
+    unsubscribed_actor = Actor.create(
+        javdb_id="unsubscribed", name="未订阅可播放", gender=1, is_subscribed=False
+    )
+    invalid_actor = Actor.create(
+        javdb_id="invalid", name="无有效媒体", gender=1, is_subscribed=True
+    )
+    empty_actor = Actor.create(
+        javdb_id="empty", name="无作品", gender=1, is_subscribed=True
+    )
+    playable_actor = Actor.create(
+        javdb_id="playable", name="可播放", gender=1, is_subscribed=True
+    )
+
+    for index in range(2):
+        movie = Movie.create(
+            movie_number=f"PLAY-UNSUB-{index}",
+            javdb_id=f"play-unsub-{index}",
+            title="Playable",
+        )
+        MovieActor.create(movie=movie, actor=unsubscribed_actor)
+        Media.create(movie=movie, library=library, file_name=f"unsub-{index}.mp4")
+
+    playable_movie = Movie.create(
+        movie_number="PLAY-PLAYABLE", javdb_id="play-playable", title="Playable"
+    )
+    MovieActor.create(movie=playable_movie, actor=playable_actor)
+    for index in range(2):
+        Media.create(
+            movie=playable_movie, library=library, file_name=f"playable-{index}.mp4"
+        )
+
+    invalid_movie = Movie.create(
+        movie_number="PLAY-INVALID", javdb_id="play-invalid", title="Invalid"
+    )
+    MovieActor.create(movie=invalid_movie, actor=invalid_actor)
+    Media.create(
+        movie=invalid_movie, library=library, file_name="invalid.mp4", valid=False
+    )
+
+    headers = _headers(client, account_user)
+
+    filtered = client.get(
+        "/actors",
+        headers=headers,
+        params={"subscription_status": "subscribed", "has_playable_movies": "true"},
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["total"] == 1
+    assert [item["id"] for item in filtered.json()["items"]] == [playable_actor.id]
+
+    combined = client.get(
+        "/actors",
+        headers=headers,
+        params={
+            "subscription_status": "all",
+            "has_playable_movies": "true",
+            "query": "可播放",
+        },
+    )
+    assert combined.status_code == 200
+    assert sorted(item["id"] for item in combined.json()["items"]) == sorted(
+        [playable_actor.id, unsubscribed_actor.id]
+    )
+
+    descending = client.get(
+        "/actors",
+        headers=headers,
+        params={"subscription_status": "all", "sort": "playable_movie_count:desc"},
+    )
+    assert descending.status_code == 200
+    assert [item["id"] for item in descending.json()["items"]] == [
+        unsubscribed_actor.id,
+        playable_actor.id,
+        empty_actor.id,
+        invalid_actor.id,
+    ]
+
+    ascending = client.get(
+        "/actors",
+        headers=headers,
+        params={"subscription_status": "all", "sort": "playable_movie_count:asc"},
+    )
+    assert ascending.status_code == 200
+    assert [item["id"] for item in ascending.json()["items"]] == [
+        invalid_actor.id,
+        empty_actor.id,
+        playable_actor.id,
+        unsubscribed_actor.id,
+    ]

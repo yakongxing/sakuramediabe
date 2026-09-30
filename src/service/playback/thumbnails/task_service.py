@@ -228,7 +228,7 @@ class MediaThumbnailTaskService:
                     f"expected={expected_count} minimum={minimum_count} "
                     f"actual={len(valid_artifacts)}"
                 )
-            batch = store.prepare(valid_artifacts, workspace)
+            batch = ThumbnailArtifactService.prepare_batch(store, valid_artifacts, workspace)
             return ThumbnailArtifactService.persist_batch(
                 media, batch, check_connection=check_connection, progress_callback=progress_callback,
             )

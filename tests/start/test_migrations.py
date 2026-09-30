@@ -22,9 +22,11 @@ from src.start.commands import main
 from src.start.migrations.runner import (
     ACTOR_GENDER_BACKFILL_MIGRATION_NAME,
     ACTOR_LOCAL_PROFILE_MIGRATION_NAME,
+    ACTOR_MERGED_INTO_MIGRATION_NAME,
     ACTOR_METADATA_MIGRATION_NAME,
     CONSOLIDATED_MIGRATION_NAME,
     DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME,
+    DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME,
     DROP_MOVIE_EXTRA_MIGRATION_NAME,
     HOT_REVIEW_ITEM_REMOVAL_MIGRATION_NAME,
     IMAGE_REFERENCES_MIGRATION_NAME,
@@ -38,6 +40,7 @@ from src.start.migrations.runner import (
     MOVIE_COLLECTION_OWNER_MIGRATION_NAME,
     PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
     PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
+    REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME,
     MigrationExecution,
     MigrationRunSummary,
     _list_migration_modules,
@@ -120,6 +123,9 @@ def test_current_migrations_are_discoverable_in_order():
         PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
         MEDIA_POINT_PRESERVATION_MIGRATION_NAME,
         DROP_MOVIE_EXTRA_MIGRATION_NAME,
+        REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME,
+        ACTOR_MERGED_INTO_MIGRATION_NAME,
+        DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME,
     ]
 
 
@@ -230,6 +236,9 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         MigrationExecution(name=PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME, applied=True),
         MigrationExecution(name=MEDIA_POINT_PRESERVATION_MIGRATION_NAME, applied=True),
         MigrationExecution(name=DROP_MOVIE_EXTRA_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=ACTOR_MERGED_INTO_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME, applied=True),
     ]
     assert _schema_migration_names(clean_db) == [
         CONSOLIDATED_MIGRATION_NAME,
@@ -250,6 +259,9 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
         MEDIA_POINT_PRESERVATION_MIGRATION_NAME,
         DROP_MOVIE_EXTRA_MIGRATION_NAME,
+        REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME,
+        ACTOR_MERGED_INTO_MIGRATION_NAME,
+        DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME,
     ]
 
 
@@ -677,6 +689,21 @@ def test_drop_movie_extra_migration_removes_column(clean_db):
     assert "extra" not in _column_names(clean_db, "movie")
 
 
+def test_drop_image_derived_sizes_migration_removes_columns(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    for column_name in ("small", "medium", "large"):
+        clean_db.execute_sql(
+            f'ALTER TABLE image ADD COLUMN IF NOT EXISTS "{column_name}" VARCHAR(255) NOT NULL DEFAULT \'\''
+        )
+
+    _load_migration_module(Path(f"{DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME}.py")).migrate(
+        clean_db
+    )
+
+    assert not {"small", "medium", "large"} & _column_names(clean_db, "image")
+
+
 def test_migrate_command_runs_the_consolidated_migration(monkeypatch):
     events = []
     optional_service_calls = []
@@ -752,7 +779,7 @@ def test_media_point_migration_preserves_old_points_and_collection_membership(cl
         if kind == 'jav' else {'video_item': VideoItem.create(title='Video')}
     )
     media = Media.create(library=library, file_name='source.mp4', **owner)
-    image = Image.create(origin='saved.webp', small='saved.webp', medium='saved.webp', large='saved.webp')
+    image = Image.create(origin='saved.webp')
     thumbnail = MediaThumbnail.create(media=media, image=image, offset=42)
     # 用真正的旧字段和级联约束构造升级前的数据。
     _drop_columns(clean_db, 'media_point', ('image_id', 'movie_number', 'video_item_id'))
@@ -792,3 +819,38 @@ def test_media_point_migration_preserves_old_points_and_collection_membership(cl
     # 当前模型建表后的重复迁移也不能清空已经独立的时刻快照。
     migration.migrate(clean_db)
     assert MediaPoint.get_by_id(point_id).image_id == image.id
+
+
+def test_remove_orphan_video_items_migration_deletes_empty_videos_and_membership(clean_db):
+    from src.model import (
+        Image,
+        MediaPoint,
+        VideoCollection,
+        VideoCollectionItem,
+        VideoItem,
+    )
+
+    clean_db.create_tables(TEST_MODELS)
+    library = MediaLibrary.create(name='orphan-cleanup', provider_key='demo', provider_config={})
+    orphan = VideoItem.create(title='orphan video')
+    kept = VideoItem.create(title='kept video')
+    kept_media = Media.create(video_item=kept, library=library, file_name='kept.mp4')
+    collection = VideoCollection.create(name='mixed collection')
+    orphan_link = VideoCollectionItem.create(collection=collection, video_item=orphan, position=0)
+    kept_link = VideoCollectionItem.create(collection=collection, video_item=kept, position=1)
+    image = Image.create(origin='orphan.webp')
+    point = MediaPoint.create(image=image, video_item_id=orphan.id, offset_seconds=10)
+
+    migration = _load_migration_module(Path(f'{REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME}.py'))
+    migration.migrate(clean_db)
+
+    assert VideoItem.get_or_none(VideoItem.id == orphan.id) is None
+    assert not VideoCollectionItem.select().where(VideoCollectionItem.id == orphan_link.id).exists()
+    assert VideoItem.get_or_none(VideoItem.id == kept.id) is not None
+    assert Media.get_or_none(Media.id == kept_media.id) is not None
+    assert VideoCollectionItem.get_by_id(kept_link.id).video_item_id == kept.id
+    # 时刻是无外键的展示快照，不随条目删除。
+    assert MediaPoint.get_by_id(point.id).video_item_id == orphan.id
+    # 重复执行幂等：有效条目与成员不受影响。
+    migration.migrate(clean_db)
+    assert VideoCollectionItem.get_by_id(kept_link.id).video_item_id == kept.id

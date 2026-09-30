@@ -439,6 +439,17 @@ def enabled_optional_services(monkeypatch):
     monkeypatch.setattr(settings.image_search, "enabled", True)
 
 
+@pytest.fixture(autouse=True)
+def isolated_asset_storage_backends():
+    from src.storage.factory import reset_storage_backends
+
+    reset_storage_backends()
+    try:
+        yield
+    finally:
+        reset_storage_backends()
+
+
 @pytest.fixture()
 def isolated_local_storage(tmp_path, monkeypatch):
     """隔离会缓存路径的资产/切片后端，避免临时目录在测试之间串用。"""

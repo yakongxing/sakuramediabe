@@ -54,6 +54,10 @@ class ThumbnailBatch:
         self._checkpoint_lock = RLock()
 
     @property
+    def packed(self) -> bool:
+        return self.manifest.get("format", "loose") == "zip"
+
+    @property
     def entries(self):
         return self.manifest["images"]
 
@@ -156,7 +160,9 @@ class ThumbnailBatchStore:
             return None
         try:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-            _require(manifest["version"] == 1)
+            _require(manifest["version"] in (1, 2))
+            _require(manifest.get("format", "loose") in {"loose", "zip"})
+            _require(manifest["version"] != 1 or manifest.get("format", "loose") == "loose")
             _require(manifest["identity"] == self.identity)
             _require(manifest["media_id"] == self.media_id)
             _require(re.fullmatch(r"[0-9a-f]{32}", manifest["generation"]))
@@ -176,7 +182,7 @@ class ThumbnailBatchStore:
         except (ValueError, KeyError, TypeError) as exc:
             raise ValueError("thumbnail_batch_manifest_invalid") from exc
 
-    def prepare(self, artifacts, workspace: Path | None = None) -> ThumbnailBatch:
+    def prepare(self, artifacts, workspace: Path | None = None, *, packed: bool = False) -> ThumbnailBatch:
         if not artifacts:
             raise ValueError("thumbnail_generation_empty")
         workspace = workspace or self.new_workspace()
@@ -206,7 +212,7 @@ class ThumbnailBatchStore:
             entries.append({"offset": offset, "size": size, "sha256": digest, "state": "pending"})
         _sync_directory(images)
         _sync_directory(workspace)
-        manifest = {"version": 1, "identity": self.identity, "media_id": self.media_id,
+        manifest = {"version": 2, "format": "zip" if packed else "loose", "identity": self.identity, "media_id": self.media_id,
                     "generation": workspace.name, "images": sorted(entries, key=lambda entry: entry["offset"])}
         self.save(manifest)
         return ThumbnailBatch(self, manifest)

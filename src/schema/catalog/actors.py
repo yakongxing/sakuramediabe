@@ -26,9 +26,6 @@ class ActorListSubscriptionStatus(str, Enum):
 class ImageResource(SchemaModel):
     id: int
     origin: str
-    small: str
-    medium: str
-    large: str
 
     @staticmethod
     def _sign_image_path(value: str) -> str:
@@ -40,12 +37,10 @@ class ImageResource(SchemaModel):
             raise ValueError("malformed URL-like image reference")
         return build_signed_image_url(value)
 
-    @field_validator("origin", "small", "medium", "large")
+    @field_validator("origin")
     @classmethod
     def sign_image_path(cls, value: str) -> str:
-        if not value:
-            return value
-        return cls._sign_image_path(value)
+        return cls._sign_image_path(value) if value else value
 
 
 class ActorResource(SchemaModel):
@@ -58,6 +53,13 @@ class ActorResource(SchemaModel):
     is_subscribed: bool
     subscribed_at: datetime | None = None
     movie_count: int = 0
+    age: int | None = None
+    birthday: date | None = None
+    height_cm: int | None = None
+    bust_cm: int | None = None
+    waist_cm: int | None = None
+    hips_cm: int | None = None
+    cup: str | None = None
 
     @classmethod
     def from_actor(cls, actor):
@@ -66,13 +68,6 @@ class ActorResource(SchemaModel):
 
 class ActorDetailResource(ActorResource):
     gender: int = 0
-    birthday: date | None = None
-    age: int | None = None
-    height_cm: int | None = None
-    bust_cm: int | None = None
-    waist_cm: int | None = None
-    hips_cm: int | None = None
-    cup: str | None = None
     birthplace: str | None = None
     blood_type: str | None = None
     display_name_override: str | None = None
@@ -201,3 +196,14 @@ class ActorJavdbSearchRequest(SchemaModel):
         if not normalized:
             raise ValueError("actor_name cannot be blank")
         return normalized
+
+
+class ActorMergeRequest(SchemaModel):
+    source_actor_ids: list[int] = Field(min_length=1)
+
+    @field_validator("source_actor_ids")
+    @classmethod
+    def validate_source_actor_ids(cls, value: list[int]) -> list[int]:
+        if any(actor_id <= 0 for actor_id in value):
+            raise ValueError("source_actor_ids 必须是正整数")
+        return value

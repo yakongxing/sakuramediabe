@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from src.common.image_references import is_nonlocal_image_reference
+from src.common.image_store import read_image_bytes
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
     emit_progress,
@@ -172,8 +173,9 @@ class MomentRecommendationService:
             )
             return None
         try:
-            with asset_storage().open(seed.thumbnail.image.origin) as stream:
-                return stream.read()
+            return read_image_bytes(seed.thumbnail.image.origin, storage=asset_storage())
+        except FileNotFoundError:
+            return None
         except Exception as exc:
             logger.warning("Moment recommendation seed image skipped point_id={} detail={}", seed.point.id, exc)
             return None

@@ -1,13 +1,17 @@
 import hashlib
+import os
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 
 from loguru import logger
 from PIL import Image as PILImage
 
 from src.common.image_references import is_nonlocal_image_reference
+from src.common.image_store import read_image_bytes, write_pack
 from src.common.media_paths import (
     MOVIE_MEDIA_SUBDIR,
+    media_image_root_path,
     movie_asset_relative_dir,
     normalize_asset_dir_name,
 )
@@ -19,6 +23,7 @@ from src.schema.playback.media import MediaThumbnailResource
 from src.service.playback.thumbnails.batches import ThumbnailBatch, ThumbnailBatchStore
 from src.storage import asset_storage
 from src.storage.batch import publish_batch
+from src.storage.local import LocalStorageBackend
 from src.storage.types import StorageConflict, StorageNotFound
 
 
@@ -33,6 +38,19 @@ class ThumbnailArtifactService:
             else PurePosixPath("videos") / str(media.video_item_id)
         )
         return (namespace / MOVIE_MEDIA_SUBDIR / str(media.id) / "thumbnails").as_posix()
+
+    @classmethod
+    def thumbnail_directory(cls, media: Media) -> Path:
+        return media_image_root_path() / cls.thumbnail_prefix(media)
+
+    @classmethod
+    def thumbnail_pack_file(cls, media: Media) -> Path:
+        return cls.thumbnail_directory(media).with_suffix(".zip")
+
+    @staticmethod
+    def prepare_batch(store, artifacts, workspace=None) -> ThumbnailBatch:
+        packed = settings.storage.backend == "local" and isinstance(asset_storage(), LocalStorageBackend)
+        return store.prepare(artifacts, workspace, packed=packed)
 
     @staticmethod
     def _workspace_file(workspace: Path, relative_path: str) -> Path:
@@ -82,7 +100,7 @@ class ThumbnailArtifactService:
         check_connection: Callable[[], None] | None = None,
     ) -> int:
         with ThumbnailBatchStore(media).locked() as store:
-            batch = store.load() or store.prepare(artifacts)
+            batch = store.load() or cls.prepare_batch(store, artifacts)
             return cls.persist_batch(media, batch, check_connection=check_connection)
 
     @classmethod
@@ -152,6 +170,21 @@ class ThumbnailArtifactService:
                 storage.put_file(key, batch.source(entry), overwrite=False, immutable=True)
             batch.checkpoint(entry, "uploaded")
 
+        if pending and batch.packed:
+            if settings.storage.backend != "local" or not isinstance(storage, LocalStorageBackend):
+                raise RuntimeError("image_pack_requires_local_storage")
+            pack = batch.workspace / "thumbnails.zip"
+            if not pack.is_file():
+                temporary = pack.with_suffix(".zip.tmp")
+                try:
+                    write_pack(temporary, [(f"{entry['offset']}.webp", batch.source(entry)) for entry in batch.entries])
+                    os.replace(temporary, pack)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            storage.put_file(f"{prefix}/{batch.manifest['generation']}.zip", pack, overwrite=False, immutable=True)
+            for entry in pending:
+                batch.checkpoint(entry, "uploaded")
+            pending = []
         if pending:
             result = publish_batch(
                 pending, publish,
@@ -173,7 +206,7 @@ class ThumbnailArtifactService:
             if not cls._committed(media, batch):
                 for entry in batch.entries:
                     key = batch.key(prefix, entry)
-                    image = Image.create(origin=key, small=key, medium=key, large=key)
+                    image = Image.create(origin=key)
                     MediaThumbnail.create(
                         media=media, image=image, offset=entry["offset"],
                         image_search_index_status=(
@@ -198,7 +231,7 @@ class ThumbnailArtifactService:
     def read_dimensions(image_origin: str) -> tuple[int | None, int | None]:
         if is_nonlocal_image_reference(image_origin):
             raise ValueError("thumbnail_image_reference_nonlocal")
-        with asset_storage().open(image_origin) as stream, PILImage.open(stream) as image:
+        with PILImage.open(BytesIO(read_image_bytes(image_origin, storage=asset_storage()))) as image:
             return image.size
 
     @classmethod

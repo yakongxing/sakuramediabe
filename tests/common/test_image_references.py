@@ -24,9 +24,7 @@ def test_image_resource_preserves_external_urls(reference):
     )
 
     assert resource.origin == reference
-    assert resource.small == reference
-    assert resource.medium == reference
-    assert resource.large == reference
+    assert set(resource.model_dump()) == {"id", "origin"}
 
 
 def test_image_resource_signs_internal_key_and_preserves_signed_path():
@@ -39,7 +37,8 @@ def test_image_resource_signs_internal_key_and_preserves_signed_path():
     )
 
     assert resource.origin.startswith("/files/images/movies/ab/AB-001/cover.jpg?")
-    assert resource.small == "/files/images/already-signed?expires=1&signature=x"
+    signed = "/files/images/already-signed?expires=1&signature=x"
+    assert ImageResource(id=2, origin=signed).origin == signed
 
 
 @pytest.mark.parametrize(
@@ -254,7 +253,7 @@ def test_signed_image_file_boundary_rejects_url_like_references(reference):
 def test_image_fields_allow_long_external_urls():
     assert all(
         field.max_length >= 2048
-        for field in (Image.origin, Image.small, Image.medium, Image.large)
+        for field in (Image.origin,)
     )
 
 
@@ -269,12 +268,7 @@ def test_image_fields_round_trip_long_external_url(test_db):
     )
     current = Image.get_by_id(image.id)
 
-    assert (current.origin, current.small, current.medium, current.large) == (
-        reference,
-        reference,
-        reference,
-        reference,
-    )
+    assert current.origin == reference
 
 
 def test_catalog_image_tasks_keep_direct_urls_and_reject_invalid_cover():

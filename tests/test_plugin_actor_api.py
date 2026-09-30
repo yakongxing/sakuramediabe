@@ -159,7 +159,16 @@ def test_detail_exposes_profile_and_computes_age(actors, monkeypatch, client, ac
     assert response.json()["age"] == 33
     listing = client.get("/actors", headers=headers)
     assert listing.status_code == 200
-    assert "birthday" not in listing.json()["items"][0]
+    item = listing.json()["items"][0]
+    assert item["birthday"] == "1993-08-16"
+    assert item["age"] == 33
+    assert item["height_cm"] == 159
+    assert item["bust_cm"] == 84
+    assert item["waist_cm"] == 58
+    assert item["hips_cm"] == 88
+    assert item["cup"] == "F"
+    assert "birthplace" not in item
+    assert "blood_type" not in item
 
 
 def test_actor_migration_preserves_rows_and_is_idempotent(clean_db):
@@ -189,3 +198,19 @@ def test_cli_releases_actor_ownership(actors, monkeypatch):
     assert result.exit_code == 0, result.output
     assert actors.get(actor.id).owners == {}
     assert actors.get(actor.id).values["height_cm"] == 159
+
+
+def test_actor_api_resolves_merged_actor(actors, test_db):
+    from src.service.catalog.actor_merge_service import ActorMergeService
+
+    target = Actor.create(javdb_id="merged-target", name="新名")
+    source = Actor.create(javdb_id="merged-source", name="旧名")
+    ActorMergeService.merge_actors(target.id, [source.id])
+
+    snapshot = actors.get(source.id)
+    assert snapshot is not None
+    assert snapshot.actor_id == target.id
+    assert [item.actor_id for item in actors.list_page().items] == [target.id]
+
+    assert actors.patch(source.id, {"height_cm": 160}, snapshot.revision)
+    assert actors.get(target.id).values["height_cm"] == 160

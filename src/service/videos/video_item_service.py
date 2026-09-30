@@ -76,7 +76,7 @@ class VideoItemService:
         valid_count = fn.SUM(Case(None, [(Media.valid == True, 1)], 0))
         first_media_id = Media.select(
             Media.video_item.alias("owner_id"),
-            fn.MIN(Media.id).alias("first_media_id"),
+            fn.MIN(Case(None, [(Media.valid == True, Media.id)])).alias("first_media_id"),
             fn.COUNT(Media.id).alias("media_count"),
             valid_count.alias("valid_count"),
         ).where(Media.video_item.is_null(False)).group_by(Media.video_item)
@@ -254,8 +254,8 @@ class VideoItemService:
         media_items = media_batch.resources
         stats_media_count = len(media_items)
         can_play = any(media.valid for media in media_items)
-        # 时长/大小取第一条媒体（media_items 已按 Media.id 升序），无媒体时为 0。
-        first_media = media_items[0] if media_items else None
+        # 时长/大小/封面比例取第一条有效媒体（media_items 已按 Media.id 升序），无有效媒体时为 0。
+        first_media = next((media for media in media_items if media.valid), None)
         cover_width, cover_height = cls._parse_resolution(
             first_media.resolution if first_media else None
         )
@@ -351,7 +351,8 @@ class VideoItemService:
         # 复用媒体删除链路：清理文件、缩略图图片、向量与级联子表，而非简单置空可空外键。
         media_ids = [media.id for media in Media.select(Media.id).where(Media.video_item == video)]
         for media_id in media_ids:
-            MediaService.delete_media(media_id)
+            # 条目删除链路本身已在此收口，关闭媒体侧的条目同步避免递归。
+            MediaService.delete_media(media_id, sync_video_member=False)
         # 封面 Image 为该视频独有（generate_cover 新建），随视频一并清理图片行与磁盘文件，避免孤儿。
         cover_image = video.cover_image if video.cover_image_id is not None else None
         obsolete_image_paths: set[str] = set()

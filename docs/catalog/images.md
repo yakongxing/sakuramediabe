@@ -4,8 +4,8 @@ Movie covers, plot images, and actor avatars supplied as remote URLs by JavDB an
 other remote metadata providers are stored and returned as validated third-party
 HTTP(S) URLs. Those imports do not probe, download, stage, proxy, or publish the
 images, and query strings are preserved byte-for-byte. External image URLs are
-limited to 2048 UTF-8 bytes at the persistence boundary; the database columns
-remain `VARCHAR(2048)` for compatibility.
+limited to 2048 UTF-8 bytes at the persistence boundary; the `origin` database column
+remains `VARCHAR(2048)` for compatibility.
 
 Bundled metadata plugins use the stable host API to deliver local image file
 artifacts (`cover_image_path` and `plot_image_paths`). The host imports those
@@ -26,3 +26,15 @@ During upgrade, pending or running legacy `image_publication` queue rows are mar
 failed with `catalog_image_publication_retired`. Staging directories are not swept
 at startup. Rollback to code that assumes every `Image` value is a local key is not
 safe after external URLs have been written.
+
+## Local packs and remote assets
+
+The image model and API expose only `origin` (plus the API resource ID); derived
+size columns have been removed. Local movie files may live in `assets.zip` and
+local thumbnail batches in generation-specific ZIP_STORED packs. Logical image
+keys remain unchanged at the read boundary; missing pack entries fall back to
+loose local files. Legacy sibling `thumbnails.zip` packs remain readable.
+
+WebDAV continues to publish and resume individual image objects. It never reads
+local packs as a fallback and the two ZIP backfill jobs reject WebDAV before
+scanning records or changing files. Third-party URLs are not packed or proxied.

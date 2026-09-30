@@ -17,6 +17,7 @@ from loguru import logger
 from peewee import IntegrityError
 
 from src.common import normalize_movie_number
+from src.common.media_paths import movie_asset_relative_dir, normalize_asset_dir_name
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import find_movie_by_number
 from src.metadata._providers.models import (
@@ -34,12 +35,14 @@ from src.model import (
     Tag,
     get_database,
 )
+from src.model.catalog.actors import merge_actor_alias_name
 from src.model.catalog.movies import PROTECTED_MOVIE_FIELDS
 from src.plugins.extensions.metadata import PluginMovieMetadata
 from src.service.catalog.actor_ownership_gateway import (
     JAVDB_ACTOR_FIELD_OWNER,
     ActorOwnershipGateway,
 )
+from src.service.catalog.movie_asset_pack_service import MovieAssetPackService
 from src.service.catalog.movie_heat_service import MovieHeatService
 from src.service.catalog.movie_image_service import (
     ImageDownloadError,
@@ -77,39 +80,13 @@ class CatalogImportService:
         self.persist_lock = persist_lock
 
     @staticmethod
-    def _split_actor_alias_name(alias_name: str) -> list[str]:
-        return [name.strip() for name in (alias_name or "").split("/") if name.strip()]
-
-    @classmethod
-    def _merge_actor_alias_name(
-        cls,
-        primary_name: str,
-        alias_names: list[str],
-        existing_alias_name: str,
-    ) -> str:
-        merged_aliases: list[str] = []
-        seen_aliases: set[str] = set()
-
-        # 搜索来源别名优先，保证后续本地搜索尽量贴近 JavDB 返回结果。
-        for candidate_name in [
-            primary_name,
-            *alias_names,
-            *cls._split_actor_alias_name(existing_alias_name),
-        ]:
-            normalized_name = (candidate_name or "").strip()
-            if not normalized_name:
-                continue
-            dedupe_key = normalized_name.casefold()
-            if dedupe_key in seen_aliases:
-                continue
-            seen_aliases.add(dedupe_key)
-            merged_aliases.append(normalized_name)
-
-        return " / ".join(merged_aliases)
-
-    @staticmethod
     def _resolve_movie_series(series_name: str | None) -> MovieSeries | None:
         return Movie.resolve_series(series_name)
+
+    @staticmethod
+    def _movie_asset_dir(movie: Movie):
+        """影片图片目录（movies/<shard>/<番号>）的相对路径。"""
+        return movie_asset_relative_dir(normalize_asset_dir_name(movie.movie_number))
 
     def _apply_thin_cover_resolution(
         self,
@@ -312,6 +289,7 @@ class CatalogImportService:
             )
 
         self.image_service.delete_obsolete_image_files(obsolete_paths)
+        MovieAssetPackService.rebuild_movie_asset_pack(self._movie_asset_dir(movie))
         MovieHeatService.update_single_movie_heat(movie.id)
         logger.info(
             "Catalog import finished movie_id={} movie_number={}",
@@ -381,6 +359,7 @@ class CatalogImportService:
                 if existing is None:
                     raise
                 return existing, False
+        MovieAssetPackService.rebuild_movie_asset_pack(self._movie_asset_dir(movie))
         return movie, True
 
     def backfill_plugin_movie(
@@ -501,6 +480,7 @@ class CatalogImportService:
             logger.warning(
                 "补录完成，旧图片或索引清理失败 movie={} detail={}", movie.id, exc
             )
+        MovieAssetPackService.rebuild_movie_asset_pack(self._movie_asset_dir(movie))
         return Movie.get_by_id(movie.id)
 
     # ③ 允许更新的字段白名单 -> detail 取值器；heat 是推导列不允许直接写，
@@ -839,6 +819,36 @@ class CatalogImportService:
                 tag, _ = Tag.get_or_create(name=name)
                 MovieTag.get_or_create(movie=movie, tag=tag)
 
+    def _merge_resource_into_canonical(
+        self,
+        merged_actor: Actor,
+        actor_resource: JavdbMovieActorResource,
+        *,
+        update_gender: bool = False,
+    ) -> Actor:
+        """来源 javdb_id 已合并时，只把新名字并入保留记录，不覆盖其身份与头像。"""
+        canonical = Actor.resolve_canonical(merged_actor.id)
+        if canonical is None:
+            raise RuntimeError(f"merged_into 指向的演员缺失 actor_id={merged_actor.id}")
+        lock_context = self.persist_lock or nullcontext()
+        with lock_context, get_database().atomic():
+            canonical = Actor.get_by_id(canonical.id)
+            merged_alias = merge_actor_alias_name(
+                primary_name=canonical.name,
+                alias_names=[actor_resource.name, *actor_resource.alias_names],
+                existing_alias_name=canonical.alias_name,
+            )
+            if merged_alias != canonical.alias_name:
+                canonical.alias_name = merged_alias
+                canonical.save(only=[Actor.alias_name])
+            if update_gender and actor_resource.gender in (1, 2):
+                ActorOwnershipGateway.update_host_source(
+                    canonical.id,
+                    {"gender": actor_resource.gender},
+                )
+            canonical = Actor.get_by_id(canonical.id)
+        return canonical
+
     def _refresh_actor_from_javdb_resource_strict(
         self,
         *,
@@ -846,11 +856,11 @@ class CatalogImportService:
         profile_image_task: ImagePersistTask | None,
     ) -> tuple[Actor, set[str]]:
         actor = Actor.get_or_none(Actor.javdb_id == actor_resource.javdb_id)
+        if actor is not None and actor.merged_into_id is not None:
+            return self._merge_resource_into_canonical(actor, actor_resource), set()
         if actor is None:
-            profile_image = self.image_service.persist_refreshed_image_record(
-                profile_image_task
-            )
-            merged_alias_name = self._merge_actor_alias_name(
+            profile_image = self.image_service.persist_refreshed_image_record(profile_image_task)
+            merged_alias_name = merge_actor_alias_name(
                 primary_name=actor_resource.name,
                 alias_names=actor_resource.alias_names,
                 existing_alias_name="",
@@ -874,7 +884,7 @@ class CatalogImportService:
                 profile_image_task
             )
         actor.name = actor_resource.name
-        actor.alias_name = self._merge_actor_alias_name(
+        actor.alias_name = merge_actor_alias_name(
             primary_name=actor_resource.name,
             alias_names=actor_resource.alias_names,
             existing_alias_name=actor.alias_name,
@@ -926,6 +936,7 @@ class CatalogImportService:
                 )
             )
         self.image_service.delete_obsolete_image_files(obsolete_paths)
+        MovieAssetPackService.rebuild_movie_asset_pack(self._movie_asset_dir(movie))
         refreshed_movie = Movie.get_by_id(movie.id)
         return refreshed_movie.thin_cover_image_id is not None
 
@@ -941,6 +952,12 @@ class CatalogImportService:
         演员搜索等非影片入库场景只能同步身份和头像信息；只有新影片入库
         显式传入 ``update_gender=True`` 时，才使用影片详情中的性别写入本地。
         """
+        existing = Actor.get_or_none(Actor.javdb_id == actor_resource.javdb_id)
+        if existing is not None and existing.merged_into_id is not None:
+            return self._merge_resource_into_canonical(
+                existing, actor_resource, update_gender=update_gender
+            )
+
         if profile_image_task is None:
             _, _, actor_tasks = self.image_service.build_catalog_direct_image_tasks(
                 "", None, [], [actor_resource]
@@ -957,7 +974,7 @@ class CatalogImportService:
                 if update_gender and actor_resource.gender in (1, 2)
                 else None
             )
-            merged_alias_name = self._merge_actor_alias_name(
+            merged_alias_name = merge_actor_alias_name(
                 primary_name=actor_resource.name,
                 alias_names=actor_resource.alias_names,
                 existing_alias_name="",
@@ -978,7 +995,7 @@ class CatalogImportService:
             if not created:
                 actor.name = actor_resource.name
                 # 只合并权威来源给出的名字集合，避免把用户输入直接污染到 alias。
-                actor.alias_name = self._merge_actor_alias_name(
+                actor.alias_name = merge_actor_alias_name(
                     primary_name=actor_resource.name,
                     alias_names=actor_resource.alias_names,
                     existing_alias_name=actor.alias_name,

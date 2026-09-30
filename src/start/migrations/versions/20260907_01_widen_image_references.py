@@ -4,7 +4,10 @@ name = "20260907_01_widen_image_references"
 
 
 def migrate(database) -> None:
+    existing = {column.name for column in database.get_columns("image")}
     for column in ("origin", "small", "medium", "large"):
+        if column not in existing:
+            continue
         database.execute_sql(
             f'ALTER TABLE image ALTER COLUMN "{column}" TYPE VARCHAR(2048)'
         )

@@ -98,7 +98,11 @@ def test_requested_generation_resets_terminal_media_and_persists_thumbnails(
         .order_by(MediaThumbnail.offset)
     )
     assert [thumbnail.offset for thumbnail in thumbnails] == [0, 10, 20]
-    assert all((image_root / item.image.origin).is_file() for item in thumbnails)
+    from src.common.image_store import read_image_bytes
+
+    assert all(read_image_bytes(item.image.origin) for item in thumbnails)
+    assert len(list(image_root.rglob("*.zip"))) == 1
+    assert not list(image_root.rglob("*.webp"))
     # 首条进度立即发出；提供方进度按心跳节流，快速完成时可能不会转发。
     assert texts[0] == "正在准备视频"
 

@@ -111,7 +111,7 @@ class MediaDetailReadService:
                 provider_bundles[provider_key] = bundle
             media.play_url = build_signed_media_url(
                 media.id, delivery=bundle.playback_deliveries[0]
-            )
+            ) if media.valid else ""
             media.library_name = media.library.name
             media.provider_key = provider_key
             media.playback_deliveries = list(bundle.playback_deliveries)

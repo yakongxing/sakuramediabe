@@ -103,7 +103,7 @@ def test_thumbnail_provider_progress_and_installed_legacy_provider(monkeypatch, 
     batch_store = SimpleNamespace(
         load=lambda: None,
         new_workspace=lambda: tmp_path,
-        prepare=lambda artifacts, workspace: artifacts,
+        prepare=lambda artifacts, workspace, **kwargs: artifacts,
     )
     monkeypatch.setattr(task_service, "ThumbnailBatchStore", lambda media: SimpleNamespace(locked=lambda: nullcontext(batch_store)))
     monkeypatch.setattr(task_service.ThumbnailArtifactService, "persist_batch", lambda media, batch, **kwargs: len(batch))

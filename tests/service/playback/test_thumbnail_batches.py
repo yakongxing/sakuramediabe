@@ -49,6 +49,8 @@ def publication(test_db, tmp_path, monkeypatch):
     PILImage.new("RGB", (32, 18)).save(source, "WEBP")
     artifacts = [(ThumbnailArtifact(offset, "source.webp"), source) for offset in (3, 6)]
     storage = RecordingStorage(tmp_path / "remote")
+    monkeypatch.setattr(settings.storage, "backend", "webdav")
+    monkeypatch.setattr(settings.storage, "webdav_base_url", "https://dav.example.test/dav")
     monkeypatch.setattr("src.service.playback.thumbnails.artifacts.asset_storage", lambda: storage)
     monkeypatch.setattr(settings.storage, "webdav_publication_max_workers", 1)
     return media, artifacts, storage
@@ -274,7 +276,7 @@ def test_source_and_destination_changes_do_not_reuse_batch(publication, monkeypa
     assert ThumbnailBatchStore(media).load() is None
     media.file_hash = None
     assert ThumbnailBatchStore(media).load() is not None
-    monkeypatch.setattr(settings.media, "import_image_root_path", "/new-target")
+    monkeypatch.setattr(settings.storage, "root_prefix", "new-target")
     assert ThumbnailBatchStore(media).load() is None
     assert old.workspace.exists()
 
