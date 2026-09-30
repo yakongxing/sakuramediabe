@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import timedelta
 from inspect import signature
-from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -28,6 +26,7 @@ from src.service.playback.operation_locks import (
 )
 from src.service.playback.provider_helpers import media_handle_for
 from src.service.playback.thumbnails.artifacts import ThumbnailArtifactService
+from src.service.playback.thumbnails.batches import ThumbnailBatchStore
 from src.service.playback.thumbnails.contracts import ThumbnailDeferred
 from src.service.playback.thumbnails.progress import ThumbnailTaskProgress
 
@@ -159,9 +158,20 @@ class MediaThumbnailTaskService:
 
     @classmethod
     def _generate_artifacts(cls, media: Media, progress_callback=None, *, check_connection=None) -> int:
-        handle = media_handle_for(media)
-        with tempfile.TemporaryDirectory(prefix=f"media-thumbnails-{media.id}-") as workspace_name:
-            workspace = Path(workspace_name)
+        with ThumbnailBatchStore(media).locked() as store:
+            batch = store.load()
+            if batch is not None:
+                if progress_callback:
+                    progress_callback("正在恢复本地缩略图上传批次")
+                return ThumbnailArtifactService.persist_batch(
+                    media, batch, check_connection=check_connection, progress_callback=progress_callback,
+                )
+            if check_connection is not None:
+                check_connection()
+            handle = media_handle_for(media)
+            workspace = store.new_workspace()
+            provider_workspace = workspace / "generated"
+            provider_workspace.mkdir()
             try:
                 storage = MEDIA_PROVIDER_REGISTRY.storage_for(handle.library)
                 # 已安装的旧提供方尚未接收缩略图进度回调。
@@ -171,7 +181,7 @@ class MediaThumbnailTaskService:
                     else {}
                 )
                 generation = storage.generate_thumbnails(
-                    media=handle, workspace=workspace, **progress_kwargs,
+                    media=handle, workspace=provider_workspace, **progress_kwargs,
                 )
             except ThumbnailGenerationDeferred as exc:
                 raise ThumbnailDeferred(
@@ -200,7 +210,7 @@ class MediaThumbnailTaskService:
                 if artifact.offset_seconds in offsets:
                     continue
                 try:
-                    source = ThumbnailArtifactService.validate_artifact(workspace, artifact)
+                    source = ThumbnailArtifactService.validate_artifact(provider_workspace, artifact)
                 except ValueError as exc:
                     logger.warning(
                         "Invalid thumbnail artifact media_id={} path={} detail={}",
@@ -218,10 +228,9 @@ class MediaThumbnailTaskService:
                     f"expected={expected_count} minimum={minimum_count} "
                     f"actual={len(valid_artifacts)}"
                 )
-            if check_connection is None:
-                return ThumbnailArtifactService.persist(media, valid_artifacts)
-            return ThumbnailArtifactService.persist(
-                media, valid_artifacts, check_connection=check_connection,
+            batch = store.prepare(valid_artifacts, workspace)
+            return ThumbnailArtifactService.persist_batch(
+                media, batch, check_connection=check_connection, progress_callback=progress_callback,
             )
 
     @staticmethod
@@ -397,6 +406,7 @@ class MediaThumbnailTaskService:
                 if not media.valid:
                     return ThumbnailGenerationOutcome("invalid")
                 if cls._has_thumbnails(media):
+                    ThumbnailArtifactService.cleanup_committed(media, check_connection=check_connection)
                     cls._mark_succeeded(media)
                     return ThumbnailGenerationOutcome("already_exists")
                 cls._reset_for_request(media)
@@ -420,6 +430,7 @@ class MediaThumbnailTaskService:
         if media is None or not media.valid:
             return ThumbnailGenerationOutcome("skipped")
         if cls._has_thumbnails(media):
+            ThumbnailArtifactService.cleanup_committed(media, check_connection=check_connection)
             cls._mark_succeeded(media)
             return ThumbnailGenerationOutcome("skipped")
         return cls._generate_loaded_media(
@@ -436,6 +447,8 @@ class MediaThumbnailTaskService:
             generated_count = cls._generate_artifacts(
                 media, progress_callback, check_connection=check_connection,
             )
+        except MediaOperationBusy:
+            raise
         except ThumbnailBackendUnavailable as exc:
             logger.warning(
                 "Media thumbnail backend unavailable media_id={} code={} detail={}",

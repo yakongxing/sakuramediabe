@@ -311,6 +311,11 @@ def app(test_db, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_thumbnail_staging(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings.media, "thumbnail_staging_root_path", str(tmp_path / "thumbnail-staging"))
+
+
+@pytest.fixture(autouse=True)
 def isolated_proxy_environment(monkeypatch):
     # 单元测试不应继承开发机代理；需要验证代理行为的 case 可自行 monkeypatch.setenv。
     for variable in _PROXY_ENVIRONMENT_VARIABLES:

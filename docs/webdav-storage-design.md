@@ -5,6 +5,8 @@
 > 核心结论：不能把 WebDAV URL 填入现有 `*_root_path`。现有代码广泛依赖 `pathlib`、`FileResponse`、`os.replace` 和 ffmpeg/PyAV 的本地文件语义，必须引入“逻辑对象 key + backend”抽象，并为外部处理器提供受控的本地工作区。  
 > 依赖核实：`webdav4` 0.11.0 要求 `httpx>=0.20,<1`，项目锁定 `httpx==0.28.1`，兼容；唯一新增传递依赖为 `python-dateutil`（当前未在依赖树中）。不需安装 `fsspec`/`http2` extra，Dockerfile 无需 davfs2/FUSE/特权模式。
 
+> 缩略图实现更新：下文通用迁移设计中的“临时工作区失败即清理”不适用于当前媒体缩略图。当前实现先在 `media.thumbnail_staging_root_path` 持久化 ready 批次及逐图上传清单，上传失败保留本地和远端结果；后续复用固定 generation key，仅补传未确认图片。整批数据库提交确认后清理本地目录。配置及恢复边界见 [README](../README.md#缩略图本地暂存与断点续传)。
+
 ## 1. 现状与边界
 
 ### 1.1 资产命名与数据库字段
@@ -224,13 +226,13 @@ WebDAV 不具备对象存储式通用条件写，不应声称能提供跨 DB/文
 
 ### 4.4 缩略图与图片搜索
 
-**`thumbnails/task_service.py`** 已用 `TemporaryDirectory` 接 provider 输出，无需改变生成协议；配置它使用统一 workspace root并加容量配额。
+**`thumbnails/task_service.py`** 保持 provider workspace 协议，但工作目录改为持久批次目录；优先加载已校验批次，恢复时不再调用 provider。`thumbnails/batches.py` 负责原子 JSON 清单、摘要校验和跨进程文件锁。当前不自动淘汰失败批次，部署需监控磁盘空间。
 
 **`thumbnails/artifacts.py`**
 
 - `validate_artifact()` 继续只读 workspace，保留 WEBP、路径逃逸、尺寸校验。
 - `persist()` 对所有合法产物先上传 `.uploading.<op>`，发布为 final key，完成后再在 DB 事务创建 `Image/MediaThumbnail`。
-- 失败删除本 operation 已发布对象，不要清理其它运行创建的 key。
+- 上传/入库失败保留本批次已发布对象及本地清单；逐图成功立即 checkpoint，未知结果恢复时先核对完整远端内容。只有明确整批提交后才能清理本地文件。
 - `reset_directory()` 不能先无条件清空远端目录；应先生成新集合并提交 DB，再按 DB 引用差集删除旧对象。
 - `read_dimensions()` 把单张图下载到有 size 上限的临时文件或读取有限 bytes 给 Pillow；可短 TTL 缓存维度。
 

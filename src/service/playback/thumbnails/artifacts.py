@@ -1,9 +1,8 @@
+import hashlib
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from uuid import uuid4
 
 from loguru import logger
-from peewee import InterfaceError, OperationalError
 from PIL import Image as PILImage
 
 from src.common.image_references import is_nonlocal_image_reference
@@ -17,9 +16,10 @@ from src.model import Image, Media, MediaThumbnail, get_database
 from src.plugins.provider_protocol import ThumbnailArtifact
 from src.schema.catalog.actors import ImageResource
 from src.schema.playback.media import MediaThumbnailResource
-from src.service.catalog.image_cleanup_service import ImageCleanupService
+from src.service.playback.thumbnails.batches import ThumbnailBatch, ThumbnailBatchStore
 from src.storage import asset_storage
 from src.storage.batch import publish_batch
+from src.storage.types import StorageConflict, StorageNotFound
 
 
 class ThumbnailArtifactService:
@@ -81,76 +81,118 @@ class ThumbnailArtifactService:
         *,
         check_connection: Callable[[], None] | None = None,
     ) -> int:
-        # A late response from an older generation must never replace this batch.
-        prefix = f"{cls.thumbnail_prefix(media)}/{uuid4().hex}"
-        storage = asset_storage()
-        initial_index_status = (
-            MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING
-            if media.movie_number
-            else MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_SKIPPED
-        )
-        published: list[tuple[ThumbnailArtifact, str]] = []
-        cleanup_keys: set[str] = set()
-        try:
-            if check_connection is not None:
-                check_connection()
-            if artifacts:
-                def publish(item):
-                    artifact, source = item
-                    key = f"{prefix}/{artifact.offset_seconds}.webp"
-                    return storage.put_file(key, source, overwrite=False)
+        with ThumbnailBatchStore(media).locked() as store:
+            batch = store.load() or store.prepare(artifacts)
+            return cls.persist_batch(media, batch, check_connection=check_connection)
 
-                batch = publish_batch(
-                    artifacts,
-                    publish,
-                    max_workers=min(settings.storage.webdav_publication_max_workers, len(artifacts)),
-                    thread_name_prefix="thumbnail-publication",
-                )
-                for (artifact, _), result in batch.published:
-                    key = f"{prefix}/{artifact.offset_seconds}.webp"
-                    published.append((artifact, key))
-                    if getattr(result, "created", False):
-                        cleanup_keys.add(key)
-                for (artifact, _), error in batch.errors:
-                    logger.warning(
-                        "Thumbnail publication failed media_id={} key={} publication_possible={}",
-                        media.id, f"{prefix}/{artifact.offset_seconds}.webp",
-                        getattr(error, "publication_possible", False),
-                    )
-                batch.raise_for_errors()
-            published.sort(key=lambda item: item[0].offset_seconds)
-            if check_connection is not None:
-                check_connection()
-            with get_database().atomic():
-                for artifact, relative_path in published:
-                    image = Image.create(
-                        origin=relative_path,
-                        small=relative_path,
-                        medium=relative_path,
-                        large=relative_path,
-                    )
-                    MediaThumbnail.create(
-                        media=media,
-                        image=image,
-                        offset=artifact.offset_seconds,
-                        image_search_index_status=initial_index_status,
-                    )
+    @classmethod
+    def _committed(cls, media: Media, batch: ThumbnailBatch) -> bool:
+        rows = list(MediaThumbnail.select(MediaThumbnail, Image).join(Image).where(
+            MediaThumbnail.media == media.id,
+        ))
+        if not rows:
+            return False
+        expected = {(entry["offset"], batch.key(cls.thumbnail_prefix(media), entry)) for entry in batch.entries}
+        actual = {(row.offset, row.image.origin) for row in rows}
+        if actual != expected or len(rows) != len(expected):
+            raise StorageConflict("thumbnail_batch_database_conflict")
+        return True
+
+    @classmethod
+    def cleanup_committed(cls, media: Media, *, check_connection=None) -> None:
+        try:
+            with ThumbnailBatchStore(media).locked() as store:
+                batch = store.load()
                 if check_connection is not None:
                     check_connection()
-        except (InterfaceError, OperationalError):
-            # COMMIT may have succeeded before its response was lost. Retain objects.
-            raise
-        except Exception:
-            for key in cleanup_keys:
-                try:
-                    ImageCleanupService.delete_obsolete_image_files({key})
-                except Exception as exc:
-                    logger.warning(
-                        "Thumbnail cleanup failed media_id={} key={} detail={}",
-                        media.id, key, exc,
+                if batch is not None and cls._committed(media, batch):
+                    cls._cleanup_after_commit(batch)
+        except (OSError, ValueError, StorageConflict) as exc:
+            logger.warning("Thumbnail committed batch cleanup deferred media_id={} detail={}", media.id, exc)
+
+    @staticmethod
+    def _remote_matches(storage, key: str, entry) -> bool:
+        try:
+            stat = storage.stat(key)
+            if not stat.is_file or stat.size != entry["size"]:
+                raise StorageConflict("thumbnail_batch_remote_content_conflict")
+            digest = hashlib.sha256()
+            size = 0
+            with storage.open(key) as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    size += len(chunk)
+                    digest.update(chunk)
+            if size != entry["size"] or digest.hexdigest() != entry["sha256"]:
+                raise StorageConflict("thumbnail_batch_remote_content_conflict")
+            return True
+        except StorageNotFound:
+            return False
+
+    @classmethod
+    def persist_batch(cls, media: Media, batch: ThumbnailBatch, *, check_connection=None, progress_callback=None) -> int:
+        if check_connection is not None:
+            check_connection()
+        if cls._committed(media, batch):
+            cls._cleanup_after_commit(batch)
+            return len(batch.entries)
+        batch.validate_files()
+        prefix = cls.thumbnail_prefix(media)
+        storage = asset_storage()
+        pending = [entry for entry in batch.entries if entry["state"] != "uploaded"]
+        if progress_callback:
+            progress_callback(f"正在上传缩略图，已确认 {len(batch.entries) - len(pending)}/{len(batch.entries)} 张")
+
+        def publish(entry):
+            key = batch.key(prefix, entry)
+            reconcile = entry["state"] == "uploading"
+            # A crash after publication but before its checkpoint is reconciled
+            # using the immutable content, not a fresh key or an unconditional PUT.
+            batch.checkpoint(entry, "uploading")
+            if not reconcile or not cls._remote_matches(storage, key, entry):
+                storage.put_file(key, batch.source(entry), overwrite=False, immutable=True)
+            batch.checkpoint(entry, "uploaded")
+
+        if pending:
+            result = publish_batch(
+                pending, publish,
+                max_workers=min(settings.storage.webdav_publication_max_workers, len(pending)),
+                thread_name_prefix="thumbnail-publication",
+            )
+            for entry, error in result.errors:
+                logger.warning(
+                    "Thumbnail publication failed media_id={} key={} publication_possible={}",
+                    media.id, batch.key(prefix, entry), getattr(error, "publication_possible", False),
+                )
+            result.raise_for_errors()
+        if check_connection is not None:
+            check_connection()
+        with get_database().atomic():
+            current = Media.get_by_id(media.id)
+            if not current.valid or ThumbnailBatchStore(current).identity != batch.store.identity:
+                raise RuntimeError("thumbnail_batch_media_changed")
+            if not cls._committed(media, batch):
+                for entry in batch.entries:
+                    key = batch.key(prefix, entry)
+                    image = Image.create(origin=key, small=key, medium=key, large=key)
+                    MediaThumbnail.create(
+                        media=media, image=image, offset=entry["offset"],
+                        image_search_index_status=(
+                            MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING if media.movie_number
+                            else MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_SKIPPED
+                        ),
                     )
-            raise
-        return len(published)
+            if check_connection is not None:
+                check_connection()
+        # No compensation deletes: every failure retains both the remote result
+        # and the durable local batch. Only a confirmed commit permits cleanup.
+        cls._cleanup_after_commit(batch)
+        return len(batch.entries)
+
+    @staticmethod
+    def _cleanup_after_commit(batch: ThumbnailBatch) -> None:
+        # An inner atomic() is only a savepoint if a caller owns a transaction.
+        if not get_database().in_transaction():
+            batch.cleanup()
 
     @staticmethod
     def read_dimensions(image_origin: str) -> tuple[int | None, int | None]:

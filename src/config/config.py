@@ -88,6 +88,8 @@ class Auth(BaseModel):
 class Media(BaseModel):
     allowed_min_video_file_size: int = 268435456 # 256MB
     import_image_root_path: str = "/data/cache/assets"
+    # 未提交的缩略图批次必须落在持久卷，失败/重启后复用。
+    thumbnail_staging_root_path: str = "/data/cache/thumbnail-staging"
     max_thumbnail_process_count: int = Field(
         default_factory=lambda: max(1, math.ceil((os.cpu_count() or 1) / 2))
     )

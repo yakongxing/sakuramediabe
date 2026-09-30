@@ -538,3 +538,49 @@ def test_cleanup_requires_explicit_writer_pause(dav):
     with pytest.raises(ValueError, match="pause"):
         backend.cleanup_expired_uploads("movies", older_than=datetime.now(timezone.utc))
     assert not server.requests
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path, monkeypatch, unknown):
+    from PIL import Image as PILImage
+
+    from src.config import settings
+    from src.model import Media, MediaLibrary, MediaThumbnail, Movie
+    from src.plugins.provider_protocol import ThumbnailArtifact
+    from src.service.playback.thumbnails.artifacts import ThumbnailArtifactService
+    from src.service.playback.thumbnails.batches import ThumbnailBatchStore
+
+    backend, server, _ = dav
+    monkeypatch.setattr("src.service.playback.thumbnails.artifacts.asset_storage", lambda: backend)
+    monkeypatch.setattr(settings.storage, "webdav_publication_max_workers", 1)
+    movie = Movie.create(movie_number="DAV-001", javdb_id="dav-001", title="movie")
+    library = MediaLibrary.create(name="dav", provider_key="fake", provider_config={})
+    media = Media.create(movie=movie, library=library, file_name="video.mp4")
+    source = tmp_path / "source.webp"
+    PILImage.new("RGB", (32, 18)).save(source, "WEBP")
+    artifacts = [(ThumbnailArtifact(offset, "source.webp"), source) for offset in (3, 6)]
+
+    def fault(request):
+        if unknown and request.method == "PROPFIND" and request.url.path.endswith("/6.webp"):
+            return httpx.Response(404)
+        if not unknown and request.method == "PUT" and "/.6.webp.uploading-" in request.url.path:
+            return httpx.Response(503)
+
+    server.fault = fault
+    with pytest.raises(StorageUnavailable):
+        ThumbnailArtifactService.persist(media, artifacts)
+    batch = ThumbnailBatchStore(media).load()
+    assert batch is not None
+    finals = {path for path in server.objects if path.endswith(".webp")}
+    assert len(finals) == (2 if unknown else 1)
+    assert not MediaThumbnail.select().exists()
+    boundary = len(server.requests)
+    server.fault = lambda request: None
+    backend._uncertain_publications.clear()
+    assert ThumbnailArtifactService.persist(media, []) == 2
+    resumed = server.requests[boundary:]
+    assert sum(method == "PUT" for method, _, _ in resumed) == (0 if unknown else 1)
+    assert not any(method == "DELETE" and path.endswith(".webp") for method, path, _ in server.requests)
+    assert finals.issubset(server.objects)
+    assert not batch.workspace.exists()
+    assert MediaThumbnail.select().count() == 2

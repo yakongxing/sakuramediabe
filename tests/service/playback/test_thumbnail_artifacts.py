@@ -11,7 +11,10 @@ from src.plugins.provider_protocol import ThumbnailArtifact
 from src.service.playback.thumbnails.artifacts import ThumbnailArtifactService
 from src.storage.local import LocalStorageBackend
 from src.storage.types import (
+    ObjectStat,
     PublicationResult,
+    StorageConflict,
+    StorageNotFound,
     StoragePublicationUnknown,
     StorageUnavailable,
 )
@@ -63,7 +66,7 @@ class RemoteStorage:
         self.failure = None
         self.attempted = []
 
-    def put_file(self, key, source, *, overwrite=True):
+    def put_file(self, key, source, *, overwrite=True, immutable=False):
         assert overwrite is False
         self.attempted.append(key)
         if self.failure and key.endswith("/6.webp"):
@@ -71,10 +74,18 @@ class RemoteStorage:
                 self.objects[key] = source.read_bytes()
                 raise StoragePublicationUnknown(key, str(self.failure))
             raise self.failure
+        if key in self.objects and self.objects[key] != source.read_bytes():
+            raise StorageConflict(key)
         self.objects[key] = source.read_bytes()
         return PublicationResult(key, len(self.objects[key]), disposition="created")
 
+    def stat(self, key):
+        if key not in self.objects:
+            raise StorageNotFound(key)
+        return ObjectStat(key, len(self.objects[key]))
+
     def open(self, key):
+        self.stat(key)
         return io.BytesIO(self.objects[key])
 
     def delete(self, key, *, missing_ok=True):
@@ -113,7 +124,7 @@ def test_remote_publication_and_dimensions(thumbnail_batch):
 
 
 @pytest.mark.parametrize("unknown", [False, True])
-def test_upload_failure_cleans_batch_and_can_retry(thumbnail_batch, unknown):
+def test_upload_failure_retains_batch_and_can_retry(thumbnail_batch, unknown):
     media, artifacts, storage = thumbnail_batch
     key = f"{ThumbnailArtifactService.thumbnail_prefix(media)}/6.webp"
     storage.failure = StoragePublicationUnknown(key, "unknown") if unknown else StorageUnavailable("offline")
@@ -122,14 +133,15 @@ def test_upload_failure_cleans_batch_and_can_retry(thumbnail_batch, unknown):
     assert not Image.select().exists()
     assert not MediaThumbnail.select().exists()
     key = next(key for key in storage.attempted if key.endswith("/6.webp"))
-    assert storage.objects == ({key: artifacts[1][1].read_bytes()} if unknown else {})
+    assert len(storage.objects) == (2 if unknown else 1)
     old_keys = set(storage.attempted)
     storage.failure = None
     assert ThumbnailArtifactService.persist(media, artifacts) == 2
-    assert not old_keys.intersection(image.origin for image in Image.select())
+    assert old_keys == {image.origin for image in Image.select()}
+    assert len(storage.attempted) == (2 if unknown else 3)
 
 
-def test_database_failure_rolls_back_and_cleans_objects(thumbnail_batch, monkeypatch):
+def test_database_failure_rolls_back_and_retains_objects(thumbnail_batch, monkeypatch):
     media, artifacts, storage = thumbnail_batch
     original_create = MediaThumbnail.create
 
@@ -143,7 +155,7 @@ def test_database_failure_rolls_back_and_cleans_objects(thumbnail_batch, monkeyp
         ThumbnailArtifactService.persist(media, artifacts)
     assert not Image.select().exists()
     assert not MediaThumbnail.select().exists()
-    assert storage.objects == {}
+    assert len(storage.objects) == 2
 
 
 def test_cleanup_failure_preserves_upload_error(thumbnail_batch, monkeypatch):
@@ -251,7 +263,7 @@ def test_published_thumbnail_signed_access(thumbnail_batch, monkeypatch):
     assert response.body == artifacts[0][1].read_bytes()
 
 
-def test_batch_waits_for_later_success_before_compensation(thumbnail_batch, monkeypatch):
+def test_batch_waits_for_later_success_and_checkpoints_it(thumbnail_batch, monkeypatch):
     from src.config import settings
 
     media, artifacts, storage = thumbnail_batch
@@ -260,7 +272,7 @@ def test_batch_waits_for_later_success_before_compensation(thumbnail_batch, monk
     later_finished = threading.Event()
     original_delete = storage.delete
 
-    def put_file(key, source, *, overwrite):
+    def put_file(key, source, *, overwrite, immutable):
         assert overwrite is False
         if key.endswith("/3.webp"):
             assert later_started.wait(5)
@@ -282,7 +294,7 @@ def test_batch_waits_for_later_success_before_compensation(thumbnail_batch, monk
     with pytest.raises(StorageUnavailable, match="first failed"):
         ThumbnailArtifactService.persist(media, artifacts)
     assert later_finished.is_set()
-    assert not storage.objects
+    assert len(storage.objects) == 1
     assert not Image.select().exists()
     assert not MediaThumbnail.select().exists()
 
@@ -315,7 +327,7 @@ def test_lost_media_lock_prevents_thumbnail_commit(thumbnail_batch, failure_chec
     assert checks == failure_check
     assert not Image.select().exists()
     assert not MediaThumbnail.select().exists()
-    assert not storage.objects
+    assert len(storage.objects) == 2
 
 
 def test_commit_response_loss_retains_published_thumbnails(thumbnail_batch, monkeypatch, test_db):
@@ -340,18 +352,16 @@ def test_commit_response_loss_retains_published_thumbnails(thumbnail_batch, monk
     assert {image.origin for image in Image.select()} == set(storage.objects)
 
 
-def test_late_old_generation_does_not_overwrite_retried_batch(thumbnail_batch):
+def test_unknown_publication_is_reconciled_without_reupload(thumbnail_batch):
     media, artifacts, storage = thumbnail_batch
     storage.failure = StoragePublicationUnknown("pending", "unknown")
     with pytest.raises(StoragePublicationUnknown):
         ThumbnailArtifactService.persist(media, artifacts)
-    old_key = next(key for key in storage.attempted if key.endswith("/6.webp"))
+    old_keys = set(storage.attempted)
     storage.failure = None
     assert ThumbnailArtifactService.persist(media, artifacts) == 2
-    storage.objects[old_key] = b"late older request"
-    current_keys = {image.origin for image in Image.select()}
-    assert old_key not in current_keys
-    assert all(storage.objects[key] == artifacts[0][1].read_bytes() for key in current_keys)
+    assert {image.origin for image in Image.select()} == old_keys
+    assert len(storage.attempted) == 2
 
 
 def test_lost_media_lock_does_not_update_thumbnail_task_state(monkeypatch):
@@ -384,7 +394,7 @@ def test_lost_lock_prevents_thumbnail_commit(thumbnail_batch, failure_check):
         ThumbnailArtifactService.persist(media, artifacts, check_connection=check_connection)
     assert not MediaThumbnail.select().exists()
     assert not Image.select().exists()
-    assert not storage.objects
+    assert len(storage.objects) == 2
 
 
 def test_connection_is_checked_before_upload_before_writes_and_before_commit(thumbnail_batch):
@@ -415,21 +425,19 @@ def test_database_connection_failure_retains_published_objects(thumbnail_batch, 
     assert len(storage.objects) == 2
 
 
-def test_late_old_generation_write_cannot_overwrite_current_thumbnail(thumbnail_batch):
+def test_unknown_publication_with_wrong_content_is_not_overwritten(thumbnail_batch):
     media, artifacts, storage = thumbnail_batch
     storage.failure = StoragePublicationUnknown("unknown", "response lost")
     with pytest.raises(StoragePublicationUnknown):
         ThumbnailArtifactService.persist(media, artifacts)
-    old_keys = set(storage.attempted)
+    key = next(key for key in storage.attempted if key.endswith("/6.webp"))
+    storage.objects[key] = b"different content"
     storage.failure = None
-    assert ThumbnailArtifactService.persist(media, artifacts) == 2
-    new_keys = {image.origin for image in Image.select()}
-    assert not old_keys.intersection(new_keys)
-    # Simulate the previous remote request finishing only after the retry committed.
-    for key in old_keys:
-        storage.objects[key] = b"late old bytes"
-    for key in new_keys:
-        assert storage.objects[key] == artifacts[0][1].read_bytes()
+    with pytest.raises(StorageConflict):
+        ThumbnailArtifactService.persist(media, artifacts)
+    assert not MediaThumbnail.select().exists()
+    assert storage.objects[key] == b"different content"
+    assert len(storage.attempted) == 2
 
 
 @pytest.mark.parametrize("generation_failed", [False, True])

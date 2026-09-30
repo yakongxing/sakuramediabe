@@ -78,7 +78,7 @@ def test_thumbnail_empty_task_finishes_explicitly(monkeypatch):
 
 
 @pytest.mark.parametrize("supports_progress", [False, True])
-def test_thumbnail_provider_progress_and_installed_legacy_provider(monkeypatch, supports_progress):
+def test_thumbnail_provider_progress_and_installed_legacy_provider(monkeypatch, tmp_path, supports_progress):
     events = []
     generation = ThumbnailGeneration(1, (ThumbnailArtifact(0, "0.webp"),))
 
@@ -98,7 +98,15 @@ def test_thumbnail_provider_progress_and_installed_legacy_provider(monkeypatch, 
         task_service.ThumbnailArtifactService, "validate_artifact",
         lambda workspace, artifact: workspace / artifact.relative_path,
     )
-    monkeypatch.setattr(task_service.ThumbnailArtifactService, "persist", lambda media, artifacts: len(artifacts))
+    from contextlib import nullcontext
+
+    batch_store = SimpleNamespace(
+        load=lambda: None,
+        new_workspace=lambda: tmp_path,
+        prepare=lambda artifacts, workspace: artifacts,
+    )
+    monkeypatch.setattr(task_service, "ThumbnailBatchStore", lambda media: SimpleNamespace(locked=lambda: nullcontext(batch_store)))
+    monkeypatch.setattr(task_service.ThumbnailArtifactService, "persist_batch", lambda media, batch, **kwargs: len(batch))
     result = MediaThumbnailTaskService._generate_artifacts(
         SimpleNamespace(id=1, library=None), events.append,
     )
