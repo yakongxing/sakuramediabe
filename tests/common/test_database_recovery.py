@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from threading import Barrier
 from unittest.mock import MagicMock
 
@@ -87,6 +88,104 @@ def test_probe_replaces_stale_connection_before_business_sql(fake_db):
     assert connect.call_count == 2
     old.cursor.return_value.execute.assert_called_once_with("SELECT 1")
     new.cursor.return_value.execute.assert_called_once_with("SELECT 42", ())
+
+
+@pytest.mark.parametrize("disconnect", ["closed", "probe", "marked"])
+@pytest.mark.parametrize("depth", [1, 2])
+def test_recovery_preserves_connection_context_stack(fake_db, disconnect, depth):
+    database, (old, new), connect = fake_db
+    with ExitStack() as stack:
+        for _ in range(depth):
+            stack.enter_context(database.connection_context())
+        contexts = list(database._state.ctx)
+        if disconnect == "closed":
+            old.closed = 1
+        elif disconnect == "probe":
+            old.cursor.return_value.execute.side_effect = lambda *args: fail_connection(old)
+        else:
+            database._mark_unavailable()
+        database.execute_sql("SELECT 42")
+        assert database._state.ctx == contexts
+        assert database.connection() is new
+        assert connect.call_count == 2
+        new.close.assert_not_called()
+    assert database.is_closed()
+    assert database._state.ctx == []
+    new.close.assert_called_once()
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_failed_recovery_preserves_context_exit_and_original_error(fake_db, depth):
+    database, (old, new), connect = fake_db
+    failure = psycopg2.OperationalError("connection refused")
+    connect.side_effect = [failure, new]
+    with pytest.raises(DatabaseUnavailable) as caught, ExitStack() as stack:
+        for _ in range(depth):
+            stack.enter_context(database.connection_context())
+        old.closed = 1
+        database.execute_sql("SELECT 42")
+    assert caught.value.__cause__ is failure
+    assert database.is_closed()
+    assert database._state.ctx == []
+    with database.connection_context():
+        database.execute_sql("SELECT 43")
+        assert database.connection() is new
+    assert database.is_closed()
+    new.close.assert_called_once()
+
+
+def test_recovery_can_retry_inside_still_active_connection_context(fake_db):
+    database, (old, new), connect = fake_db
+    connect.side_effect = [psycopg2.OperationalError("connection refused"), new]
+    with database.connection_context():
+        contexts = list(database._state.ctx)
+        old.closed = 1
+        with pytest.raises(DatabaseUnavailable):
+            database.execute_sql("SELECT 42")
+        assert database._state.ctx == contexts
+        assert database.is_closed()
+        database.execute_sql("SELECT 43")
+        assert database._state.ctx == contexts
+        assert database.connection() is new
+        new.close.assert_not_called()
+    assert database.is_closed()
+    new.close.assert_called_once()
+
+
+@pytest.mark.parametrize("entry", ["nested_context", "connection"])
+def test_failed_recovery_allows_reopening_within_outer_context(fake_db, entry):
+    database, (old, new), connect = fake_db
+    connect.side_effect = [psycopg2.OperationalError("connection refused"), new]
+    with database.connection_context():
+        contexts = list(database._state.ctx)
+        old.closed = 1
+        with pytest.raises(DatabaseUnavailable):
+            database.execute_sql("SELECT 42")
+        if entry == "nested_context":
+            with database.connection_context():
+                assert database.connection() is new
+                assert database._state.ctx[:-1] == contexts
+        else:
+            assert database.connection() is new
+        assert database._state.ctx == contexts
+        new.close.assert_not_called()
+    assert database.is_closed()
+    new.close.assert_called_once()
+
+
+def test_recovered_inner_context_does_not_close_outer_connection(fake_db):
+    database, (old, new), _ = fake_db
+    with pytest.raises(RuntimeError, match="business error"), database.connection_context():
+        with database.connection_context():
+            old.closed = 1
+            database.execute_sql("SELECT 42")
+        assert not database.is_closed()
+        assert len(database._state.ctx) == 1
+        assert database.connection() is new
+        new.close.assert_not_called()
+        raise RuntimeError("business error")
+    assert database.is_closed()
+    new.close.assert_called_once()
 
 
 @pytest.mark.parametrize("sql", ["INSERT INTO item VALUES (1)", "BEGIN", "COMMIT"])
@@ -251,7 +350,10 @@ def test_multiple_long_lived_threads_recover_independently(test_db):
             terminate_connection(old)
             assert database.execute_sql("SELECT 42").fetchone() == (42,)
             assert database.connection() is not old
-            return database.connection().get_backend_pid()
+            pid = database.connection().get_backend_pid()
+        assert database.is_closed()
+        assert database._state.ctx == []
+        return pid
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         results = list(executor.map(lambda _: work(), range(3)))

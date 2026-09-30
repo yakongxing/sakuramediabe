@@ -86,6 +86,26 @@ class RecoveringPostgresqlDatabase(PostgresqlDatabase):
         self._state.recovery_needed = False
         return connection
 
+    def connect(self, reuse_if_open=False):
+        # connection() and nested connection_context() can reopen directly after
+        # a caught recovery failure, without passing through _ensure_connection().
+        contexts = self._state.ctx
+        try:
+            return super().connect(reuse_if_open=reuse_if_open)
+        finally:
+            self._state.ctx = contexts
+
+    def _replace_connection(self):
+        # Peewee resets ctx on close/connect. Active connection scopes belong to
+        # the caller, not the dead session, and must unwind even if reconnect fails.
+        contexts = self._state.ctx
+        try:
+            if not self.is_closed():
+                self.close()
+            self.connect()
+        finally:
+            self._state.ctx = contexts
+
     def _ensure_connection(self):
         # Never replace a session inside a transaction or while it owns a
         # session-level advisory lock. Peewee must unwind its own transaction stack.
@@ -95,13 +115,12 @@ class RecoveringPostgresqlDatabase(PostgresqlDatabase):
                 raise DatabaseUnavailable("Database temporarily unavailable")
             return
         if self.is_closed():
-            self.connect()
+            self._replace_connection()
             return
         connection = self._state.conn
         if connection.closed or getattr(self._state, "recovery_needed", False):
             self._mark_unavailable()
-            self.close()
-            self.connect()
+            self._replace_connection()
             return
         # Also respect transactions started directly through a driver cursor.
         if connection.get_transaction_status() != TRANSACTION_STATUS_IDLE:
@@ -113,8 +132,7 @@ class RecoveringPostgresqlDatabase(PostgresqlDatabase):
             if not _is_disconnect(exc, connection):
                 raise
             self._mark_unavailable()
-            self.close()
-            self.connect()
+            self._replace_connection()
 
     def cursor(self, named_cursor=None):
         self._ensure_connection()

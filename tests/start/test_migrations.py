@@ -400,9 +400,17 @@ def test_consolidated_migration_upgrades_v0421_schema_and_preserves_required_mem
     with clean_db.atomic():
         consolidated.migrate(clean_db)
         SchemaMigration.create(name=CONSOLIDATED_MIGRATION_NAME)
+    registered = set(_schema_migration_names(clean_db))
+    available = {module.name for module in _list_migration_modules()}
+    pending = available - registered
     summary = run_pending_migrations(clean_db)
 
-    assert summary.applied_count == 16
+    assert {item.name for item in summary.executed if item.applied} == pending
+    assert {item.name for item in summary.executed if not item.applied} == available & registered
+    assert summary.applied_count == len(pending)
+    assert summary.skipped_count == len(available & registered)
+    assert DROP_MOVIE_EXTRA_MIGRATION_NAME in pending
+    assert "extra" not in _column_names(clean_db, "movie")
     assert clean_db.execute_sql(
         "SELECT interaction_synced_at FROM movie WHERE id = %s", (movie.id,)
     ).fetchone()[0] == datetime(2026, 8, 20, 1, 2, 3)
@@ -465,6 +473,11 @@ def test_consolidated_migration_upgrades_v0421_schema_and_preserves_required_mem
         "SELECT field_owners FROM movie WHERE id = %s", (movie.id,)
     ).fetchone()[0] == {"is_collection": "host:manual"}
     assert "is_blacklisted" in _column_names(clean_db, "movie")
+    assert set(_schema_migration_names(clean_db)) == registered | available
+    repeated = run_pending_migrations(clean_db)
+    assert repeated.applied_count == 0
+    assert repeated.skipped_count == len(available)
+    assert {item.name for item in repeated.executed} == available
 
 
 def test_remove_media_special_tags_migration_drops_data_and_virtual_playlists(clean_db):
