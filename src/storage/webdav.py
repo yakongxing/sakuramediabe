@@ -396,18 +396,6 @@ class WebDAVStorageBackend:
                     raise self._error(stage, exc) from exc
                 self._pause(exc, self._retry_delays[attempt], stage=stage, attempt=attempt + 1)
 
-    def _stat_visible(self, key: str, *, stage: str, retry_delays: tuple[float, ...] | None = None) -> ObjectStat:
-        delays = self._retry_delays if retry_delays is None else retry_delays
-        for attempt in range(len(delays) + 1):
-            try:
-                return self._stat_once(key)
-            except (StorageNotFound, StorageUnavailable) as exc:
-                transient = isinstance(exc, StorageNotFound) or self._is_transient(exc)
-                if not transient or attempt == len(delays):
-                    raise StorageUnavailable(f"WebDAV {stage} visibility failed ({self._status_code(exc) or 'network'})", stage=stage, status_code=self._status_code(exc), retryable=transient) from exc
-                self._pause(exc, delays[attempt], stage=stage, attempt=attempt + 1)
-        raise AssertionError("unreachable")
-
     def _download_once(self, key: str, target) -> None:
         with self._network(), self.http.stream("GET", self._url(key), headers={"Accept-Encoding": "identity"}, timeout=self._request_timeout()) as response:
             response.raise_for_status()
@@ -433,35 +421,31 @@ class WebDAVStorageBackend:
             return None
         return destination
 
-    def _verify_content(self, key: str, size: int, digest: str, *, published: bool) -> ObjectStat:
+    def _verify_content(self, key: str, size: int, digest: str) -> ObjectStat:
         try:
-            return self._verify_content_attempts(key, size, digest, published=published)
+            return self._verify_content_attempts(key, size, digest)
         except StorageIntegrityError as exc:
-            exc.publication_possible = published
+            exc.publication_possible = True
             raise
         except StoragePublicationUnknown:
             raise
         except StorageError as exc:
-            if published:
-                raise StoragePublicationUnknown(key, "WebDAV publication reconciliation failed", stage="verify", status_code=self._status_code(exc), retryable=exc.retryable) from exc
-            raise
+            raise StoragePublicationUnknown(key, "WebDAV publication reconciliation failed", stage="verify", status_code=self._status_code(exc), retryable=exc.retryable) from exc
 
-    def _verify_content_attempts(self, key: str, size: int, digest: str, *, published: bool) -> ObjectStat:
-        delays = self._final_visibility_retry_delays if published else self._retry_delays
+    def _verify_content_attempts(self, key: str, size: int, digest: str) -> ObjectStat:
+        delays = self._final_visibility_retry_delays
         for attempt in range(len(delays) + 1):
             try:
                 result = self._destination_matches(key, expected_size=size, expected_sha256=digest)
                 if result is None:
-                    raise StorageIntegrityError(f"WebDAV content mismatch key={key}", stage="verify", publication_possible=published)
+                    raise StorageIntegrityError(f"WebDAV content mismatch key={key}", stage="verify", publication_possible=True)
                 return result
             except StorageIntegrityError:
                 raise
             except (StorageNotFound, StorageUnavailable) as exc:
                 transient = self._status_code(exc) == 404 or self._is_transient(exc)
                 if not transient or attempt == len(delays):
-                    if published:
-                        raise StoragePublicationUnknown(key, "WebDAV published object cannot be verified", stage="verify", status_code=self._status_code(exc), retryable=transient) from exc
-                    raise StorageUnavailable("WebDAV temporary content cannot be verified", stage="temporary_verify", status_code=self._status_code(exc), retryable=transient) from exc
+                    raise StoragePublicationUnknown(key, "WebDAV published object cannot be verified", stage="verify", status_code=self._status_code(exc), retryable=transient) from exc
                 self._pause(exc, delays[attempt], stage="verify", attempt=attempt + 1)
         raise AssertionError("unreachable")
 
@@ -566,13 +550,9 @@ class WebDAVStorageBackend:
                 except Exception as pause_error:
                     raise StoragePublicationUnknown(key, "WebDAV move reconciliation budget exhausted", stage="move", retryable=True) from pause_error
                 continue
-            try:
-                final = self._stat_visible(key, stage="final", retry_delays=self._final_visibility_retry_delays)
-            except StorageUnavailable as exc:
-                raise StoragePublicationUnknown(key, "WebDAV publish committed but final visibility is unknown", stage="final", status_code=self._status_code(exc), retryable=exc.retryable) from exc
-            if not final.is_file or final.size != size:
-                raise StorageIntegrityError(f"WebDAV final size mismatch key={key}", stage="final_verify", publication_possible=True)
-            return final, "created" if status == 201 and not ambiguous else "published"
+            # A successful MOVE acknowledges publication; remote reads are only
+            # needed to reconcile ambiguous responses or immutable conflicts.
+            return ObjectStat(key, size), "created" if status == 201 and not ambiguous else "published"
         raise AssertionError("unreachable")
 
     def _delete_temporary_best_effort(self, key: str):
@@ -592,7 +572,7 @@ class WebDAVStorageBackend:
                 with self._uncertain_lock:
                     previous = self._uncertain_publications.get(identity)
                 if previous is not None:
-                    final = self._verify_content(key, size, expected_sha256, published=True)
+                    final = self._verify_content(key, size, expected_sha256)
                     disposition = "published"
                     operation_id = previous
                 else:
@@ -601,12 +581,6 @@ class WebDAVStorageBackend:
                     if validate_source is not None:
                         validate_source()
                     temporary = self._upload_temporary(key, stream, size, expected_sha256, repaired, safe_temps)
-                    if immutable:
-                        self._verify_content(temporary, size, expected_sha256, published=False)
-                    else:
-                        staged = self._stat_visible(temporary, stage="temporary")
-                        if not staged.is_file or staged.size != size:
-                            raise StorageIntegrityError(f"WebDAV upload size mismatch key={key}", stage="temporary_verify")
                     if validate_source is not None:
                         validate_source()
                     final, disposition = self._move_with_retry(temporary, key, size, expected_sha256, overwrite=overwrite, immutable=immutable, repaired=repaired, safe_temps=safe_temps)

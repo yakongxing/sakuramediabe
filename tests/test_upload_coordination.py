@@ -106,7 +106,6 @@ def test_same_key_waiter_does_not_block_an_unrelated_publication(monkeypatch):
     monkeypatch.setattr(PublicationBudget, "remaining", tracked_remaining)
     monkeypatch.setattr(backend, "_ensure_parents", lambda *_args: None)
     monkeypatch.setattr(backend, "_upload_temporary", staged)
-    monkeypatch.setattr(backend, "_stat_visible", lambda key, **_kwargs: ObjectStat(key, 5))
     monkeypatch.setattr(backend, "_move_with_retry", publish)
     first = Thread(name="first", target=run, args=("first", "shared.webp"))
     contender = Thread(name="contender", target=run, args=("contender", "shared.webp"))

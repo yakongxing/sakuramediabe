@@ -177,13 +177,15 @@ def test_webdav_immutable_put_uses_temporary_key_and_no_overwrite_move(monkeypat
     assert moves == [((uploads[0][0], "assets/movies/a/cover-deadbeef.jpg"), {"overwrite": False})]
 
 
-def test_webdav_immutable_put_rejects_same_size_wrong_content(monkeypatch, tmp_path):
+def test_webdav_immutable_conflict_rejects_same_size_wrong_content(monkeypatch, tmp_path):
     from src.storage import webdav as module
 
     class FakeClient:
         def __init__(self, *args, **kwargs): pass
         def mkdir(self, path): pass
         def upload_fileobj(self, *args, **kwargs): pass
+        def move(self, src_path, dst_path, *, overwrite=False): raise module.ResourceAlreadyExists(dst_path)
+        def remove(self, path): pass
         def info(self, path): return {"size": 5, "type": "file", "etag": "not-a-hash"}
         def download_fileobj(self, path, target): target.write(b"wrong")
 
@@ -192,13 +194,13 @@ def test_webdav_immutable_put_rejects_same_size_wrong_content(monkeypatch, tmp_p
     source = tmp_path / "image.jpg"
     source.write_bytes(b"image")
 
-    with pytest.raises(module.StorageUnavailable, match="content mismatch"):
+    with pytest.raises(module.StorageConflict, match="content mismatch"):
         module.WebDAVStorageBackend("https://dav.example", "assets").put_file(
             "movies/a/hash.jpg", source, overwrite=False, immutable=True
         )
 
 
-def test_webdav_put_retries_eventual_temp_visibility_404(monkeypatch):
+def test_webdav_put_does_not_wait_for_temp_visibility(monkeypatch):
     from src.storage import webdav as module
 
     info_calls = []
@@ -209,9 +211,7 @@ def test_webdav_put_retries_eventual_temp_visibility_404(monkeypatch):
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
         def info(self, path):
             info_calls.append(path)
-            if ".uploading-" in path and info_calls.count(path) == 1:
-                raise module.ResourceNotFound(path)
-            return {"size": 5, "type": "file"}
+            raise module.ResourceNotFound(path)
         def move(self, src_path, dst_path, *, overwrite=False): pass
         def remove(self, path): pass
 
@@ -223,7 +223,7 @@ def test_webdav_put_retries_eventual_temp_visibility_404(monkeypatch):
     )
 
     assert backend.put_bytes("movies/cover.jpg", b"image").size == 5
-    assert sleeps
+    assert info_calls == sleeps == []
 
 
 def test_webdav_put_retries_transient_move_423(monkeypatch):
@@ -522,7 +522,7 @@ def test_webdav_cleanup_failure_does_not_mask_publish_error(monkeypatch):
         backend.put_bytes("movies/cover.jpg", b"image")
 
 
-def test_webdav_put_retries_eventual_final_visibility_404(monkeypatch):
+def test_webdav_put_does_not_wait_for_final_visibility(monkeypatch):
     from src.storage import webdav as module
 
     final_info_calls = 0
@@ -535,8 +535,7 @@ def test_webdav_put_retries_eventual_final_visibility_404(monkeypatch):
             nonlocal final_info_calls
             if ".uploading-" not in path:
                 final_info_calls += 1
-                if final_info_calls == 1:
-                    raise module.ResourceNotFound(path)
+                raise module.ResourceNotFound(path)
             return {"size": 5, "type": "file"}
         def move(self, src_path, dst_path, *, overwrite=False): pass
         def remove(self, path): pass
@@ -548,10 +547,10 @@ def test_webdav_put_retries_eventual_final_visibility_404(monkeypatch):
     )
 
     assert backend.put_bytes("movies/cover.jpg", b"image").size == 5
-    assert final_info_calls == 2
+    assert final_info_calls == 0
 
 
-def test_webdav_final_visibility_uses_separate_realistic_retry_window(monkeypatch):
+def test_webdav_unconfirmed_publication_uses_final_visibility_retry_window(monkeypatch):
     from src.storage import webdav as module
 
     final_info_calls = 0
@@ -563,12 +562,13 @@ def test_webdav_final_visibility_uses_separate_realistic_retry_window(monkeypatc
         def upload_fileobj(self, file_obj, to_path, **kwargs): objects[to_path] = file_obj.read()
         def info(self, path):
             nonlocal final_info_calls
-            if ".uploading-" in path:
-                return {"size": len(objects[path]), "type": "file"}
             final_info_calls += 1
             if final_info_calls <= 5: raise module.ResourceNotFound(path)
             return {"size": len(objects[path]), "type": "file"}
-        def move(self, src_path, dst_path, *, overwrite=False): objects[dst_path] = objects.pop(src_path)
+        def move(self, src_path, dst_path, *, overwrite=False):
+            objects[dst_path] = objects.pop(src_path)
+            raise module.StoragePublicationUnknown(dst_path, "response lost", stage="move")
+        def download_fileobj(self, path, target): target.write(objects[path])
         def remove(self, path): objects.pop(path, None)
 
     monkeypatch.setattr(module, "Client", FakeClient)
@@ -578,11 +578,14 @@ def test_webdav_final_visibility_uses_separate_realistic_retry_window(monkeypatc
         retry_delays=(0,), final_visibility_retry_delays=(0, 0, 0, 0, 0),
     )
 
+    with pytest.raises(module.StoragePublicationUnknown):
+        backend.put_bytes("movies/cover.jpg", b"image")
+    assert final_info_calls == 0
     assert backend.put_bytes("movies/cover.jpg", b"image").size == 5
     assert final_info_calls == 6
 
 
-def test_webdav_exhausted_final_visibility_reports_possible_publication(monkeypatch):
+def test_webdav_exhausted_reconciliation_reports_possible_publication(monkeypatch):
     from src.storage import webdav as module
     from src.storage.types import StoragePublicationUnknown
 
@@ -590,10 +593,9 @@ def test_webdav_exhausted_final_visibility_reports_possible_publication(monkeypa
         def __init__(self, *args, **kwargs): pass
         def mkdir(self, path): pass
         def upload_fileobj(self, file_obj, to_path, **kwargs): pass
-        def info(self, path):
-            if ".uploading-" in path: return {"size": 5, "type": "file"}
-            raise module.ResourceNotFound(path)
-        def move(self, src_path, dst_path, *, overwrite=False): pass
+        def info(self, path): raise module.ResourceNotFound(path)
+        def move(self, src_path, dst_path, *, overwrite=False):
+            raise StoragePublicationUnknown(dst_path, "response lost", stage="move")
         def remove(self, path): pass
 
     monkeypatch.setattr(module, "Client", FakeClient)
@@ -603,9 +605,12 @@ def test_webdav_exhausted_final_visibility_reports_possible_publication(monkeypa
         retry_delays=(), final_visibility_retry_delays=(0, 0),
     )
 
+    with pytest.raises(StoragePublicationUnknown):
+        backend.put_bytes("movies/cover.jpg", b"image")
     with pytest.raises(StoragePublicationUnknown) as raised:
         backend.put_bytes("movies/cover.jpg", b"image")
     assert raised.value.key == "movies/cover.jpg"
+    assert raised.value.stage == "verify"
     assert raised.value.publication_possible is True
 
 

@@ -52,7 +52,7 @@ class ObjectStat:
 
 @dataclass(frozen=True)
 class PublicationResult(ObjectStat):
-    """Verified publication, not permission to delete a potentially shared key."""
+    """Backend-acknowledged publication, not permission to delete a shared key."""
 
     operation_id: str = ""
     disposition: Literal["created", "reused", "published"] = "published"

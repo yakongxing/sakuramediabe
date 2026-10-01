@@ -97,6 +97,23 @@ def dav(monkeypatch):
     backend.http.close()
 
 
+@pytest.fixture
+def unconfirmed_dav(dav):
+    backend, server, _ = dav
+
+    def fault(request):
+        if request.method == "MOVE":
+            server.normal(request)
+            return httpx.Response(202)
+
+    server.fault = fault
+    with pytest.raises(StoragePublicationUnknown):
+        backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    server.fault = lambda request: None
+    server.requests.clear()
+    return dav
+
+
 def test_directory_cache_and_normal_move_request_counts(dav):
     backend, server, _ = dav
     backend.put_bytes("movies/a/1.webp", b"first")
@@ -105,17 +122,49 @@ def test_directory_cache_and_normal_move_request_counts(dav):
     counts = Counter(method for method, _, _ in server.requests)
     assert counts["MKCOL"] == first_count["MKCOL"] == 3
     assert counts["PUT"] == counts["MOVE"] == 2
-    assert counts["PROPFIND"] == 4
-    assert counts["DELETE"] == counts["GET"] == 0
+    assert counts["PROPFIND"] == counts["DELETE"] == counts["GET"] == 0
     assert backend.client.chunk_size == 65536
 
 
-def test_immutable_success_verifies_full_content_before_atomic_move(dav):
+def test_immutable_success_moves_without_remote_verification(dav):
     backend, server, _ = dav
     backend.put_bytes("movies/hash.webp", b"image", immutable=True, overwrite=False)
     methods = [method for method, _, _ in server.requests]
-    assert methods[methods.index("PUT") + 1:] == ["PROPFIND", "GET", "MOVE", "PROPFIND"]
-    assert all(".uploading-" in path for method, path, _ in server.requests if method in {"PUT", "GET"})
+    assert methods[methods.index("PUT") + 1:] == ["MOVE"]
+    assert all(".uploading-" in path for method, path, _ in server.requests if method == "PUT")
+
+
+@pytest.mark.parametrize("immutable", [False, True])
+@pytest.mark.parametrize("from_file", [False, True])
+@pytest.mark.parametrize("move_status", [201, 204])
+@pytest.mark.parametrize("read_failure", [404, 503, "transport"])
+def test_successful_upload_does_not_depend_on_remote_reads(dav, tmp_path, immutable, from_file, move_status, read_failure):
+    backend, server, sleeps = dav
+
+    def fault(request):
+        if request.method in {"PROPFIND", "GET"}:
+            if read_failure == "transport":
+                raise httpx.ReadError("remote reads unavailable", request=request)
+            return httpx.Response(read_failure)
+        if request.method == "MOVE":
+            assert request.headers["Overwrite"] == ("F" if immutable else "T")
+            server.normal(request)
+            return httpx.Response(move_status)
+
+    server.fault = fault
+    if from_file:
+        source = tmp_path / "image.webp"
+        source.write_bytes(b"image")
+        result = backend.put_file("a.webp", source, immutable=immutable, overwrite=not immutable)
+    else:
+        result = backend.put_bytes("a.webp", b"image", immutable=immutable, overwrite=not immutable)
+
+    assert result.key == "a.webp" and result.size == 5 and result.is_file
+    assert result.etag is None and result.operation_id
+    assert result.disposition == ("created" if move_status == 201 else "published")
+    assert server.objects == {"/dav/assets/a.webp": b"image"}
+    assert [method for method, _, _ in server.requests] == ["MKCOL", "PUT", "MOVE"]
+    assert sleeps == []
 
 
 @pytest.mark.parametrize("immutable", [False, True])
@@ -184,11 +233,14 @@ def test_mkdir_409_is_not_accepted_as_success(dav):
 
 
 @pytest.mark.parametrize("immutable", [False, True])
-def test_committed_but_invisible_result_is_unknown_and_retry_reconciles(dav, immutable):
+def test_unconfirmed_invisible_result_is_unknown_and_retry_reconciles(dav, immutable):
     backend, server, _ = dav
     final_path = "/dav/assets/a.webp"
 
     def invisible(request):
+        if request.method == "MOVE":
+            server.normal(request)
+            raise httpx.ReadTimeout("response lost", request=request)
         if request.method == "PROPFIND" and request.url.path == final_path and final_path in server.objects:
             return httpx.Response(404)
 
@@ -217,28 +269,29 @@ def test_move_response_lost_is_confirmed_by_hash(dav):
     assert sum(method == "GET" for method, _, _ in server.requests) == 1
 
 
-def test_verification_download_failure_is_not_content_mismatch(dav):
-    backend, server, _ = dav
+def test_unconfirmed_publication_download_failure_is_not_content_mismatch(unconfirmed_dav):
+    backend, server, _ = unconfirmed_dav
     server.fault = lambda request: httpx.Response(503) if request.method == "GET" else None
-    with pytest.raises(StorageUnavailable) as caught:
+    with pytest.raises(StoragePublicationUnknown) as caught:
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
-    assert not isinstance(caught.value, StoragePublicationUnknown)
-    assert caught.value.stage == "temporary_verify"
+    assert caught.value.stage == "verify"
     assert sum(method == "GET" for method, _, _ in server.requests) == 3
-    assert "/dav/assets/a.webp" not in server.objects
-    assert not any(method == "MOVE" for method, _, _ in server.requests)
+    assert server.objects == {"/dav/assets/a.webp": b"image"}
+    assert not any(method in {"PUT", "MOVE", "DELETE"} for method, _, _ in server.requests)
 
 
-def test_equal_size_wrong_content_fails_full_verification(dav):
-    backend, server, _ = dav
+def test_unconfirmed_publication_rejects_equal_size_wrong_content(unconfirmed_dav):
+    backend, server, _ = unconfirmed_dav
     server.fault = lambda request: httpx.Response(200, content=b"wrong") if request.method == "GET" else None
     with pytest.raises(StorageUnavailable, match="content mismatch") as caught:
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
     assert not isinstance(caught.value, StoragePublicationUnknown)
+    assert caught.value.publication_possible
+    assert not any(method in {"PUT", "MOVE", "DELETE"} for method, _, _ in server.requests)
 
 
-def test_get_404_after_stat_is_retried(dav):
-    backend, server, _ = dav
+def test_get_404_after_stat_is_retried_during_reconciliation(unconfirmed_dav):
+    backend, server, _ = unconfirmed_dav
     gets = []
 
     def fault(request):
@@ -284,8 +337,8 @@ def test_digest_comparison_distinguishes_missing_from_mismatch(dav):
     assert backend._destination_matches("a.webp", expected_size=5, expected_sha256=hashlib.sha256(b"image").hexdigest()) is None
 
 
-def test_broken_verification_stream_has_bounded_retries_and_is_closed(dav):
-    backend, server, sleeps = dav
+def test_broken_reconciliation_stream_has_bounded_retries_and_is_closed(unconfirmed_dav):
+    backend, server, sleeps = unconfirmed_dav
     streams = []
 
     class BrokenStream(httpx.SyncByteStream):
@@ -305,12 +358,12 @@ def test_broken_verification_stream_has_bounded_retries_and_is_closed(dav):
             return httpx.Response(200, stream=stream, headers={"Accept-Ranges": "bytes"})
 
     server.fault = fault
-    with pytest.raises(StorageUnavailable):
+    with pytest.raises(StoragePublicationUnknown):
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
     assert len(streams) == 3
     assert all(stream.closed for stream in streams)
     assert len(sleeps) == 2
-    assert not any(method == "MOVE" for method, _, _ in server.requests)
+    assert not any(method in {"PUT", "MOVE", "DELETE"} for method, _, _ in server.requests)
 
 
 def test_conflict_with_unreadable_destination_is_unknown(dav):
@@ -472,8 +525,8 @@ def test_move_budget_exhaustion_keeps_unknown_classification(dav):
     assert not any(method == "DELETE" for method, _, _ in server.requests)
 
 
-def test_slow_small_verification_chunks_check_deadline_and_close(dav):
-    backend, server, _ = dav
+def test_slow_small_reconciliation_chunks_check_deadline_and_close(unconfirmed_dav):
+    backend, server, _ = unconfirmed_dav
 
     class SlowStream(httpx.SyncByteStream):
         closed = False
@@ -489,10 +542,10 @@ def test_slow_small_verification_chunks_check_deadline_and_close(dav):
 
     stream = SlowStream()
     server.fault = lambda request: httpx.Response(200, stream=stream) if request.method == "GET" else None
-    with pytest.raises(StorageUnavailable):
+    with pytest.raises(StoragePublicationUnknown):
         backend.put_bytes("a.webp", b"image", overwrite=False, immutable=True)
     assert stream.closed
-    assert not any(method == "MOVE" for method, _, _ in server.requests)
+    assert not any(method in {"PUT", "MOVE", "DELETE"} for method, _, _ in server.requests)
 
 
 def test_modified_source_is_rejected_before_publication(dav, monkeypatch, tmp_path):
@@ -509,6 +562,25 @@ def test_modified_source_is_rejected_before_publication(dav, monkeypatch, tmp_pa
     with pytest.raises(StorageUnavailable, match="source changed"):
         backend.put_file("a.webp", source)
     assert not any(method in {"PUT", "MOVE"} for method, _, _ in server.requests)
+
+
+def test_source_changed_during_upload_is_rejected_before_move(dav, tmp_path):
+    backend, server, _ = dav
+    source = tmp_path / "image.webp"
+    source.write_bytes(b"image")
+
+    def fault(request):
+        if request.method == "PUT":
+            server.normal(request)
+            source.write_bytes(b"changed content")
+            return httpx.Response(201)
+
+    server.fault = fault
+    with pytest.raises(StorageUnavailable, match="source changed during publication"):
+        backend.put_file("a.webp", source, immutable=True, overwrite=False)
+    assert not any(method == "MOVE" for method, _, _ in server.requests)
+    assert any(method == "DELETE" for method, _, _ in server.requests)
+    assert not server.objects
 
 
 def test_zero_byte_upload_is_not_missing_length(dav):
@@ -561,6 +633,9 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
     artifacts = [(ThumbnailArtifact(offset, "source.webp"), source) for offset in (3, 6)]
 
     def fault(request):
+        if unknown and request.method == "MOVE" and "/.6.webp.uploading-" in request.url.path:
+            server.normal(request)
+            raise httpx.ReadTimeout("response lost", request=request)
         if unknown and request.method == "PROPFIND" and request.url.path.endswith("/6.webp"):
             return httpx.Response(404)
         if not unknown and request.method == "PUT" and "/.6.webp.uploading-" in request.url.path:
