@@ -15,6 +15,7 @@ from src.plugins.provider_protocol import (
 from src.service.playback.operation_locks import MediaOperationBusy
 from src.service.playback.thumbnails.artifacts import ThumbnailArtifactService
 from src.service.playback.thumbnails.batches import ThumbnailBatch, ThumbnailBatchStore
+from src.service.playback.thumbnails.contracts import ThumbnailPublicationIncomplete
 from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
 from src.storage.local import LocalStorageBackend
 from src.storage.types import StoragePublicationUnknown, StorageUnavailable
@@ -66,7 +67,7 @@ def test_retry_reloads_disk_progress_and_cleans_only_after_commit(publication):
     assert [entry["state"] for entry in batch.entries] == ["uploaded", "uploading"]
     assert batch.source(batch.entries[0]).exists()
     assert len(list(storage.root.rglob("*.webp"))) == 1
-    assert not MediaThumbnail.select().exists()
+    assert [row.offset for row in MediaThumbnail.select()] == [3]
     # Neither the previous in-memory batch nor the original source is needed.
     artifacts[0][1].unlink()
     storage.failure = None
@@ -91,7 +92,12 @@ def test_requested_retry_does_not_call_provider_again(publication, monkeypatch):
     monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda library: Provider())
     storage.failure = StorageUnavailable("offline", retryable=True)
     first = MediaThumbnailTaskService.generate_requested_media(media.id)
-    assert first.state == "retryable_failed"
+    assert first.state == "terminal_failed"
+    assert first.error_code == ThumbnailPublicationIncomplete.ERROR_CODE
+    assert first.generated_count == 1
+    assert Media.get_by_id(media.id).thumbnail_next_retry_at is None
+    assert MediaThumbnailTaskService.count_pending_media() == 0
+    assert MediaThumbnailTaskService.count_terminal_failed_media() == 1
     assert calls == [media.id]
     storage.failure = None
     monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda library: pytest.fail("regenerated"))
@@ -100,6 +106,85 @@ def test_requested_retry_does_not_call_provider_again(publication, monkeypatch):
     assert second.state == "succeeded"
     assert len(storage.attempts) == 3
     assert events  # Fast retries may finish within the progress heartbeat throttle.
+
+
+def test_bulk_partial_upload_counts_available_images_then_waits_for_user(publication, monkeypatch):
+    from types import SimpleNamespace
+
+    media, artifacts, storage = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        store.prepare(artifacts)
+    monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda _library: pytest.fail("regenerated"))
+    storage.failure = StorageUnavailable("offline", retryable=True)
+    reporter = SimpleNamespace(emit=lambda **_kwargs: None)
+    result = MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)
+    assert result["successful_media"] == 0 and result["terminal_failed_media"] == 1
+    assert result["generated_thumbnails"] == 1
+    assert MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)["pending_media"] == 0
+    assert len(storage.attempts) == 2
+
+
+def test_explicit_reset_resumes_partial_thumbnails_without_regeneration(publication, monkeypatch):
+    from types import SimpleNamespace
+
+    media, artifacts, storage = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        store.prepare(artifacts)
+    monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda _library: pytest.fail("regenerated"))
+    storage.failure = StorageUnavailable("offline", retryable=True)
+    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
+    existing_id = MediaThumbnail.get().id
+    reporter = SimpleNamespace(emit=lambda **_kwargs: None)
+    assert MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)["pending_media"] == 0
+    assert len(storage.attempts) == 2
+    storage.failure = None
+    assert MediaThumbnailTaskService.reset_terminal_media([media.id]) == 1
+    assert MediaThumbnailTaskService.count_pending_media() == 1
+    assert MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)["successful_media"] == 1
+    assert len(storage.attempts) == 3
+    assert MediaThumbnail.get(MediaThumbnail.offset == 3).id == existing_id
+    assert MediaThumbnail.select().count() == 2
+    assert Media.get_by_id(media.id).thumbnail_generation_state == Media.THUMBNAIL_STATE_SUCCEEDED
+
+
+@pytest.mark.parametrize("reset_first", [False, True])
+def test_missing_partial_batch_is_not_treated_as_complete(publication, monkeypatch, reset_first):
+    media, artifacts, storage = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        store.prepare(artifacts)
+    monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda _library: pytest.fail("regenerated"))
+    storage.failure = StorageUnavailable("offline", retryable=True)
+    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
+    store.manifest_path.unlink()
+    if reset_first:
+        assert MediaThumbnailTaskService.reset_terminal_media([media.id]) == 1
+    result = MediaThumbnailTaskService.generate_requested_media(media.id)
+    assert result.state == "terminal_failed"
+    assert result.error_code == ThumbnailPublicationIncomplete.ERROR_CODE
+    assert result.generated_count == 1
+    assert len(storage.attempts) == 2
+    assert MediaThumbnail.select().count() == 1
+    assert "清单缺失" in Media.get_by_id(media.id).thumbnail_last_error
+
+
+def test_partial_marker_survives_local_failure_and_missing_manifest(publication, monkeypatch):
+    media, artifacts, storage = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        store.prepare(artifacts)
+    monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda _library: pytest.fail("regenerated"))
+    storage.failure = StorageUnavailable("offline", retryable=True)
+    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
+    batch = store.load()
+    batch.source(batch.entries[1]).write_bytes(b"corrupt")
+    failed = MediaThumbnailTaskService.generate_requested_media(media.id)
+    assert failed.state == "terminal_failed" and failed.error_code == ThumbnailPublicationIncomplete.ERROR_CODE
+    refreshed = Media.get_by_id(media.id)
+    assert refreshed.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE
+    assert "thumbnail_batch_file_invalid" in refreshed.thumbnail_last_error
+    store.manifest_path.unlink()
+    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
+    assert MediaThumbnail.select().count() == 1
+    assert len(storage.attempts) == 2
 
 
 def test_database_failure_retries_only_commit(publication, monkeypatch):
@@ -137,10 +222,10 @@ def test_commit_response_loss_is_reconciled_on_next_request(publication, monkeyp
             ThumbnailArtifactService.persist(media, artifacts)
     batch = ThumbnailBatchStore(media).load()
     assert batch is not None
-    assert MediaThumbnail.select().count() == 2
-    # A partly completed cleanup must not prevent committed-batch reconciliation.
+    assert MediaThumbnail.select().count() == 1
+    # A committed file is no longer needed locally to finish the remaining batch.
     batch.source(batch.entries[0]).unlink()
-    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "already_exists"
+    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "succeeded"
     assert not batch.workspace.exists()
     assert ThumbnailBatchStore(media).load() is None
     assert len(storage.attempts) == 2
@@ -180,13 +265,14 @@ def test_remote_uncertainty_does_not_turn_read_failure_into_missing(publication,
     media, artifacts, storage = publication
     storage.failure = StorageUnavailable("offline", retryable=True)
     storage.unknown = True
-    with pytest.raises(StoragePublicationUnknown):
+    with pytest.raises(ThumbnailPublicationIncomplete):
         ThumbnailArtifactService.persist(media, artifacts)
     storage.failure = None
     with monkeypatch.context() as patch:
         patch.setattr(storage, "stat", lambda key: (_ for _ in ()).throw(StorageUnavailable("read offline")))
-        with pytest.raises(StorageUnavailable, match="read offline"):
+        with pytest.raises(ThumbnailPublicationIncomplete) as caught:
             ThumbnailArtifactService.persist(media, [])
+        assert str(caught.value.__cause__) == "read offline"
     assert len(storage.attempts) == 2
     assert ThumbnailArtifactService.persist(media, []) == 2
     assert len(storage.attempts) == 2
@@ -249,6 +335,20 @@ def test_manifest_replace_failure_preserves_previous_checkpoint(publication, mon
         assert set(store.directory.iterdir()) == {store.manifest_path, batch.workspace}
 
 
+def test_failed_checkpoint_preserves_previous_error_metadata(publication, monkeypatch):
+    media, artifacts, _ = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        batch = store.prepare(artifacts)
+        entry = batch.entries[0]
+        batch.checkpoint(entry, "uploading", error=StorageUnavailable("offline", status_code=503))
+        before = dict(entry)
+        monkeypatch.setattr(store, "save", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
+        with pytest.raises(OSError):
+            batch.checkpoint(entry, "uploaded")
+        assert entry == before
+        assert store.load().entries[0] == before
+
+
 def test_concurrent_checkpoints_keep_all_successes(publication):
     media, artifacts, _ = publication
     with ThumbnailBatchStore(media).locked() as store:
@@ -304,7 +404,7 @@ def test_changed_media_cannot_commit_uploaded_batch(publication):
     with pytest.raises(RuntimeError, match="media_changed"):
         ThumbnailArtifactService.persist(media, artifacts)
     assert not MediaThumbnail.select().exists()
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
     assert ThumbnailBatchStore(media).load() is not None
 
 

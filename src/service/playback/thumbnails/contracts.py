@@ -1,3 +1,21 @@
+from src.storage.types import StorageUnavailable
+
+
+class ThumbnailPublicationIncomplete(StorageUnavailable):
+    """Uploaded thumbnails remain usable; unfinished items need a manual retry."""
+
+    ERROR_CODE = "thumbnail_publication_incomplete"
+
+    def __init__(self, available_count: int, failed_count: int, *, publication_possible: bool = False):
+        super().__init__(
+            f"缩略图上传未完成，已有 {available_count} 张可用，{failed_count} 张失败；请手动重试失败项",
+            error_code=self.ERROR_CODE, retryable=False,
+            publication_possible=publication_possible,
+        )
+        self.available_count = available_count
+        self.failed_count = failed_count
+
+
 class ThumbnailDeferred(RuntimeError):
     """媒体源暂未就绪；必须带有限次退避策略，不能无限 pending。"""
 
@@ -19,4 +37,4 @@ class ThumbnailDeferred(RuntimeError):
         self.deferred_backoff_base_seconds = deferred_backoff_base_seconds
 
 
-__all__ = ["ThumbnailDeferred"]
+__all__ = ["ThumbnailDeferred", "ThumbnailPublicationIncomplete"]

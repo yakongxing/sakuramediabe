@@ -609,8 +609,8 @@ class ThumbnailApi:
     ) -> PluginThumbnailGenerationResult:
         """在当前线程立即为一条媒体生成缩略图，复用定时任务的提供方、校验与状态收口。
 
-        显式请求等同人工重试：先清零失败与延后计数并忽略退避时间；已有缩略图时
-        不会重建。``progress_callback`` 接收进度文本，耗时步骤中会周期性重复回调。
+        显式请求等同人工重试：先清零失败与延后计数并忽略退避时间；已有完整缩略图时
+        不会重建，未完成批次只补传缺失项。``progress_callback`` 接收进度文本，耗时步骤中会周期性重复回调。
 
         ``outcome`` 取值：
 
@@ -621,6 +621,8 @@ class ThumbnailApi:
         - ``deferred``：媒体源暂未就绪，已按延后策略交由定时任务重试；
         - ``backend_unavailable``：媒体库的缩略图后端暂不可用，媒体保持待生成；
         - ``retryable_failed`` / ``terminal_failed``：生成失败，已按失败策略记录。
+          ``thumbnail_publication_incomplete`` 表示已成功项立即可用，未完成项等待人工重试；
+          此时 ``generated_count`` 为已可用总数。
         """
         MediaApi._validate_positive_id(media_id, "media_id")
         if progress_callback is not None and not callable(progress_callback):

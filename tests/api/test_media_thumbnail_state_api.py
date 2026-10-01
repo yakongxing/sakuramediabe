@@ -86,3 +86,29 @@ def test_reset_media_thumbnail_terminal_state(client, account_user):
     assert reset_media.thumbnail_last_error_code is None
     assert reset_media.thumbnail_last_error is None
     assert reset_media.thumbnail_terminal_at is None
+
+
+def test_reset_partial_upload_keeps_existing_thumbnails_and_allows_resume(client, account_user):
+    from src.model import Image, MediaThumbnail
+    from src.service.playback.thumbnails.contracts import ThumbnailPublicationIncomplete
+    from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
+
+    library = MediaLibrary.create(name="partial", provider_key="test", provider_config={})
+    movie = Movie.create(movie_number="PARTIAL-001", javdb_id="partial-1", title="partial")
+    media = Media.create(
+        movie=movie, library=library, file_name="partial.mp4",
+        thumbnail_generation_state=Media.THUMBNAIL_STATE_TERMINAL,
+        thumbnail_last_error_code=ThumbnailPublicationIncomplete.ERROR_CODE,
+    )
+    image = Image.create(origin="partial.webp")
+    thumbnail = MediaThumbnail.create(media=media, image=image, offset=3)
+    assert MediaThumbnailTaskService.count_terminal_failed_media() == 1
+    assert MediaThumbnailTaskService.count_pending_media() == 0
+    response = client.post(
+        "/media/thumbnail-generation/reset", json={"media_ids": [media.id]},
+        headers=_auth_headers(client, account_user.username),
+    )
+    assert response.status_code == 200 and response.json() == {"reset_count": 1}
+    assert MediaThumbnailTaskService.count_pending_media() == 1
+    assert MediaThumbnail.get_by_id(thumbnail.id).image_id == image.id
+    assert Media.get_by_id(media.id).thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE

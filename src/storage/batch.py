@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
@@ -30,6 +31,8 @@ def publish_batch(
     *,
     max_workers: int,
     thread_name_prefix: str,
+    stop_on_error: bool = True,
+    on_complete: Callable[[Item, Result | None, Exception | None], None] | None = None,
 ) -> PublicationBatch[Item, Result]:
     if max_workers < 1:
         raise ValueError("publication max_workers must be positive")
@@ -46,20 +49,25 @@ def publish_batch(
                     item = next(iterator)
                 except StopIteration:
                     break
-                pending[executor.submit(publish, item)] = item
+                pending[executor.submit(copy_context().run, publish, item)] = item
 
         fill()
         while pending:
             completed, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in completed:
                 item = pending.pop(future)
+                result, error = None, None
                 try:
                     result = future.result()
                 except Exception as exc:
+                    error = exc
                     batch.errors.append((item, exc))
                 else:
                     batch.published.append((item, result))
-            # Stop submitting after any failure, but account for every running upload.
-            if not batch.errors:
+                # Callback failures are coordinator failures, not upload failures.
+                # Let them stop scheduling while the executor drains running work.
+                if on_complete is not None:
+                    on_complete(item, result, error)
+            if not stop_on_error or not batch.errors:
                 fill()
     return batch

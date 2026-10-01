@@ -231,4 +231,26 @@ def test_already_generated_and_failed_outcomes(test_db, job, monkeypatch):
         job.handler(_Reporter(), {"movie_number": "TGT-001"})
 
 
+def test_partial_upload_reports_available_images_and_manual_retry(test_db, job, monkeypatch):
+    _movie, (media,) = _movie_with_media("TGT-001.mp4")
+    Media.update(
+        thumbnail_generation_state=Media.THUMBNAIL_STATE_TERMINAL,
+        thumbnail_last_error_code="thumbnail_publication_incomplete",
+    ).where(Media.id == media.id).execute()
+    MediaThumbnail.create(media=media, image=Image.create(origin="partial.webp"), offset=3)
+    monkeypatch.setattr(
+        MediaThumbnailTaskService, "generate_requested_media",
+        lambda *_args, **_kwargs: ThumbnailGenerationOutcome(
+            "terminal_failed", generated_count=1, error_code="thumbnail_publication_incomplete",
+        ),
+    )
+    reporter = _Reporter()
+    with pytest.raises(RuntimeError, match="已有 1 张缩略图可用.*补传失败项"):
+        job.handler(reporter, {"movie_number": "TGT-001"})
+    candidate_event = next(event for event in reporter.events if "candidates" in event.get("summary_patch", {}))
+    assert "已有 1 张可用，上传未完成" in candidate_event["summary_patch"]["candidates"][0]["description"]
+    assert reporter.events[-1]["summary_patch"] == {"available_thumbnails": 1, "manual_retry_required": True}
+    assert "自动重试" not in reporter.events[-1]["text"]
+
+
 pytestmark = pytest.mark.usefixtures("isolated_local_storage")

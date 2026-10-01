@@ -421,9 +421,9 @@ class WebDAVStorageBackend:
             return None
         return destination
 
-    def _verify_content(self, key: str, size: int, digest: str) -> ObjectStat:
+    def _verify_content(self, key: str, size: int, digest: str, *, missing_ok: bool = False) -> ObjectStat | None:
         try:
-            return self._verify_content_attempts(key, size, digest)
+            return self._verify_content_attempts(key, size, digest, missing_ok=missing_ok)
         except StorageIntegrityError as exc:
             exc.publication_possible = True
             raise
@@ -432,19 +432,27 @@ class WebDAVStorageBackend:
         except StorageError as exc:
             raise StoragePublicationUnknown(key, "WebDAV publication reconciliation failed", stage="verify", status_code=self._status_code(exc), retryable=exc.retryable) from exc
 
-    def _verify_content_attempts(self, key: str, size: int, digest: str) -> ObjectStat:
+    def _verify_content_attempts(self, key: str, size: int, digest: str, *, missing_ok: bool = False) -> ObjectStat | None:
         delays = self._final_visibility_retry_delays
+        consistently_missing = True
         for attempt in range(len(delays) + 1):
+            destination = None
             try:
-                result = self._destination_matches(key, expected_size=size, expected_sha256=digest)
+                destination = self._stat_once(key)
+                result = self._destination_matches(key, expected_size=size, expected_sha256=digest, destination=destination)
                 if result is None:
                     raise StorageIntegrityError(f"WebDAV content mismatch key={key}", stage="verify", publication_possible=True)
                 return result
             except StorageIntegrityError:
                 raise
             except (StorageNotFound, StorageUnavailable) as exc:
+                # Only repeated metadata 404s permit an immutable retry. A GET
+                # failure or an earlier uncertain read is not proof of absence.
+                consistently_missing = consistently_missing and destination is None and isinstance(exc, StorageNotFound)
                 transient = self._status_code(exc) == 404 or self._is_transient(exc)
                 if not transient or attempt == len(delays):
+                    if missing_ok and consistently_missing:
+                        return None
                     raise StoragePublicationUnknown(key, "WebDAV published object cannot be verified", stage="verify", status_code=self._status_code(exc), retryable=transient) from exc
                 self._pause(exc, delays[attempt], stage="verify", attempt=attempt + 1)
         raise AssertionError("unreachable")
@@ -567,15 +575,17 @@ class WebDAVStorageBackend:
         operation_id = uuid.uuid4().hex
         started = time.monotonic()
         safe_temps: set[str] = set()
+        previous = None
         with path_locks.hold(f"file:{self._lock_identity}:{self._path(key)}", _budget.get()):
             try:
                 with self._uncertain_lock:
                     previous = self._uncertain_publications.get(identity)
+                final = None
                 if previous is not None:
-                    final = self._verify_content(key, size, expected_sha256)
-                    disposition = "published"
                     operation_id = previous
-                else:
+                    final = self._verify_content(key, size, expected_sha256, missing_ok=immutable)
+                    disposition = "published"
+                if final is None:
                     repaired: set[str] = set()
                     self._ensure_parents(key, repaired)
                     if validate_source is not None:
@@ -589,13 +599,21 @@ class WebDAVStorageBackend:
                 logger.debug("WebDAV publication succeeded operation={} key={} bytes={} disposition={} elapsed_seconds={:.3f}", operation_id, key, size, disposition, time.monotonic() - started)
                 return PublicationResult(final.key, final.size, final.is_file, final.etag, operation_id=operation_id, disposition=disposition)
             except Exception as exc:
-                if getattr(exc, "publication_possible", False):
+                error = exc
+                if previous is not None and not getattr(exc, "publication_possible", False) and not isinstance(exc, StorageConflict):
+                    if isinstance(exc, StorageIntegrityError):
+                        exc.publication_possible = True
+                    else:
+                        error = StoragePublicationUnknown(key, "WebDAV resumed publication outcome cannot be confirmed", stage=getattr(exc, "stage", None), status_code=self._status_code(exc), retryable=self._is_transient(exc))
+                if getattr(error, "publication_possible", False):
                     with self._uncertain_lock:
                         self._uncertain_publications[identity] = operation_id
                         self._uncertain_publications.move_to_end(identity)
                         while len(self._uncertain_publications) > 4096:
                             self._uncertain_publications.popitem(last=False)
-                logger.warning("WebDAV publication failed operation={} key={} stage={} status={} possible={} bytes={} elapsed_seconds={:.3f}", operation_id, key, getattr(exc, "stage", None), self._status_code(exc), getattr(exc, "publication_possible", False), size, time.monotonic() - started)
+                logger.warning("WebDAV publication failed operation={} key={} stage={} status={} possible={} bytes={} elapsed_seconds={:.3f}", operation_id, key, getattr(error, "stage", None), self._status_code(error), getattr(error, "publication_possible", False), size, time.monotonic() - started)
+                if error is not exc:
+                    raise error from exc
                 raise
             finally:
                 for temporary in safe_temps:

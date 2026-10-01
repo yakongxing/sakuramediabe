@@ -105,6 +105,8 @@ def _thumbnail_label(
         return "文件失效，无法生成"
     if status is None:
         return "缩略图状态未知"
+    if status.last_error_code == "thumbnail_publication_incomplete":
+        return f"已有 {status.thumbnail_count} 张可用，上传未完成，请手动重试"
     if status.thumbnail_count > 0:
         return f"已有 {status.thumbnail_count} 张缩略图"
     if status.state == "retry_wait":
@@ -179,6 +181,8 @@ def _request_selection(
 
 
 def _failure_message(label: str, result: PluginThumbnailGenerationResult) -> str:
+    if result.error_code == "thumbnail_publication_incomplete":
+        return f"{label}：已有 {result.generated_count} 张缩略图可用，上传未完成，请重新执行本任务补传失败项"
     reason = _FAILURE_REASONS.get(result.outcome, f"缩略图生成未完成（{result.outcome}）")
     suffix = f"（错误码 {result.error_code}）" if result.error_code else ""
     return f"{label}：{reason}{suffix}"
@@ -220,6 +224,11 @@ def _generate(
         message = f"{label} 已有 {count} 张缩略图，无需重复生成"
         reporter.emit(current=1, total=1, text=message)
         return {"status": "already_exists", "message": message}
+    if result.error_code == "thumbnail_publication_incomplete":
+        reporter.emit(
+            current=1, total=1, text=_failure_message(label, result),
+            summary_patch={"available_thumbnails": result.generated_count, "manual_retry_required": True},
+        )
     raise TargetedThumbnailError(_failure_message(label, result))
 
 

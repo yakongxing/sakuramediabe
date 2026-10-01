@@ -108,7 +108,7 @@ def test_thumbnail_provider_progress_and_installed_legacy_provider(monkeypatch, 
     monkeypatch.setattr(task_service, "ThumbnailBatchStore", lambda media: SimpleNamespace(locked=lambda: nullcontext(batch_store)))
     monkeypatch.setattr(task_service.ThumbnailArtifactService, "persist_batch", lambda media, batch, **kwargs: len(batch))
     result = MediaThumbnailTaskService._generate_artifacts(
-        SimpleNamespace(id=1, library=None), events.append,
+        SimpleNamespace(id=1, library=None, thumbnail_last_error_code=None), events.append,
     )
     assert result == 1
     assert ("已生成 1/1 张" in events) == supports_progress

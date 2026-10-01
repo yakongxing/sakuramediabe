@@ -16,6 +16,7 @@ from src.service.playback.operation_locks import (
     media_operation_lock,
 )
 from src.service.playback.provider_helpers import library_handle_for
+from src.service.playback.thumbnails.contracts import ThumbnailPublicationIncomplete
 
 
 class MediaValidityScanService:
@@ -49,6 +50,8 @@ class MediaValidityScanService:
 
     @staticmethod
     def _revival_thumbnail_values(media: Media) -> dict:
+        if media.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE:
+            return {}
         has_thumbnail = MediaThumbnail.select(MediaThumbnail.id).where(
             MediaThumbnail.media == media.id
         ).exists()

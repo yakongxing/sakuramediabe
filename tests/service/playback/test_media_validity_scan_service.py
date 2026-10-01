@@ -85,6 +85,35 @@ def test_scan_reconciles_media_from_one_library_inventory(test_db, monkeypatch):
     ]
 
 
+def test_revival_preserves_partial_upload_manual_retry(test_db, monkeypatch):
+    from src.model import Image, MediaThumbnail
+    from src.service.playback.thumbnails.contracts import ThumbnailPublicationIncomplete
+
+    library = MediaLibrary.create(name="partial-validity", provider_key="demo", provider_config={})
+    media = _media(library, "PARTIAL-001", valid=False)
+    Media.update(
+        thumbnail_generation_state=Media.THUMBNAIL_STATE_TERMINAL,
+        thumbnail_last_error_code=ThumbnailPublicationIncomplete.ERROR_CODE,
+    ).where(Media.id == media.id).execute()
+    MediaThumbnail.create(media=media, image=Image.create(origin="partial.webp"), offset=3)
+
+    class Storage:
+        def scan_managed_media_ref_keys(self):
+            return {_managed_ref_key(media.storage_ref)}
+
+        @staticmethod
+        def managed_media_ref_key(*, media_ref):
+            return _managed_ref_key(media_ref)
+
+    monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda _library: Storage())
+    assert MediaValidityScanService.scan_media_validity(reporter=Reporter())["revived_media"] == 1
+    refreshed = Media.get_by_id(media.id)
+    assert refreshed.valid
+    assert refreshed.thumbnail_generation_state == Media.THUMBNAIL_STATE_TERMINAL
+    assert refreshed.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE
+    assert MediaThumbnail.select().count() == 1
+
+
 def test_scan_skips_only_a_library_when_its_provider_inventory_fails(test_db, monkeypatch):
     failed_library = MediaLibrary.create(name="failed-library", provider_key="failed", provider_config={})
     working_library = MediaLibrary.create(name="working-library", provider_key="working", provider_config={})

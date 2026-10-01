@@ -70,20 +70,31 @@ class ThumbnailBatch:
     def key(self, prefix: str, entry) -> str:
         return f"{prefix}/{self.manifest['generation']}/{entry['offset']}.webp"
 
-    def validate_files(self) -> None:
-        for entry in self.entries:
+    def validate_files(self, entries=None) -> None:
+        for entry in self.entries if entries is None else entries:
             path = self.source(entry)
             if not path.is_file() or file_digest(path) != (entry["size"], entry["sha256"]):
                 raise ValueError("thumbnail_batch_file_invalid")
 
-    def checkpoint(self, entry, state: str) -> None:
+    def checkpoint(self, entry, state: str, *, error: Exception | None = None) -> None:
         with self._checkpoint_lock:
-            previous = entry["state"]
+            previous = dict(entry)
             entry["state"] = state
+            if error is None:
+                entry.pop("last_error", None)
+            else:
+                entry["last_error"] = {
+                    "type": type(error).__name__,
+                    "code": getattr(error, "error_code", None),
+                    "stage": getattr(error, "stage", None),
+                    "status_code": getattr(error, "status_code", None),
+                    "publication_possible": bool(getattr(error, "publication_possible", False)),
+                }
             try:
                 self.store.save(self.manifest)
             except BaseException:
-                entry["state"] = previous
+                entry.clear()
+                entry.update(previous)
                 raise
 
     def cleanup(self) -> None:

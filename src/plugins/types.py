@@ -213,7 +213,7 @@ class PluginMediaPresence:
 
 @dataclass(frozen=True)
 class PluginThumbnailStatus:
-    """单条媒体的缩略图状态；是否已有缩略图以 thumbnail_count 为准。
+    """单条媒体的缩略图状态；thumbnail_count 是已可用数量，不代表整批完成。
 
     ``state`` 取值为 ``pending``、``retry_wait``、``terminal``、``succeeded``。
     """

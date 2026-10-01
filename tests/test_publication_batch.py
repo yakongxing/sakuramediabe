@@ -100,3 +100,72 @@ def test_empty_batch_does_not_invoke_publisher():
 def test_batch_rejects_invalid_worker_count():
     with pytest.raises(ValueError):
         publish_batch([], lambda item: item, max_workers=0, thread_name_prefix="test")
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_batch_can_continue_after_individual_failures(workers):
+    from threading import get_ident
+
+    coordinator = get_ident()
+    completed = []
+
+    def publish(item):
+        if item in {1, 3, 7}:
+            raise StorageUnavailable(f"failed {item}")
+        return item * 2
+
+    def report(item, result, error):
+        assert get_ident() == coordinator
+        completed.append((item, result, error))
+
+    batch = publish_batch(
+        range(10), publish, max_workers=workers, thread_name_prefix="test",
+        stop_on_error=False, on_complete=report,
+    )
+    assert sorted(item for item, _, _ in completed) == list(range(10))
+    assert {item for item, _ in batch.errors} == {1, 3, 7}
+    assert sorted(batch.published) == [(item, item * 2) for item in range(10) if item not in {1, 3, 7}]
+
+
+def test_completion_callback_failure_stops_scheduling():
+    attempted = []
+
+    def publish(item):
+        attempted.append(item)
+        return item
+
+    def broken_callback(*_args):
+        raise RuntimeError("database unavailable")
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        publish_batch(
+            range(5), publish, max_workers=1, thread_name_prefix="test",
+            stop_on_error=False, on_complete=broken_callback,
+        )
+    assert attempted == [0]
+
+
+def test_each_upload_inherits_an_independent_task_context():
+    from contextvars import ContextVar
+
+    from loguru import logger
+
+    marker = ContextVar("upload_test_marker", default="missing")
+    token = marker.set("caller")
+    records = []
+    sink = logger.add(lambda message: records.append(message.record), filter=lambda record: record["message"] == "upload context")
+    try:
+        def publish(item):
+            assert marker.get() == "caller"
+            marker.set(str(item))
+            logger.info("upload context")
+            return item
+
+        with logger.contextualize(task="test-thumbnail-publication"):
+            publish_batch(range(5), publish, max_workers=2, thread_name_prefix="test").raise_for_errors()
+        assert marker.get() == "caller"
+        assert len(records) == 5
+        assert all(record["extra"]["task"] == "test-thumbnail-publication" for record in records)
+    finally:
+        logger.remove(sink)
+        marker.reset(token)

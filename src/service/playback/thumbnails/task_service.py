@@ -7,7 +7,7 @@ from inspect import signature
 from typing import Any
 
 from loguru import logger
-from peewee import fn
+from peewee import Case, fn
 
 from src.common.database import ensure_database_ready
 from src.common.runtime_time import utc_now_for_db
@@ -27,8 +27,12 @@ from src.service.playback.operation_locks import (
 from src.service.playback.provider_helpers import media_handle_for
 from src.service.playback.thumbnails.artifacts import ThumbnailArtifactService
 from src.service.playback.thumbnails.batches import ThumbnailBatchStore
-from src.service.playback.thumbnails.contracts import ThumbnailDeferred
+from src.service.playback.thumbnails.contracts import (
+    ThumbnailDeferred,
+    ThumbnailPublicationIncomplete,
+)
 from src.service.playback.thumbnails.progress import ThumbnailTaskProgress
+from src.storage.types import StorageUnavailable
 
 
 @dataclass(frozen=True)
@@ -95,7 +99,11 @@ class MediaThumbnailTaskService:
         return (
             Media.select(Media.id)
             .join(MediaLibrary)
-            .where(Media.valid == True, cls._missing_thumbnail_condition(), normal_state)
+            .where(
+                Media.valid == True, normal_state,
+                cls._missing_thumbnail_condition()
+                | (Media.thumbnail_generation_state != Media.THUMBNAIL_STATE_SUCCEEDED),
+            )
             .order_by(Media.id)
         )
 
@@ -114,10 +122,7 @@ class MediaThumbnailTaskService:
     def _count_state(cls, state: str) -> int:
         return (
             Media.select(Media.id)
-            .where(
-                cls._missing_thumbnail_condition(),
-                Media.thumbnail_generation_state == state,
-            )
+            .where(Media.thumbnail_generation_state == state)
             .count()
         )
 
@@ -136,20 +141,20 @@ class MediaThumbnailTaskService:
     @classmethod
     def reset_terminal_media(cls, media_ids: list[int]) -> int:
         ensure_database_ready()
+        incomplete = Media.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE
         return Media.update(
             thumbnail_generation_state=Media.THUMBNAIL_STATE_PENDING,
             thumbnail_attempt_count=0,
             thumbnail_deferred_count=0,
             thumbnail_next_retry_at=None,
-            thumbnail_last_error_code=None,
-            thumbnail_last_error=None,
+            thumbnail_last_error_code=Case(None, [(incomplete, ThumbnailPublicationIncomplete.ERROR_CODE)], None),
+            thumbnail_last_error=Case(None, [(incomplete, Media.thumbnail_last_error)], None),
             thumbnail_terminal_at=None,
             updated_at=utc_now_for_db(),
         ).where(
             Media.id.in_(media_ids),
             Media.valid == True,
             Media.thumbnail_generation_state == Media.THUMBNAIL_STATE_TERMINAL,
-            cls._missing_thumbnail_condition(),
         ).execute()
 
     @staticmethod
@@ -165,6 +170,11 @@ class MediaThumbnailTaskService:
                     progress_callback("正在恢复本地缩略图上传批次")
                 return ThumbnailArtifactService.persist_batch(
                     media, batch, check_connection=check_connection, progress_callback=progress_callback,
+                )
+            if media.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE:
+                raise StorageUnavailable(
+                    "缩略图补传清单缺失，已保留可用缩略图，请恢复原批次后重试",
+                    error_code=ThumbnailPublicationIncomplete.ERROR_CODE,
                 )
             if check_connection is not None:
                 check_connection()
@@ -323,6 +333,16 @@ class MediaThumbnailTaskService:
         attempt_count = int(media.thumbnail_attempt_count or 0) + 1
         error_code = cls._error_code(exc)
         retryable = getattr(exc, "retryable", True)
+        # Partial availability is durable even when a later failure is local or
+        # a DB commit response was lost. Only a complete batch clears its marker.
+        incomplete = (
+            getattr(media, "thumbnail_last_error_code", None) == ThumbnailPublicationIncomplete.ERROR_CODE
+            or Media.select(Media.thumbnail_last_error_code).where(Media.id == media.id).scalar()
+            == ThumbnailPublicationIncomplete.ERROR_CODE
+        )
+        if incomplete:
+            error_code = ThumbnailPublicationIncomplete.ERROR_CODE
+            retryable = False
         is_terminal = (
             not retryable
             or error_code in cls.TERMINAL_ERROR_CODES
@@ -339,6 +359,7 @@ class MediaThumbnailTaskService:
                 error_detail=cls._error_detail(exc),
                 terminal_at=now,
             )
+            media.thumbnail_last_error_code = error_code
             return True
         backoff_seconds = min(
             cls.FAILURE_RETRY_BACKOFF_BASE_SECONDS * attempt_count,
@@ -354,6 +375,7 @@ class MediaThumbnailTaskService:
             error_detail=cls._error_detail(exc),
             terminal_at=None,
         )
+        media.thumbnail_last_error_code = error_code
         return False
 
     @classmethod
@@ -372,16 +394,27 @@ class MediaThumbnailTaskService:
         return MediaThumbnail.select().where(MediaThumbnail.media == media).exists()
 
     @classmethod
+    def _has_complete_thumbnails(cls, media: Media) -> bool:
+        if not cls._has_thumbnails(media):
+            return False
+        with ThumbnailBatchStore(media).locked() as store:
+            batch = store.load()
+            if batch is not None:
+                return ThumbnailArtifactService._committed(media, batch)
+        return media.thumbnail_last_error_code != ThumbnailPublicationIncomplete.ERROR_CODE
+
+    @classmethod
     def _reset_for_request(cls, media: Media) -> None:
-        """显式请求等同人工重试：清零失败与延后计数、撤销退避，然后立即生成。"""
+        """显式请求等同人工重试；保留未完成标记，避免清单丢失时误判完成。"""
+        incomplete = media.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE
         cls._write_state(
             media,
             state=Media.THUMBNAIL_STATE_PENDING,
             attempt_count=0,
             deferred_count=0,
             next_retry_at=None,
-            error_code=None,
-            error_detail=None,
+            error_code=media.thumbnail_last_error_code if incomplete else None,
+            error_detail=media.thumbnail_last_error if incomplete else None,
             terminal_at=None,
         )
         # 失败收口按实例上的计数累加，必须与刚写入的状态保持一致。
@@ -393,9 +426,9 @@ class MediaThumbnailTaskService:
     def generate_requested_media(cls, media_id: int, *, progress_callback=None) -> ThumbnailGenerationOutcome:
         """按显式请求立即为单条媒体生成缩略图，不经过批量候选筛选。
 
-        忽略退避时间与终态；已有缩略图时不会重建。生成失败后沿用常规的重试/终态
-        策略，由定时任务继续接手。``progress_callback(text)`` 接收进度文本，耗时步骤
-        期间会由心跳线程重复回调并追加等待秒数。
+        忽略退避时间与终态；已有完整产物时不会重建，未完成批次只补传缺失项。
+        上传未完成等待人工重试；其它生成失败沿用常规重试策略。``progress_callback(text)``
+        接收进度文本，耗时步骤期间会由心跳线程重复回调并追加等待秒数。
         """
         ensure_database_ready()
         try:
@@ -405,7 +438,7 @@ class MediaThumbnailTaskService:
                     return ThumbnailGenerationOutcome("not_found")
                 if not media.valid:
                     return ThumbnailGenerationOutcome("invalid")
-                if cls._has_thumbnails(media):
+                if cls._has_complete_thumbnails(media):
                     ThumbnailArtifactService.cleanup_committed(media, check_connection=check_connection)
                     cls._mark_succeeded(media)
                     return ThumbnailGenerationOutcome("already_exists")
@@ -429,7 +462,7 @@ class MediaThumbnailTaskService:
         media = Media.get_or_none(Media.id == media_id)
         if media is None or not media.valid:
             return ThumbnailGenerationOutcome("skipped")
-        if cls._has_thumbnails(media):
+        if cls._has_complete_thumbnails(media):
             ThumbnailArtifactService.cleanup_committed(media, check_connection=check_connection)
             cls._mark_succeeded(media)
             return ThumbnailGenerationOutcome("skipped")
@@ -483,20 +516,25 @@ class MediaThumbnailTaskService:
             # An old worker that lost its advisory-lock session cannot write state.
             if check_connection is not None:
                 check_connection()
-            if cls._has_thumbnails(media):
+            if cls._has_complete_thumbnails(media):
                 cls._mark_succeeded(media)
                 return ThumbnailGenerationOutcome("succeeded")
             terminal = cls._mark_failure(media, exc)
+            error_code = getattr(media, "thumbnail_last_error_code", None) or cls._error_code(exc)
             logger.warning(
                 "Media thumbnail generation failed media_id={} code={} terminal={} detail={}",
                 media_id,
-                cls._error_code(exc),
+                error_code,
                 terminal,
                 exc,
             )
             return ThumbnailGenerationOutcome(
                 "terminal_failed" if terminal else "retryable_failed",
-                error_code=cls._error_code(exc),
+                generated_count=(
+                    MediaThumbnail.select().where(MediaThumbnail.media == media.id).count()
+                    if error_code == ThumbnailPublicationIncomplete.ERROR_CODE else 0
+                ),
+                error_code=error_code,
             )
         if check_connection is not None:
             check_connection()
@@ -592,6 +630,8 @@ class MediaThumbnailTaskService:
                 stats["failed_media_ids"].append(media_id)
             elif outcome.state == "terminal_failed":
                 stats["terminal_failed_media"] += 1
+                if outcome.error_code == ThumbnailPublicationIncomplete.ERROR_CODE:
+                    stats["generated_thumbnails"] += outcome.generated_count
                 stats["failed_media_ids"].append(media_id)
                 stats["terminal_failed_media_ids"].append(media_id)
             else:

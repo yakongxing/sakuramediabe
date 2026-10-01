@@ -114,6 +114,138 @@ def unconfirmed_dav(dav):
     return dav
 
 
+@pytest.fixture
+def absent_unconfirmed_dav(dav):
+    backend, server, _ = dav
+    server.fault = lambda request: httpx.Response(500) if request.method == "MOVE" else None
+    with pytest.raises(StoragePublicationUnknown, match="move outcome unknown"):
+        backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert "/dav/assets/a.webp" not in server.objects
+    server.fault = lambda request: None
+    server.requests.clear()
+    return dav
+
+
+@pytest.mark.parametrize("from_file", [False, True])
+def test_unknown_immutable_publication_reuploads_missing_destination(absent_unconfirmed_dav, tmp_path, from_file):
+    backend, server, _ = absent_unconfirmed_dav
+    old_temps = set(server.objects)
+    operation_id = next(iter(backend._uncertain_publications.values()))
+
+    def inspect(request):
+        if request.method == "MOVE":
+            assert request.headers["Overwrite"] == "F"
+
+    server.fault = inspect
+    if from_file:
+        source = tmp_path / "image.webp"
+        source.write_bytes(b"image")
+        result = backend.put_file("a.webp", source, immutable=True, overwrite=False)
+    else:
+        result = backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+
+    assert result.created and result.size == 5 and result.operation_id == operation_id
+    assert server.objects["/dav/assets/a.webp"] == b"image"
+    assert old_temps.issubset(server.objects)
+    assert not backend._uncertain_publications
+    assert [method for method, _, _ in server.requests] == ["PROPFIND"] * 3 + ["PUT", "MOVE"]
+    assert all(path not in old_temps for method, path, _ in server.requests if method == "PUT")
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_unknown_nonimmutable_publication_never_reuploads_after_metadata_404(dav, overwrite):
+    backend, server, _ = dav
+    server.fault = lambda request: httpx.Response(500) if request.method == "MOVE" else None
+    with pytest.raises(StoragePublicationUnknown):
+        backend.put_bytes("a.webp", b"image", overwrite=overwrite)
+    server.requests.clear()
+    server.fault = lambda request: None
+
+    with pytest.raises(StoragePublicationUnknown, match="published object cannot be verified"):
+        backend.put_bytes("a.webp", b"image", overwrite=overwrite)
+    assert [method for method, _, _ in server.requests] == ["PROPFIND"] * 3
+    assert backend._uncertain_publications
+
+
+@pytest.mark.parametrize("failure", [500, 503, "timeout"])
+def test_unknown_metadata_failure_does_not_allow_reupload(absent_unconfirmed_dav, failure):
+    backend, server, _ = absent_unconfirmed_dav
+
+    def fault(request):
+        if request.method == "PROPFIND":
+            if failure == "timeout":
+                raise httpx.ReadTimeout("metadata unavailable", request=request)
+            return httpx.Response(failure)
+
+    server.fault = fault
+    with pytest.raises(StoragePublicationUnknown):
+        backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert [method for method, _, _ in server.requests] == ["PROPFIND"] * 3
+    assert backend._uncertain_publications
+
+
+def test_unknown_mixed_metadata_errors_do_not_prove_absence(absent_unconfirmed_dav):
+    backend, server, _ = absent_unconfirmed_dav
+    reads = 0
+
+    def fault(request):
+        nonlocal reads
+        if request.method == "PROPFIND":
+            reads += 1
+            return httpx.Response(503 if reads == 1 else 404)
+
+    server.fault = fault
+    with pytest.raises(StoragePublicationUnknown):
+        backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert [method for method, _, _ in server.requests] == ["PROPFIND"] * 3
+    assert backend._uncertain_publications
+
+
+@pytest.mark.parametrize("status", [403, 503])
+def test_failed_unknown_reupload_keeps_original_publication_uncertainty(absent_unconfirmed_dav, status):
+    backend, server, _ = absent_unconfirmed_dav
+    previous = dict(backend._uncertain_publications)
+    server.fault = lambda request: httpx.Response(status) if request.method == "PUT" else None
+
+    with pytest.raises(StoragePublicationUnknown) as caught:
+        backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert caught.value.publication_possible
+    assert caught.value.status_code == status
+    assert caught.value.retryable is (status == 503)
+    assert backend._uncertain_publications == previous
+    assert any(method == "PUT" for method, _, _ in server.requests)
+    assert not any(method in {"MOVE", "DELETE"} for method, _, _ in server.requests)
+    server.fault = lambda request: None
+    assert backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False).size == 5
+    assert not backend._uncertain_publications
+
+
+@pytest.mark.parametrize("content", [b"image", b"other"])
+def test_unknown_reupload_preserves_late_move_conflict_protection(absent_unconfirmed_dav, content):
+    backend, server, _ = absent_unconfirmed_dav
+    old_temps = set(server.objects)
+
+    def late_move(request):
+        if request.method == "MOVE":
+            assert request.headers["Overwrite"] == "F"
+            server.objects["/dav/assets/a.webp"] = content
+
+    server.fault = late_move
+    if content == b"image":
+        result = backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+        assert result.disposition == "reused" and not result.created
+        assert not backend._uncertain_publications
+    else:
+        with pytest.raises(FileExistsError, match="content mismatch"):
+            backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
+    assert server.objects["/dav/assets/a.webp"] == content
+    assert old_temps.issubset(server.objects)
+    assert sum(method == "PUT" for method, _, _ in server.requests) == 1
+    assert sum(method == "MOVE" for method, _, _ in server.requests) == 1
+    assert sum(method == "GET" for method, _, _ in server.requests) == 1
+    assert all(path not in old_temps for method, path, _ in server.requests if method == "DELETE")
+
+
 def test_directory_cache_and_normal_move_request_counts(dav):
     backend, server, _ = dav
     backend.put_bytes("movies/a/1.webp", b"first")
@@ -269,9 +401,10 @@ def test_move_response_lost_is_confirmed_by_hash(dav):
     assert sum(method == "GET" for method, _, _ in server.requests) == 1
 
 
-def test_unconfirmed_publication_download_failure_is_not_content_mismatch(unconfirmed_dav):
+@pytest.mark.parametrize("status", [404, 503])
+def test_unconfirmed_publication_download_failure_is_not_content_mismatch(unconfirmed_dav, status):
     backend, server, _ = unconfirmed_dav
-    server.fault = lambda request: httpx.Response(503) if request.method == "GET" else None
+    server.fault = lambda request: httpx.Response(status) if request.method == "GET" else None
     with pytest.raises(StoragePublicationUnknown) as caught:
         backend.put_bytes("a.webp", b"image", immutable=True, overwrite=False)
     assert caught.value.stage == "verify"
@@ -648,7 +781,7 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
     assert batch is not None
     finals = {path for path in server.objects if path.endswith(".webp")}
     assert len(finals) == (2 if unknown else 1)
-    assert not MediaThumbnail.select().exists()
+    assert [row.offset for row in MediaThumbnail.select()] == [3]
     boundary = len(server.requests)
     server.fault = lambda request: None
     backend._uncertain_publications.clear()
