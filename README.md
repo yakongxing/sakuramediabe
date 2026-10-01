@@ -25,6 +25,45 @@ PostgreSQL 重启后，API 和后台工作线程会在后续数据库操作时�
 
 如有侵权，请邮箱联系 tinyping@protonmail.com
 
+## 视频片段独立存储
+
+`storage.clips_backend` 单独控制生成的 MP4 片段，图片/缩略图仍使用 `storage.backend`：
+
+| `clips_backend` | 片段存储位置 |
+| --- | --- |
+| `"inherit"`（默认） | 跟随 `storage.backend`，保持升级前行为 |
+| `"local"` | 使用 `media.media_clip_root_path`，默认 `/data/media-clips` |
+| `"webdav"` | 使用现有 WebDAV 端点/凭据及 `clips` 命名空间 |
+
+例如，图片走 WebDAV、视频片段落本地：
+
+```toml
+[storage]
+backend = "webdav"
+clips_backend = "local"
+# webdav_base_url、username、password 等沿用已有配置
+
+[media]
+media_clip_root_path = "/data/media-clips"
+```
+
+也支持反向组合：`backend = "local"`、`clips_backend = "webdav"`；此时仍须配置有效的 `storage.webdav_base_url`。图片和片段使用同一组 WebDAV 配置，不支持为片段另设端点或账号。
+
+环境变量可用：
+
+```text
+STORAGE__CLIPS_BACKEND=local
+MEDIA__MEDIA_CLIP_ROOT_PATH=/data/media-clips
+```
+
+标准前缀形式同样支持 `SAKURAMEDIA_STORAGE__CLIPS_BACKEND` 和 `SAKURAMEDIA_MEDIA__MEDIA_CLIP_ROOT_PATH`。环境变量覆盖 TOML；若同时设置两套环境变量，上面的无前缀部署变量优先。
+
+本地目录是**容器内路径**，需要持久卷且运行用户有写权限。例如将宿主机 `/srv/sakura/clips` 挂载到 `/data/media-clips`；自定义位置如 `/mnt/clips` 时，应同时修改 `media_clip_root_path` 并配置对应挂载。`thumbnail_staging_root_path` 是缩略图暂存目录，不是 MP4 片段的最终目录。
+
+修改配置后重启 API/APS。`storage` 节不能经通用配置 API 修改；本地目录字段属于 `media` 节，可通过配置 API 保存或直接修改 TOML/环境变量。本次无需数据库迁移。
+
+**切换片段后端或保存目录不会自动迁移旧文件，也不回退读取旧位置。** 切换前应备份数据库、暂停相关服务，将文件按原相对 key 迁移到新位置并核验，再启用配置；否则列表/访问可能把目标位置明确缺失的片段作为无效记录清理。片段仍是独立 MP4，不使用 ZIP，也没有新增上传断点续传能力。
+
 ## 媒体缩略图存储
 
 新生成的电影和视频缩略图使用统一资产存储：`storage.backend = "local"` 时保存到本地，配置为 `"webdav"` 时保存到 WebDAV 的 `assets` 命名空间。缩略图尺寸读取、图片访问、缩略图搜索索引、推荐读取和媒体删除均使用同一存储配置。

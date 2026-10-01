@@ -21,11 +21,14 @@ def storage_for(namespace: str):
     with _backend_lock:
         if namespace in _backends:
             return _backends[namespace]
-        if settings.storage.backend == "local":
+        config = settings.storage
+        backend_name = config.backend
+        if namespace == "clips" and config.clips_backend != "inherit":
+            backend_name = config.clips_backend
+        if backend_name == "local":
             root = settings.media.import_image_root_path if namespace == "assets" else settings.media.media_clip_root_path
             backend = LocalStorageBackend(Path(root))
         else:
-            config = settings.storage
             timeout = httpx.Timeout(connect=config.connect_timeout_seconds, read=config.read_timeout_seconds, write=config.write_timeout_seconds, pool=config.pool_timeout_seconds)
             backend = WebDAVStorageBackend(
                 config.webdav_base_url, namespace,

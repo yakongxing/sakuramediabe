@@ -103,8 +103,10 @@ class Media(BaseModel):
 
 class Storage(BaseModel):
     backend: str = "local"
-    # 字幕可单独落到 media.import_image_root_path，其他资源继续使用 backend。
+    # 字幕可单独落到 media.import_image_root_path。
     subtitles_backend: str = "inherit"
+    # 片段默认跟随 backend；本地保存目录由 media.media_clip_root_path 控制。
+    clips_backend: str = "inherit"
     webdav_base_url: str = ""
     username: str = ""
     password: str = ""
@@ -143,10 +145,13 @@ class Storage(BaseModel):
         self.subtitles_backend = self.subtitles_backend.strip().lower()
         if self.subtitles_backend not in {"inherit", "local"}:
             raise ValueError("storage.subtitles_backend must be inherit or local")
+        self.clips_backend = self.clips_backend.strip().lower()
+        if self.clips_backend not in {"inherit", "local", "webdav"}:
+            raise ValueError("storage.clips_backend must be inherit, local or webdav")
         self.backend = self.backend.strip().lower()
         if self.backend not in {"local", "webdav"}:
             raise ValueError("storage.backend must be local or webdav")
-        if self.backend == "webdav":
+        if self.backend == "webdav" or self.clips_backend == "webdav":
             parsed = urlparse(self.webdav_base_url.strip())
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("storage.webdav_base_url must be an http(s) URL")
@@ -338,6 +343,7 @@ else:
 
 _STORAGE_ENV_MAP = {
     "STORAGE__BACKEND": "backend",
+    "STORAGE__CLIPS_BACKEND": "clips_backend",
     "STORAGE__WEBDAV_BASE_URL": "webdav_base_url",
     "STORAGE__USERNAME": "username",
     "STORAGE__PASSWORD": "password",
@@ -360,8 +366,9 @@ def _deployment_env_settings() -> dict[str, Any]:
     """Unprefixed deployment env vars that must override config.toml.
 
     PaaS providers commonly inject ``DATABASE__URL`` directly. WebDAV storage
-    deployments use the matching ``STORAGE__...`` names. Keep this source
-    intentionally narrow instead of enabling every unprefixed settings section.
+    deployments use the matching ``STORAGE__...`` names; local clip mounts
+    accept ``MEDIA__MEDIA_CLIP_ROOT_PATH``. Keep this source intentionally narrow
+    instead of enabling every unprefixed settings section.
     """
     data: dict[str, Any] = {}
     if "DATABASE__URL" in os.environ:
@@ -374,6 +381,8 @@ def _deployment_env_settings() -> dict[str, Any]:
     }
     if storage_values:
         data["storage"] = storage_values
+    if "MEDIA__MEDIA_CLIP_ROOT_PATH" in os.environ:
+        data.setdefault("media", {})["media_clip_root_path"] = os.environ["MEDIA__MEDIA_CLIP_ROOT_PATH"]
     if "METADATA__IMAGE_DOWNLOAD_MAX_WORKERS" in os.environ:
         data.setdefault("metadata", {})["image_download_max_workers"] = os.environ[
             "METADATA__IMAGE_DOWNLOAD_MAX_WORKERS"
