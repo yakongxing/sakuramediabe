@@ -129,6 +129,10 @@ class ImageCleanupService:
         if pack_relative.name == MOVIE_ASSETS_PACK_NAME:
             # 影片图片包：以数据库活跃集为准重建；活跃集为空时由服务删除包。
             MovieAssetPackService.rebuild_movie_asset_pack(pack_relative.parent)
+            # Rebuilding only removes live packed files, not a losing publisher's
+            # unreferenced loose objects. Only these explicit obsolete keys are ours.
+            for relative_path in members:
+                cls._unlink_image_file(image_root / relative_path)
             return
 
         thumbnails_prefix = f"{pack_relative.parent / pack_relative.stem}/"

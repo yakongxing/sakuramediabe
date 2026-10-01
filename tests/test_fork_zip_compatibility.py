@@ -204,3 +204,22 @@ def test_movie_pack_does_not_delete_unpublished_or_nonimage_files(test_db, isola
     assert (movie_dir / "pending.webp").read_bytes() == b"not committed"
     assert (movie_dir / "notes.srt").read_bytes() == b"subtitle"
     assert read_image_bytes("movies/aa/ZIP-001/cover.webp") == b"cover"
+
+
+def test_movie_pack_cleanup_removes_explicitly_obsolete_loose_file(test_db, isolated_local_storage):
+    root = Path(settings.media.import_image_root_path)
+    movie_dir = root / "movies/aa/ZIP-001"
+    movie_dir.mkdir(parents=True)
+    live_origin = "movies/aa/ZIP-001/live.webp"
+    (movie_dir / "live.webp").write_bytes(b"live")
+    Image.create(origin=live_origin)
+    assert MovieAssetPackService.rebuild_movie_asset_pack("movies/aa/ZIP-001")
+    # The losing concurrent publisher finishes after the winner's pack is ready.
+    orphan = movie_dir / "losing-publication.webp"
+    orphan.write_bytes(b"unreferenced")
+    pending = movie_dir / "another-publication.webp"
+    pending.write_bytes(b"still uploading")
+    ImageCleanupService.delete_obsolete_image_files({"movies/aa/ZIP-001/losing-publication.webp"})
+    assert not orphan.exists()
+    assert pending.read_bytes() == b"still uploading"
+    assert read_image_bytes(live_origin) == b"live"
