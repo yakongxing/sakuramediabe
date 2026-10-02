@@ -36,7 +36,9 @@ local thumbnail batches in generation-specific ZIP_STORED packs. Logical image
 keys remain unchanged at the read boundary; missing pack entries fall back to
 loose local files. Legacy sibling `thumbnails.zip` packs remain readable.
 
-WebDAV publishes and resumes media thumbnail generations as ZIP_STORED archives,
-and reads their image entries from those remote archives. Covers do not enter
+WebDAV uploads saved media thumbnail ZIP_STORED archives directly and verifies
+their full size and SHA-256 before deleting the local ZIP. Failed uploads retain
+the same ZIP for manual retry and create a system failure notification. It reads
+image entries from those remote archives. Covers do not enter
 WebDAV publication. It never reads local thumbnail packs as a fallback and the two ZIP backfill jobs reject WebDAV before
 scanning records or changing files. Third-party URLs are not packed or proxied.

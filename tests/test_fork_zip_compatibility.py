@@ -59,6 +59,9 @@ class RemoteStorage:
     def delete(self, *args, **kwargs):
         pytest.fail("remote rollback attempted")
 
+    def put_zip(self, key, source, *, size, sha256):
+        return self.put_file(key, source, overwrite=False, immutable=True)
+
 
 @pytest.fixture
 def remote(isolated_local_storage, monkeypatch):

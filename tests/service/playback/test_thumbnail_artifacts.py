@@ -1,3 +1,4 @@
+import hashlib
 import io
 from pathlib import PurePosixPath
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from src.storage.types import (
     ObjectStat,
     PublicationResult,
     StorageConflict,
+    StorageIntegrityError,
     StorageNotFound,
     StoragePublicationUnknown,
     StorageUnavailable,
@@ -67,17 +69,24 @@ class RemoteStorage:
         self.attempted = []
 
     def put_file(self, key, source, *, overwrite=True, immutable=False):
-        assert overwrite is False
         self.attempted.append(key)
         if self.failure:
             if isinstance(self.failure, StoragePublicationUnknown):
                 self.objects[key] = source.read_bytes()
                 raise StoragePublicationUnknown(key, str(self.failure))
             raise self.failure
-        if key in self.objects and self.objects[key] != source.read_bytes():
+        if not overwrite and key in self.objects and self.objects[key] != source.read_bytes():
             raise StorageConflict(key)
         self.objects[key] = source.read_bytes()
         return PublicationResult(key, len(self.objects[key]), disposition="created")
+
+    def put_zip(self, key, source, *, size, sha256):
+        result = self.put_file(key, source)
+        with self.open(key) as stream:
+            content = stream.read()
+        if self.stat(key).size != size or hashlib.sha256(content).hexdigest() != sha256:
+            raise StorageIntegrityError("ZIP mismatch")
+        return result
 
     def stat(self, key):
         if key not in self.objects:
@@ -142,7 +151,7 @@ def test_upload_failure_retains_batch_and_can_retry(thumbnail_batch, unknown):
     storage.failure = None
     assert ThumbnailArtifactService.persist(media, artifacts) == 2
     assert old_keys == set(storage.objects)
-    assert len(storage.attempted) == (1 if unknown else 2)
+    assert len(storage.attempted) == 2
 
 
 def test_database_failure_rolls_back_entire_generation(thumbnail_batch, monkeypatch):
@@ -293,7 +302,8 @@ def test_zip_failure_leaves_entire_generation_pending(thumbnail_batch):
     assert caught.value.available_count == 0 and caught.value.failed_count == 2
     assert not MediaThumbnail.select().exists()
     batch = ThumbnailBatchStore(media).load()
-    assert all(entry["state"] == "uploading" and entry["last_error"]["status_code"] == 500 for entry in batch.entries)
+    assert all(entry["state"] == "pending" for entry in batch.entries)
+    assert batch.pack_file.is_file()
     storage.failure = None
     assert ThumbnailArtifactService.persist(media, []) == 2
     assert len(storage.attempted) == 2
@@ -340,7 +350,7 @@ def test_commit_response_loss_retains_published_thumbnails(thumbnail_batch, monk
     assert len(storage.objects) == 1
 
 
-def test_unknown_publication_is_reconciled_without_reupload(thumbnail_batch):
+def test_unknown_publication_reuploads_saved_zip(thumbnail_batch):
     media, artifacts, storage = thumbnail_batch
     storage.failure = StoragePublicationUnknown("pending", "unknown")
     with pytest.raises(ThumbnailPublicationIncomplete):
@@ -349,11 +359,11 @@ def test_unknown_publication_is_reconciled_without_reupload(thumbnail_batch):
     storage.failure = None
     assert ThumbnailArtifactService.persist(media, artifacts) == 2
     assert set(storage.objects) == old_keys
-    assert len(storage.attempted) == 1
+    assert len(storage.attempted) == 2
 
 
 @pytest.mark.parametrize("read_error", [StorageNotFound("GET missing"), StorageUnavailable("GET unavailable")])
-def test_existing_unknown_object_read_failure_never_triggers_reupload(thumbnail_batch, monkeypatch, read_error):
+def test_failed_full_read_keeps_zip_for_next_upload(thumbnail_batch, monkeypatch, read_error):
     media, artifacts, storage = thumbnail_batch
     storage.failure = StoragePublicationUnknown("pending", "unknown")
     with pytest.raises(ThumbnailPublicationIncomplete):
@@ -367,10 +377,10 @@ def test_existing_unknown_object_read_failure_never_triggers_reupload(thumbnail_
         with pytest.raises(ThumbnailPublicationIncomplete) as caught:
             ThumbnailArtifactService.persist(media, [])
         assert caught.value.__cause__ is read_error
-    assert len(storage.attempted) == 1
+    assert len(storage.attempted) == 2
     assert not MediaThumbnail.select().exists()
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert len(storage.attempted) == 1
+    assert len(storage.attempted) == 3
 
 
 def test_lost_media_lock_does_not_update_thumbnail_task_state(monkeypatch):
@@ -434,7 +444,7 @@ def test_database_connection_failure_retains_published_objects(thumbnail_batch, 
     assert len(storage.objects) == 1
 
 
-def test_unknown_publication_with_wrong_content_is_not_overwritten(thumbnail_batch):
+def test_retry_replaces_failed_generation_zip(thumbnail_batch):
     media, artifacts, storage = thumbnail_batch
     storage.failure = StoragePublicationUnknown("unknown", "response lost")
     with pytest.raises(ThumbnailPublicationIncomplete):
@@ -442,12 +452,9 @@ def test_unknown_publication_with_wrong_content_is_not_overwritten(thumbnail_bat
     key = storage.attempted[0]
     storage.objects[key] = b"different content"
     storage.failure = None
-    with pytest.raises(ThumbnailPublicationIncomplete) as caught:
-        ThumbnailArtifactService.persist(media, artifacts)
-    assert isinstance(caught.value.__cause__, StorageConflict)
-    assert not MediaThumbnail.select().exists()
-    assert storage.objects[key] == b"different content"
-    assert len(storage.attempted) == 1
+    assert ThumbnailArtifactService.persist(media, []) == 2
+    assert storage.objects[key] != b"different content"
+    assert len(storage.attempted) == 2
 
 
 @pytest.mark.parametrize("generation_failed", [False, True])

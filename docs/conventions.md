@@ -212,4 +212,4 @@ Host API 9 新增 `context.thumbnails`，插件无需导入宿主内部服务即
 
 ### 图片存储后端兼容
 
-图片模型与响应仅保留 `origin`，内部路径与外部 HTTP(S) 引用均继续支持。local 采用影片 `assets.zip` 与缩略图 ZIP，读取保留单文件兼容；WebDAV 缩略图同样以独立 generation ZIP 整包发布与续传，读取保留历史单图兼容，禁止本地 ZIP 回填任务在 WebDAV 模式运行。图片缓存不超过签名有效期。
+图片模型与响应仅保留 `origin`，内部路径与外部 HTTP(S) 引用均继续支持。local 采用影片 `assets.zip` 与缩略图 ZIP，读取保留单文件兼容；WebDAV 缩略图复用本地独立 generation ZIP 直接 PUT，完整回读校验长度与 SHA-256 后删除本地 ZIP，失败通知并保留 ZIP 供人工重传。读取保留历史单图兼容，禁止本地 ZIP 回填任务在 WebDAV 模式运行。图片缓存不超过签名有效期。

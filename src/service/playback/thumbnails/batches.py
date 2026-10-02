@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from src.common.image_store import write_pack
 from src.config import settings
 from src.service.playback.operation_locks import MediaOperationBusy
 
@@ -70,6 +71,27 @@ class ThumbnailBatch:
 
     def key(self, prefix: str, entry) -> str:
         return f"{prefix}/{self.manifest['generation']}/{entry['offset']}.webp"
+
+    @property
+    def pack_file(self) -> Path:
+        return self.workspace / "thumbnails.zip"
+
+    def prepare_pack(self) -> Path:
+        """Reuse the saved archive; loose sources are only needed to build it."""
+        pack = self.pack_file
+        if pack.is_symlink():
+            raise ValueError("thumbnail_batch_path_invalid")
+        if not pack.is_file():
+            self.validate_files()
+            temporary = pack.with_suffix(".zip.tmp")
+            try:
+                write_pack(temporary, [(f"{entry['offset']}.webp", self.source(entry)) for entry in self.entries])
+                os.replace(temporary, pack)
+                _sync_directory(self.workspace)
+            finally:
+                temporary.unlink(missing_ok=True)
+        self.validate_pack(pack)
+        return pack
 
     def validate_files(self, entries=None) -> None:
         for entry in self.entries if entries is None else entries:
@@ -263,5 +285,7 @@ class ThumbnailBatchStore:
         _sync_directory(workspace)
         manifest = {"version": 2, "format": "zip", "identity": self.identity, "media_id": self.media_id,
                     "generation": workspace.name, "images": sorted(entries, key=lambda entry: entry["offset"])}
+        batch = ThumbnailBatch(self, manifest)
+        batch.prepare_pack()
         self.save(manifest)
-        return ThumbnailBatch(self, manifest)
+        return batch

@@ -8,7 +8,7 @@ class ThumbnailPublicationIncomplete(StorageUnavailable):
 
     def __init__(self, available_count: int, failed_count: int, *, publication_possible: bool = False):
         super().__init__(
-            f"缩略图 ZIP 上传未完成，已有 {available_count} 张可用，{failed_count} 张未发布；请手动重试",
+            f"缩略图 ZIP 上传或完整校验未完成，本地 ZIP 已保留，已有 {available_count} 张可用，{failed_count} 张未发布；请手动重试",
             error_code=self.ERROR_CODE, retryable=False,
             publication_possible=publication_possible,
         )
