@@ -28,6 +28,7 @@ from src.model import (
 )
 from src.service.catalog.movie_asset_pack_service import MovieAssetPackService
 from src.storage import asset_storage
+from src.storage.covers import is_local_cover_key, local_cover_storage
 from src.storage.keys import normalize_storage_key
 
 
@@ -87,6 +88,12 @@ class ImageCleanupService:
             return
         referenced = {row.origin for row in Image.select(Image.origin).where(Image.origin.in_(relative_paths))}
         relative_paths -= referenced
+        if not relative_paths:
+            return
+        local_covers = {path for path in relative_paths if is_local_cover_key(path)}
+        for path in local_covers:
+            local_cover_storage().delete(path, missing_ok=True)
+        relative_paths -= local_covers
         if not relative_paths:
             return
         storage = asset_storage()

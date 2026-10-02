@@ -93,3 +93,24 @@ def test_image_file_route_returns_404_when_pack_entry_missing(
     response = client.get(build_signed_image_url(relative_path))
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize("key,media_type", [
+    ("local-covers/movies/aa/ABC-001/cover.jpg", "image/jpeg"),
+    ("videos/7/cover/0.webp", "image/webp"),
+])
+def test_local_cover_signed_route_bypasses_webdav(client, monkeypatch, tmp_path, key, media_type):
+    from src.api.routers.files import images as module
+    from src.common.image_store import read_image_bytes
+
+    monkeypatch.setattr(settings.storage, "backend", "webdav")
+    monkeypatch.setattr(settings.media, "import_image_root_path", str(tmp_path / "assets"))
+    target = tmp_path / "assets" / key
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"local cover")
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("local cover requested from WebDAV"))
+    response = client.get(build_signed_image_url(key))
+    assert response.status_code == 200
+    assert response.content == read_image_bytes(key) == b"local cover"
+    assert response.headers["content-type"] == media_type
+    assert "max-age=" in response.headers["cache-control"]

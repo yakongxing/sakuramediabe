@@ -70,6 +70,10 @@ MEDIA__MEDIA_CLIP_ROOT_PATH=/data/media-clips
 
 切换存储后不会自动迁移历史本地缩略图，也不会回退读取本地副本；已有缩略图记录不会因此自动重新生成。
 
+### 媒体封面 URL
+
+外部来源的影片封面直接保存、返回原始 HTTP(S) URL（含查询参数），不下载或上传 WebDAV；元数据搜索候选同样直接使用原封面 URL。插件交付的本地封面、生成的薄封面与视频首帧封面保存在 `media.import_image_root_path` 下的 `local-covers/`，通过签名图片 URL 访问，不进入 WebDAV 发布队列。使用 WebDAV 存放缩略图时，本地封面目录仍需持久化。
+
 ### 缩略图 ZIP 存储
 
 - **本地存储**：新缩略图批次写入独立的 `thumbnails/<批次UUID>.zip`（ZIP_STORED），数据库保留逻辑图片路径 `thumbnails/<批次UUID>/<时间点>.webp`。内部影片图片按影片归入 `assets.zip`；外部 HTTP(S) 图片引用仍直接返回，不下载打包。

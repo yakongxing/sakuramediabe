@@ -104,7 +104,7 @@ def test_finalize_preserves_backend_content_conflict(monkeypatch, tmp_path):
     source = tmp_path / "cover.jpg"
     source.write_bytes(b"image")
     prepared = PreparedImageFile(
-        ImagePersistTask("cover", "unused", "movies/a/cover.jpg", Path("/unused")),
+        ImagePersistTask("plot", "unused", "movies/a/cover.jpg", Path("/unused")),
         source, tmp_path,
     )
     with pytest.raises(StorageConflict) as caught:
@@ -123,7 +123,7 @@ def test_finalize_only_compensates_confirmed_exclusive_creation(
     key = "movies/a/cover-digest.jpg"
     result = PublicationResult(key, 5, disposition=disposition)
     monkeypatch.setattr(module, "asset_storage", lambda: SimpleNamespace(put_file=lambda *a, **k: result))
-    task = ImagePersistTask("cover", "unused", key, tmp_path / "cover.jpg")
+    task = ImagePersistTask("plot", "unused", key, tmp_path / "cover.jpg")
     if exclusive:
         task.exclusive_key = key
     created_keys = set()
@@ -395,3 +395,66 @@ def test_metadata_compensation_retains_objects_after_database_connection_error(m
         service.prepare_metadata_images("TEST-001", str(source), [], local=True),
     ):
         raise OperationalError("commit connection lost")
+
+
+def test_cover_url_persistence_never_downloads_or_uploads(monkeypatch):
+    from src.service.catalog import movie_image_service as module
+
+    url = "https://images.example.test/cover.jpg?token=a%2Fb&size=large"
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("cover reached WebDAV"))
+    service = MovieImageService(image_downloader=lambda *_: pytest.fail("cover was downloaded"))
+    monkeypatch.setattr(service, "_upsert_image_record", lambda value: value)
+    task = service._build_image_task("movie_cover", "ABC-001", url)
+    assert task.relative_path == url
+    assert service.resolve_thin_cover_from_downloaded_images("ABC-001", task, []).use_cover
+    service.download_image_tasks([task])
+    assert service.download_image_tasks_to_temporary_files([task]) == []
+    assert service.persist_image("movie_cover", "ABC-001", url) == url
+    assert service.persist_prepared_image(task) == url
+
+
+def test_legacy_prepared_cover_retains_original_url(monkeypatch, tmp_path):
+    from src.service.catalog import movie_image_service as module
+
+    url = "https://images.example.test/cover.jpg?token=a%2Fb"
+    task = ImagePersistTask("cover", url, "movies/aa/ABC-001/cover.jpg", tmp_path / "cover.jpg")
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("cover upload"))
+    MovieImageService().finalize_prepared_image_files(
+        [PreparedImageFile(task, task.absolute_path, tmp_path)], cleanup=False,
+    )
+    assert task.relative_path == url
+    assert task.publication is None
+
+
+@pytest.mark.parametrize("kind", ["cover", "thin_cover"])
+def test_local_cover_publication_stays_local_in_webdav_mode(monkeypatch, tmp_path, kind):
+    from src.common.image_store import read_image_bytes
+    from src.config import settings
+    from src.service.catalog import movie_image_service as module
+
+    monkeypatch.setattr(settings.storage, "backend", "webdav")
+    monkeypatch.setattr(settings.media, "import_image_root_path", str(tmp_path / "assets"))
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("cover reached WebDAV"))
+    source = tmp_path / "cover.jpg"
+    source.write_bytes(b"local image")
+    task = ImagePersistTask(kind, str(source), "movies/aa/ABC-001/cover.jpg", Path("/unused"))
+    created = set()
+    task.exclusive_key = task.relative_path
+    MovieImageService().finalize_prepared_image_files(
+        [PreparedImageFile(task, source, tmp_path)], created_keys=created, cleanup=False,
+    )
+    assert task.relative_path.startswith("local-covers/")
+    assert read_image_bytes(task.relative_path) == b"local image"
+    assert created == {task.relative_path}
+
+
+def test_legacy_download_cover_task_stores_url_without_upload(monkeypatch, tmp_path):
+    from src.service.catalog import movie_image_service as module
+
+    url = "https://images.example.test/cover.jpg?token=a%2Fb"
+    task = ImagePersistTask("cover", url, "movies/aa/ABC-001/cover.jpg", tmp_path / "cover.jpg")
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("legacy cover upload"))
+    service = MovieImageService(image_downloader=lambda *_: pytest.fail("cover download"))
+    service._download_movie_image_task(task)
+    assert task.relative_path == url
+    service.http_client.close()

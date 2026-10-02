@@ -8,17 +8,18 @@ limited to 2048 UTF-8 bytes at the persistence boundary; the `origin` database c
 remains `VARCHAR(2048)` for compatibility.
 
 Bundled metadata plugins use the stable host API to deliver local image file
-artifacts (`cover_image_path` and `plot_image_paths`). The host imports those
-artifacts into configured internal storage because the plugin supplies no
-third-party image URL. This local-artifact contract remains supported and is not
+artifacts (`cover_image_path` and `plot_image_paths`). The host keeps covers and generated thin covers in local `local-covers/` storage,
+served through signed URLs, because the plugin supplies no third-party image URL.
+Plugin plot images still use the configured internal storage. This local-artifact contract remains supported and is not
 part of direct hotlinking.
 
 This hotlink architecture means clients disclose their IP address to the image
 host. Availability, content changes, expiring URLs, rate limits, and anti-hotlink
 rules are controlled by that host and are accepted tradeoffs.
 
-Application-generated media thumbnails and other non-catalog assets remain in the
-configured application storage and are exposed through signed file routes.
+Generated video first-frame covers also use local `local-covers/` storage. External
+metadata search candidates retain the original cover URL without caching a copy.
+Application-generated media thumbnails remain in the configured application storage and are exposed through signed file routes.
 Existing internal catalog image keys remain readable and are converted naturally
 when their movie is imported or strictly refreshed; there is no mass migration.
 
@@ -35,6 +36,7 @@ local thumbnail batches in generation-specific ZIP_STORED packs. Logical image
 keys remain unchanged at the read boundary; missing pack entries fall back to
 loose local files. Legacy sibling `thumbnails.zip` packs remain readable.
 
-WebDAV continues to publish and resume individual image objects. It never reads
-local packs as a fallback and the two ZIP backfill jobs reject WebDAV before
+WebDAV publishes and resumes media thumbnail generations as ZIP_STORED archives,
+and reads their image entries from those remote archives. Covers do not enter
+WebDAV publication. It never reads local thumbnail packs as a fallback and the two ZIP backfill jobs reject WebDAV before
 scanning records or changing files. Third-party URLs are not packed or proxied.

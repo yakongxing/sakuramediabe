@@ -11,6 +11,7 @@ from src.common.image_store import (
     thumbnail_generation_pack_key,
 )
 from src.storage import StorageNotFound, asset_storage
+from src.storage.covers import is_local_cover_key, local_cover_storage
 
 router = APIRouter(prefix="/files/images", tags=["files"])
 
@@ -24,7 +25,7 @@ def get_image_file(
     require_signed_params(expires, signature)
 
     normalized_path = verify_image_signature(file_path, expires, signature)
-    storage = asset_storage()
+    storage = local_cover_storage() if is_local_cover_key(normalized_path) else asset_storage()
     local_path = storage.local_path(normalized_path)
     if local_path is not None:
         pack_path = image_pack_path(normalized_path, storage=storage)

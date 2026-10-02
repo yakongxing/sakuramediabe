@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - 由运行环境决定，测试不依�
 
 from src.common.media_paths import media_image_root_path
 from src.model import Image, VideoItem, get_database
+from src.storage.covers import LOCAL_COVER_PREFIX
 
 
 class VideoCoverService:
@@ -28,6 +29,7 @@ class VideoCoverService:
         # 与缩略图同根目录，按 videos/<id>/cover 归类，便于统一签名 URL 与清理。
         return (
             media_image_root_path()
+            / LOCAL_COVER_PREFIX
             / "videos"
             / str(video_item_id)
             / "cover"

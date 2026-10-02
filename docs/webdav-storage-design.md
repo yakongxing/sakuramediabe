@@ -242,6 +242,8 @@ WebDAV 不具备对象存储式通用条件写，不应声称能提供跨 DB/文
 - `image_search_index_service.py`、`movie_plot_image_search_service.py` 及读取 `Image.origin` 的索引路径改用 `assets.get/open`；批处理设置 bounded concurrency 和本地 LRU 临时缓存。
 - WebDAV 故障标记任务 retryable，不能将图片标记为永久缺失；Qdrant 元数据和 PostgreSQL 状态保持原位置。
 
+封面例外：外部封面保留原始 HTTP(S) URL，元数据搜索不下载封面；插件本地封面、薄封面及视频首帧封面使用 `local-covers/` 本地签名访问，不参与 WebDAV 发布。
+
 ### 4.5 片段
 
 **`media_clip_service.py`**

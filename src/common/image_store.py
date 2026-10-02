@@ -12,6 +12,7 @@ from src.common.image_references import is_nonlocal_image_reference
 from src.common.media_paths import image_pack_relative_path
 from src.config import settings
 from src.storage import asset_storage
+from src.storage.covers import is_local_cover_key, local_cover_storage
 from src.storage.keys import normalize_storage_key
 from src.storage.types import StorageNotFound
 
@@ -43,7 +44,9 @@ def read_image_bytes(relative_path: str, *, storage=None) -> bytes:
     if is_nonlocal_image_reference(relative_path):
         raise ValueError("image_reference_nonlocal")
     relative_path = normalize_storage_key(relative_path)
-    storage = storage if storage is not None else asset_storage()
+    storage = local_cover_storage() if is_local_cover_key(relative_path) else (
+        storage if storage is not None else asset_storage()
+    )
     pack_path = image_pack_path(relative_path, storage=storage)
     if pack_path is not None and pack_path.is_file():
         try:
