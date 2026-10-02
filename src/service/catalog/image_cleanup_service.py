@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from loguru import logger
 
 from src.common.image_references import is_nonlocal_image_reference
-from src.common.image_store import write_pack
+from src.common.image_store import thumbnail_generation_pack_key, write_pack
 from src.common.media_paths import MOVIE_ASSETS_PACK_NAME, image_pack_relative_path
 from src.config.config import settings
 from src.model import (
@@ -91,8 +91,17 @@ class ImageCleanupService:
             return
         storage = asset_storage()
         if settings.storage.backend != "local" or not hasattr(storage, "local_path"):
+            packs = set()
             for path in relative_paths:
+                pack = thumbnail_generation_pack_key(path)
+                if pack is not None:
+                    packs.add(pack)
+                # Also clean loose files left by earlier generations.
                 storage.delete(path, missing_ok=True)
+            for pack in packs:
+                prefix = f"{PurePosixPath(pack).with_suffix('')}/"
+                if not Image.select().where(Image.origin.startswith(prefix)).exists():
+                    storage.delete(pack, missing_ok=True)
             return
         image_root = cls.image_root_path()
         pack_members: dict[PurePosixPath, list[str]] = {}

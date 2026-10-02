@@ -1,13 +1,9 @@
-"""媒体图片字节的统一读取入口：缩略图包优先、单文件兜底。
-
-缩略图包与缩略图目录同级同名（``thumbnails.zip``）。包一旦存在即视为该 media
-缩略图的主要存储；包内条目缺失时回退同名单文件，两者都没有时按"文件缺失"
-处理（``FileNotFoundError``），与旧版调用方的异常语义保持一致。
-"""
+"""Read packed thumbnails on either backend, with loose reads for older assets."""
 
 from __future__ import annotations
 
 import os
+import re
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
@@ -35,8 +31,15 @@ def image_pack_path(relative_path: str, *, storage=None) -> Path | None:
     return getattr(storage, "local_path", lambda key: None)(pack_relative.as_posix())
 
 
+def thumbnail_generation_pack_key(relative_path: str) -> str | None:
+    path = PurePosixPath(normalize_storage_key(relative_path))
+    if path.parent.parent.name == "thumbnails" and re.fullmatch(r"[0-9a-f]{32}", path.parent.name):
+        return path.parent.with_suffix(".zip").as_posix()
+    return None
+
+
 def read_image_bytes(relative_path: str, *, storage=None) -> bytes:
-    """Read local ZIP entries or loose assets; WebDAV always reads individual keys."""
+    """Remote ZIP reads use the remote backend exclusively, never a local cache."""
     if is_nonlocal_image_reference(relative_path):
         raise ValueError("image_reference_nonlocal")
     relative_path = normalize_storage_key(relative_path)
@@ -48,6 +51,18 @@ def read_image_bytes(relative_path: str, *, storage=None) -> bytes:
                 return archive.read(PurePosixPath(relative_path).name)
         except (KeyError, zipfile.BadZipFile):
             pass
+    pack_key = thumbnail_generation_pack_key(relative_path)
+    if pack_path is None and pack_key is not None:
+        try:
+            stream = storage.open(pack_key)
+        except StorageNotFound:
+            pass  # An older generation may still consist of loose images.
+        else:
+            with stream, zipfile.ZipFile(stream) as archive:
+                try:
+                    return archive.read(PurePosixPath(relative_path).name)
+                except KeyError as exc:
+                    raise FileNotFoundError(relative_path) from exc
     try:
         with storage.open(relative_path) as stream:
             return stream.read()

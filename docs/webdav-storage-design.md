@@ -231,10 +231,10 @@ WebDAV 不具备对象存储式通用条件写，不应声称能提供跨 DB/文
 **`thumbnails/artifacts.py`**
 
 - `validate_artifact()` 继续只读 workspace，保留 WEBP、路径逃逸、尺寸校验。
-- `persist()` 对所有合法产物先上传 `.uploading.<op>`，发布为 final key，完成后再在 DB 事务创建 `Image/MediaThumbnail`。
-- 上传/入库失败保留本批次已发布对象及本地清单；逐图成功立即 checkpoint，未知结果恢复时先核对完整远端内容。只有明确整批提交后才能清理本地文件。
+- `persist()` 将全部合法缩略图打包为 ZIP_STORED，通过临时对象原子发布到 `thumbnails/<generation>.zip`，完成后在同一个 DB 事务创建全部 `Image/MediaThumbnail`。逻辑图片路径仍为 `thumbnails/<generation>/<offset>.webp`。
+- 上传/入库失败保留本批次已发布对象及本地清单；整包成功后 checkpoint，未知结果恢复时先核对远端 ZIP 的长度和完整 SHA-256 内容。只有明确整批提交后才能清理本地文件。
 - `reset_directory()` 不能先无条件清空远端目录；应先生成新集合并提交 DB，再按 DB 引用差集删除旧对象。
-- `read_dimensions()` 把单张图下载到有 size 上限的临时文件或读取有限 bytes 给 Pillow；可短 TTL 缓存维度。
+- `read_dimensions()` 通过统一图片读取入口从远端 generation ZIP 提取对应条目给 Pillow；历史单文件继续可读。
 
 **图片搜索服务**
 

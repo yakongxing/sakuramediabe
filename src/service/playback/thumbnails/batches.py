@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
@@ -96,6 +97,43 @@ class ThumbnailBatch:
                 entry.clear()
                 entry.update(previous)
                 raise
+
+    def checkpoint_pack(self, state: str, *, error: Exception | None = None) -> None:
+        """Persist one checkpoint for the entire archive, without per-image fsyncs."""
+        with self._checkpoint_lock:
+            entries = [{**entry, "state": state} for entry in self.entries]
+            for entry in entries:
+                if error is None:
+                    entry.pop("last_error", None)
+                else:
+                    entry["last_error"] = {
+                        "type": type(error).__name__,
+                        "code": getattr(error, "error_code", None),
+                        "stage": getattr(error, "stage", None),
+                        "status_code": getattr(error, "status_code", None),
+                        "publication_possible": bool(getattr(error, "publication_possible", False)),
+                    }
+            manifest = {**self.manifest, "images": entries}
+            self.store.save(manifest)
+            self.manifest = manifest
+
+    def validate_pack(self, pack: Path) -> None:
+        try:
+            with zipfile.ZipFile(pack) as archive:
+                expected_names = [f"{entry['offset']}.webp" for entry in self.entries]
+                if sorted(archive.namelist()) != sorted(expected_names):
+                    raise ValueError("thumbnail_batch_pack_invalid")
+                for entry, name in zip(self.entries, expected_names):
+                    digest = hashlib.sha256()
+                    size = 0
+                    with archive.open(name) as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            size += len(chunk)
+                            digest.update(chunk)
+                    if (size, digest.hexdigest()) != (entry["size"], entry["sha256"]):
+                        raise ValueError("thumbnail_batch_pack_invalid")
+        except zipfile.BadZipFile as exc:
+            raise ValueError("thumbnail_batch_pack_invalid") from exc
 
     def cleanup(self) -> None:
         # Keep the manifest if removal fails: a later committed-batch reconciliation
@@ -193,7 +231,7 @@ class ThumbnailBatchStore:
         except (ValueError, KeyError, TypeError) as exc:
             raise ValueError("thumbnail_batch_manifest_invalid") from exc
 
-    def prepare(self, artifacts, workspace: Path | None = None, *, packed: bool = False) -> ThumbnailBatch:
+    def prepare(self, artifacts, workspace: Path | None = None) -> ThumbnailBatch:
         if not artifacts:
             raise ValueError("thumbnail_generation_empty")
         workspace = workspace or self.new_workspace()
@@ -223,7 +261,7 @@ class ThumbnailBatchStore:
             entries.append({"offset": offset, "size": size, "sha256": digest, "state": "pending"})
         _sync_directory(images)
         _sync_directory(workspace)
-        manifest = {"version": 2, "format": "zip" if packed else "loose", "identity": self.identity, "media_id": self.media_id,
+        manifest = {"version": 2, "format": "zip", "identity": self.identity, "media_id": self.media_id,
                     "generation": workspace.name, "images": sorted(entries, key=lambda entry: entry["offset"])}
         self.save(manifest)
         return ThumbnailBatch(self, manifest)

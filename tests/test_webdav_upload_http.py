@@ -766,12 +766,12 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
     artifacts = [(ThumbnailArtifact(offset, "source.webp"), source) for offset in (3, 6)]
 
     def fault(request):
-        if unknown and request.method == "MOVE" and "/.6.webp.uploading-" in request.url.path:
+        if unknown and request.method == "MOVE" and ".zip.uploading-" in request.url.path:
             server.normal(request)
             raise httpx.ReadTimeout("response lost", request=request)
-        if unknown and request.method == "PROPFIND" and request.url.path.endswith("/6.webp"):
+        if unknown and request.method == "PROPFIND" and request.url.path.endswith(".zip"):
             return httpx.Response(404)
-        if not unknown and request.method == "PUT" and "/.6.webp.uploading-" in request.url.path:
+        if not unknown and request.method == "PUT" and ".zip.uploading-" in request.url.path:
             return httpx.Response(503)
 
     server.fault = fault
@@ -779,16 +779,16 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
         ThumbnailArtifactService.persist(media, artifacts)
     batch = ThumbnailBatchStore(media).load()
     assert batch is not None
-    finals = {path for path in server.objects if path.endswith(".webp")}
-    assert len(finals) == (2 if unknown else 1)
-    assert [row.offset for row in MediaThumbnail.select()] == [3]
+    finals = {path for path in server.objects if path.endswith(".zip")}
+    assert len(finals) == (1 if unknown else 0)
+    assert not MediaThumbnail.select().exists()
     boundary = len(server.requests)
     server.fault = lambda request: None
     backend._uncertain_publications.clear()
     assert ThumbnailArtifactService.persist(media, []) == 2
     resumed = server.requests[boundary:]
     assert sum(method == "PUT" for method, _, _ in resumed) == (0 if unknown else 1)
-    assert not any(method == "DELETE" and path.endswith(".webp") for method, path, _ in server.requests)
+    assert not any(method == "DELETE" and path.endswith(".zip") for method, path, _ in server.requests)
     assert finals.issubset(server.objects)
     assert not batch.workspace.exists()
     assert MediaThumbnail.select().count() == 2
