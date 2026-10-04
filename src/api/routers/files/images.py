@@ -5,8 +5,13 @@ from fastapi.responses import FileResponse, Response
 
 from src.api.routers._utils import require_existing_file, require_signed_params
 from src.common import build_signed_file_cache_control, verify_image_signature
-from src.common.image_store import image_pack_path, read_image_bytes
+from src.common.image_store import (
+    image_pack_path,
+    read_image_bytes,
+    thumbnail_generation_pack_key,
+)
 from src.storage import StorageNotFound, asset_storage
+from src.storage.covers import is_local_cover_key, local_cover_storage
 
 router = APIRouter(prefix="/files/images", tags=["files"])
 
@@ -20,7 +25,7 @@ def get_image_file(
     require_signed_params(expires, signature)
 
     normalized_path = verify_image_signature(file_path, expires, signature)
-    storage = asset_storage()
+    storage = local_cover_storage() if is_local_cover_key(normalized_path) else asset_storage()
     local_path = storage.local_path(normalized_path)
     if local_path is not None:
         pack_path = image_pack_path(normalized_path, storage=storage)
@@ -38,6 +43,11 @@ def get_image_file(
         response.headers["Cache-Control"] = build_signed_file_cache_control(expires)
         return response
     try:
+        if thumbnail_generation_pack_key(normalized_path) is not None:
+            content = read_image_bytes(normalized_path, storage=storage)
+            media_type, _ = mimetypes.guess_type(normalized_path)
+            return Response(content=content, media_type=media_type or "application/octet-stream",
+                            headers={"Cache-Control": build_signed_file_cache_control(expires)})
         response = storage.range_response(
             normalized_path,
             request.headers.get("range"),
@@ -45,6 +55,6 @@ def get_image_file(
         )
         response.headers["Cache-Control"] = build_signed_file_cache_control(expires)
         return response
-    except StorageNotFound as exc:
+    except (StorageNotFound, FileNotFoundError) as exc:
         from src.api.exception.errors import ApiError
         raise ApiError(404, "file_not_found", "文件不存在") from exc

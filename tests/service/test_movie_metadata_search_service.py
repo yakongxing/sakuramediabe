@@ -88,20 +88,6 @@ def _prepare_search_environment(monkeypatch, tmp_path, javdb_search, calls):
         lambda: SimpleNamespace(get_movie_by_number=javdb_search),
     )
 
-    class FakeImageService:
-        def __init__(self):
-            self.http_client = SimpleNamespace(close=lambda: None)
-            self.image_downloader = self._download
-
-        @staticmethod
-        def _download(_url, target):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            PillowImage.new("RGB", (30, 20), "blue").save(target, format="JPEG")
-
-    monkeypatch.setattr(
-        "src.service.catalog.movie_metadata_search_service.MovieImageService",
-        FakeImageService,
-    )
     return image_root, plugin_cover
 
 
@@ -121,14 +107,13 @@ def test_manual_search_skips_plugins_when_javdb_matches(test_db, tmp_path, monke
     assert response.movie_number == "ABC-001"
     assert calls == [("javdb", "ABC-001")]
     assert [candidate.source for candidate in response.candidates] == ["javdb"]
-    assert response.candidates[0].cover_url.startswith("/files/images/metadata-search/")
+    assert response.candidates[0].cover_url == _javdb_detail().cover_image
     assert response.source_errors == []
     assert plugin_cover.exists()
     assert Movie.select().count() == 0
     assert Image.select().count() == 0
 
-    cached_files = list((image_root / "metadata-search").rglob("*"))
-    assert any(path.is_file() for path in cached_files)
+    assert not (image_root / "metadata-search").exists()
 
 
 def test_manual_search_aggregates_plugins_when_javdb_not_found(

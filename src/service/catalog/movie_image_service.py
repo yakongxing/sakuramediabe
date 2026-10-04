@@ -28,6 +28,7 @@ from PIL import Image as PillowImage
 from PIL import UnidentifiedImageError
 
 from src.common.image_references import (
+    is_external_image_reference,
     is_nonlocal_image_reference,
     validate_external_image_url,
 )
@@ -45,6 +46,11 @@ from src.model import Image, Movie, MoviePlotImage
 from src.service.catalog.image_cleanup_service import ImageCleanupService
 from src.storage import asset_storage
 from src.storage.batch import publish_batch
+from src.storage.covers import (
+    LOCAL_COVER_PREFIX,
+    is_local_cover_key,
+    local_cover_storage,
+)
 from src.storage.types import ObjectStat, StorageUnavailable
 
 
@@ -215,7 +221,7 @@ class MovieImageService:
         safe_owner_key = normalize_asset_dir_name(movie_number)
         normalized_extension = self._normalize_image_extension(extension)
         relative_path = (
-            movie_asset_relative_dir(safe_owner_key) / f"thin-cover{normalized_extension}"
+            Path(LOCAL_COVER_PREFIX) / movie_asset_relative_dir(safe_owner_key) / f"thin-cover{normalized_extension}"
         ).as_posix()
         absolute_path = media_image_root_path() / relative_path
         return ImagePersistTask(
@@ -274,6 +280,8 @@ class MovieImageService:
         cover_task: ImagePersistTask | None,
         plot_tasks: list[ImagePersistTask],
     ) -> ThinCoverResolution:
+        if cover_task is not None and is_external_image_reference(cover_task.relative_path):
+            return ThinCoverResolution(use_cover=True)
         if cover_task is not None and cover_task.absolute_path.exists():
             thin_cover_task = self._generate_thin_cover_task_from_cover(
                 movie_number,
@@ -298,6 +306,8 @@ class MovieImageService:
         plot_tasks: list[ImagePersistTask],
         prepared_files: list[PreparedImageFile],
     ) -> ThinCoverResolution:
+        if cover_task is not None and is_external_image_reference(cover_task.relative_path):
+            return ThinCoverResolution(use_cover=True)
         prepared_by_relative_path = {prepared_file.image_task.relative_path: prepared_file for prepared_file in prepared_files}
         if cover_task is not None:
             prepared_cover = prepared_by_relative_path.get(cover_task.relative_path)
@@ -380,8 +390,10 @@ class MovieImageService:
         cover_image_url: str | None,
         plot_urls: list[str],
         actors: list[JavdbMovieActorResource],
+        *,
+        local: bool = False,
     ) -> tuple[ImagePersistTask | None, list[ImagePersistTask], dict[str, ImagePersistTask]]:
-        cover_task, plot_tasks = self._build_movie_image_tasks(movie_number, cover_image_url, plot_urls)
+        cover_task, plot_tasks = self._build_movie_image_tasks(movie_number, cover_image_url, plot_urls, local=local)
         actor_image_tasks_by_javdb_id: dict[str, ImagePersistTask] = {}
         for actor_resource in actors:
             if actor_resource.javdb_id in actor_image_tasks_by_javdb_id:
@@ -434,14 +446,17 @@ class MovieImageService:
         return cover_task, plot_tasks, actor_tasks
 
     def _build_movie_image_tasks(
-        self, movie_number: str, cover_image_url: str | None, plot_urls: list[str]
+        self, movie_number: str, cover_image_url: str | None, plot_urls: list[str], *, local: bool = False
     ) -> tuple[ImagePersistTask | None, list[ImagePersistTask]]:
         """统一生成影片封面和剧照的本地落盘任务。"""
-        cover_task = self._build_image_task(
-            owner_type="movie_cover",
-            owner_key=movie_number,
-            image_url=cover_image_url,
-        )
+        if local and cover_image_url:
+            extension = self._normalize_image_extension(Path(cover_image_url).suffix)
+            key = (Path(LOCAL_COVER_PREFIX) / movie_asset_relative_dir(normalize_asset_dir_name(movie_number)) / f"cover{extension}").as_posix()
+            cover_task = ImagePersistTask("cover", cover_image_url, key, media_image_root_path() / key)
+        else:
+            cover_task = self._build_image_task(
+                owner_type="movie_cover", owner_key=movie_number, image_url=cover_image_url,
+            )
         plot_tasks: list[ImagePersistTask] = []
         for image_index, plot_url in enumerate(plot_urls):
             image_task = self._build_image_task(
@@ -470,17 +485,16 @@ class MovieImageService:
             )
             return None
 
+        if owner_type == "movie_cover":
+            url = validate_external_image_url(image_url)
+            return ImagePersistTask("cover", url, url, Path())
+
         safe_owner_key = normalize_asset_dir_name(owner_key)
         extension = self._normalize_image_extension(Path(urlparse(image_url).path).suffix)
 
         if owner_type == "actor":
             relative_path = (Path("actors") / f"{safe_owner_key}{extension}").as_posix()
             image_type = "actor"
-        elif owner_type == "movie_cover":
-            relative_path = (
-                movie_asset_relative_dir(safe_owner_key) / f"cover{extension}"
-            ).as_posix()
-            image_type = "cover"
         elif owner_type == "movie_plot":
             if plot_index is None:
                 raise ValueError("plot_index is required for movie plot images")
@@ -518,10 +532,16 @@ class MovieImageService:
 
     def download_image_tasks(self, image_tasks: list[ImagePersistTask]) -> None:
         """并发下载一批图片；封面失败会中断导入，剧情图/头像失败仅告警跳过。"""
-        storage = asset_storage()
+        for task in image_tasks:
+            self._prepare_cover_reference(task)
+        image_tasks = [task for task in image_tasks if not is_external_image_reference(task.relative_path)]
+        if not image_tasks:
+            return
+        storage = asset_storage() if any(not is_local_cover_key(task.relative_path) for task in image_tasks) else local_cover_storage()
         tasks_to_download: list[ImagePersistTask] = []
         for image_task in image_tasks:
-            if storage.exists(image_task.relative_path):
+            target_storage = local_cover_storage() if is_local_cover_key(image_task.relative_path) else storage
+            if target_storage.exists(image_task.relative_path):
                 logger.debug(
                     "Catalog image download reused local file type={} path={}",
                     image_task.image_type,
@@ -576,13 +596,16 @@ class MovieImageService:
             raise cover_download_errors[0]
 
     def _download_movie_image_task(self, image_task: ImagePersistTask, storage=None) -> None:
+        self._prepare_cover_reference(image_task)
+        if is_external_image_reference(image_task.relative_path):
+            return
         logger.debug(
             "Catalog image download scheduled type={} url={} target={}",
             image_task.image_type,
             image_task.image_url,
             str(image_task.absolute_path),
         )
-        storage = storage or asset_storage()
+        storage = local_cover_storage() if is_local_cover_key(image_task.relative_path) else (storage or asset_storage())
         local_path = storage.local_path(image_task.relative_path)
         if local_path is not None:
             local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,6 +628,9 @@ class MovieImageService:
         *,
         temp_root: Path | None = None,
     ) -> list[PreparedImageFile]:
+        for task in image_tasks:
+            self._prepare_cover_reference(task)
+        image_tasks = [task for task in image_tasks if not is_external_image_reference(task.relative_path)]
         if not image_tasks:
             return []
 
@@ -670,17 +696,25 @@ class MovieImageService:
     ) -> None:
         if not prepared_files:
             return
-        storage = asset_storage()
+        publishable = []
+        for item in prepared_files:
+            task = item.image_task
+            self._prepare_cover_reference(task)
+            if is_external_image_reference(task.relative_path):
+                continue
+            publishable.append(item)
+        storage = asset_storage() if any(not is_local_cover_key(item.image_task.relative_path) for item in publishable) else None
 
         def publish(prepared_file: PreparedImageFile) -> ObjectStat:
             task = prepared_file.image_task
             task.publication = None
-            return storage.put_file(
+            target_storage = local_cover_storage() if is_local_cover_key(task.relative_path) else storage
+            return target_storage.put_file(
                 task.relative_path, prepared_file.temp_path, overwrite=False, immutable=True,
             )
 
         batch = publish_batch(
-            prepared_files,
+            publishable,
             publish,
             max_workers=min(settings.storage.webdav_publication_max_workers, len(prepared_files)),
             thread_name_prefix="image-publication",
@@ -708,10 +742,23 @@ class MovieImageService:
                 shutil.rmtree(temp_root, ignore_errors=True)
 
     @staticmethod
+    def _prepare_cover_reference(task: ImagePersistTask) -> None:
+        if task.image_type == "cover" and is_external_image_reference(task.image_url):
+            task.relative_path = validate_external_image_url(task.image_url)
+            task.publication = None
+            task.exclusive_key = None
+        elif task.image_type in {"cover", "thin_cover"} and not is_local_cover_key(task.relative_path):
+            exclusive = task.exclusive_key == task.relative_path
+            task.relative_path = LOCAL_COVER_PREFIX + task.relative_path
+            task.absolute_path = media_image_root_path() / task.relative_path
+            task.publication = None
+            task.exclusive_key = task.relative_path if exclusive else None
+
+    @staticmethod
     def delete_image_files_best_effort(keys: Iterable[str]) -> None:
-        storage = asset_storage()
         for key in keys:
             try:
+                storage = local_cover_storage() if is_local_cover_key(key) else asset_storage()
                 storage.delete(key, missing_ok=True)
             except Exception as exc:
                 logger.warning("Catalog image compensation delete failed key={} detail={}", key, exc)
@@ -722,7 +769,7 @@ class MovieImageService:
     ):
         """补缺与补录的新图独立落盘，调用方事务只切换已经存在的文件。"""
         cover_task, plot_tasks, actor_tasks = self.build_movie_import_image_tasks(
-            movie_number, cover, list(dict.fromkeys(plots)), list(actors)
+            movie_number, cover, list(dict.fromkeys(plots)), list(actors), local=local
         )
         tasks = self.collect_image_tasks(cover_task, plot_tasks, actor_tasks)
         root = media_image_root_path()
@@ -733,6 +780,8 @@ class MovieImageService:
         cleanup_allowed = True
         try:
             for task in tasks:
+                if is_external_image_reference(task.relative_path):
+                    continue
                 path = temp_root / task.relative_path
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if local:
@@ -785,6 +834,9 @@ class MovieImageService:
         if image_task is None:
             return None
 
+        if is_external_image_reference(image_task.relative_path):
+            return self._upsert_image_record(image_task.relative_path)
+
         if not image_task.has_confirmed_publication() and not asset_storage().exists(image_task.relative_path):
             logger.debug("Persist image downloading url={} target={}", image_task.image_url, str(image_task.absolute_path))
             self._download_movie_image_task(image_task)
@@ -796,8 +848,10 @@ class MovieImageService:
     def persist_prepared_image(self, image_task: ImagePersistTask | None) -> Image | None:
         if image_task is None:
             return None
+        if is_external_image_reference(image_task.relative_path):
+            return self._upsert_image_record(image_task.relative_path)
         # 非致命图片下载失败时不会落地文件，这里直接跳过数据库记录，避免脏路径。
-        if not image_task.has_confirmed_publication() and not asset_storage().exists(image_task.relative_path):
+        if not self._has_published_image(image_task):
             logger.warning(
                 "Persist image skipped because local file is missing image_type={} url={} target={}",
                 image_task.image_type,
@@ -806,6 +860,13 @@ class MovieImageService:
             )
             return None
         return self._upsert_image_record(image_task.relative_path)
+
+    @staticmethod
+    def _has_published_image(task: ImagePersistTask) -> bool:
+        if is_external_image_reference(task.relative_path) or task.has_confirmed_publication():
+            return True
+        storage = local_cover_storage() if is_local_cover_key(task.relative_path) else asset_storage()
+        return storage.exists(task.relative_path)
 
     def persist_prepared_images(
         self,
@@ -820,7 +881,7 @@ class MovieImageService:
         for image_task in image_tasks:
             if image_task is None:
                 continue
-            if not image_task.has_confirmed_publication() and not asset_storage().exists(image_task.relative_path):
+            if not self._has_published_image(image_task):
                 logger.warning(
                     "Persist image skipped because local file is missing image_type={} url={} target={}",
                     image_task.image_type,

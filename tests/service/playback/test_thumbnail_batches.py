@@ -1,3 +1,4 @@
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 
@@ -6,7 +7,14 @@ from peewee import OperationalError
 from PIL import Image as PILImage
 
 from src.config import settings
-from src.model import Image, Media, MediaLibrary, MediaThumbnail, Movie
+from src.model import (
+    Image,
+    Media,
+    MediaLibrary,
+    MediaThumbnail,
+    Movie,
+    SystemNotification,
+)
 from src.plugins.provider_protocol import (
     MEDIA_PROVIDER_REGISTRY,
     ThumbnailArtifact,
@@ -18,7 +26,11 @@ from src.service.playback.thumbnails.batches import ThumbnailBatch, ThumbnailBat
 from src.service.playback.thumbnails.contracts import ThumbnailPublicationIncomplete
 from src.service.playback.thumbnails.task_service import MediaThumbnailTaskService
 from src.storage.local import LocalStorageBackend
-from src.storage.types import StoragePublicationUnknown, StorageUnavailable
+from src.storage.types import (
+    StorageIntegrityError,
+    StoragePublicationUnknown,
+    StorageUnavailable,
+)
 
 
 class RecordingStorage(LocalStorageBackend):
@@ -30,7 +42,7 @@ class RecordingStorage(LocalStorageBackend):
 
     def put_file(self, key, source, **kwargs):
         self.attempts.append(key)
-        if self.failure and key.endswith("/6.webp"):
+        if self.failure:
             if self.unknown:
                 super().put_file(key, source, **kwargs)
                 raise StoragePublicationUnknown(key, "response lost")
@@ -39,6 +51,14 @@ class RecordingStorage(LocalStorageBackend):
 
     def delete(self, *args, **kwargs):
         pytest.fail("failed thumbnail publication must not delete remote files")
+
+    def put_zip(self, key, source, *, size, sha256):
+        result = self.put_file(key, source, overwrite=True)
+        with self.open(key) as stream:
+            content = stream.read()
+        if self.stat(key).size != size or hashlib.sha256(content).hexdigest() != sha256:
+            raise StorageIntegrityError("ZIP mismatch")
+        return result
 
 
 @pytest.fixture
@@ -64,15 +84,19 @@ def test_retry_reloads_disk_progress_and_cleans_only_after_commit(publication):
         ThumbnailArtifactService.persist(media, artifacts)
     store = ThumbnailBatchStore(media)
     batch = store.load()
-    assert [entry["state"] for entry in batch.entries] == ["uploaded", "uploading"]
+    assert [entry["state"] for entry in batch.entries] == ["pending", "pending"]
+    saved_pack = batch.pack_file.read_bytes()
     assert batch.source(batch.entries[0]).exists()
-    assert len(list(storage.root.rglob("*.webp"))) == 1
-    assert [row.offset for row in MediaThumbnail.select()] == [3]
+    assert not list(storage.root.rglob("*.zip"))
+    assert not MediaThumbnail.select().exists()
     # Neither the previous in-memory batch nor the original source is needed.
     artifacts[0][1].unlink()
+    for entry in batch.entries:
+        batch.source(entry).unlink()
     storage.failure = None
+    assert batch.pack_file.read_bytes() == saved_pack
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert len(storage.attempts) == 3
+    assert len(storage.attempts) == 2
     assert not store.manifest_path.exists()
     assert not batch.workspace.exists()
     assert MediaThumbnail.select().count() == Image.select().count() == 2
@@ -94,7 +118,7 @@ def test_requested_retry_does_not_call_provider_again(publication, monkeypatch):
     first = MediaThumbnailTaskService.generate_requested_media(media.id)
     assert first.state == "terminal_failed"
     assert first.error_code == ThumbnailPublicationIncomplete.ERROR_CODE
-    assert first.generated_count == 1
+    assert first.generated_count == 0
     assert Media.get_by_id(media.id).thumbnail_next_retry_at is None
     assert MediaThumbnailTaskService.count_pending_media() == 0
     assert MediaThumbnailTaskService.count_terminal_failed_media() == 1
@@ -104,11 +128,11 @@ def test_requested_retry_does_not_call_provider_again(publication, monkeypatch):
     events = []
     second = MediaThumbnailTaskService.generate_requested_media(media.id, progress_callback=events.append)
     assert second.state == "succeeded"
-    assert len(storage.attempts) == 3
+    assert len(storage.attempts) == 2
     assert events  # Fast retries may finish within the progress heartbeat throttle.
 
 
-def test_bulk_partial_upload_counts_available_images_then_waits_for_user(publication, monkeypatch):
+def test_bulk_zip_failure_has_no_available_images_and_waits_for_user(publication, monkeypatch):
     from types import SimpleNamespace
 
     media, artifacts, storage = publication
@@ -119,12 +143,12 @@ def test_bulk_partial_upload_counts_available_images_then_waits_for_user(publica
     reporter = SimpleNamespace(emit=lambda **_kwargs: None)
     result = MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)
     assert result["successful_media"] == 0 and result["terminal_failed_media"] == 1
-    assert result["generated_thumbnails"] == 1
+    assert result["generated_thumbnails"] == 0
     assert MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)["pending_media"] == 0
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
 
 
-def test_explicit_reset_resumes_partial_thumbnails_without_regeneration(publication, monkeypatch):
+def test_explicit_reset_resumes_zip_without_regeneration(publication, monkeypatch):
     from types import SimpleNamespace
 
     media, artifacts, storage = publication
@@ -133,16 +157,16 @@ def test_explicit_reset_resumes_partial_thumbnails_without_regeneration(publicat
     monkeypatch.setattr(MEDIA_PROVIDER_REGISTRY, "storage_for", lambda _library: pytest.fail("regenerated"))
     storage.failure = StorageUnavailable("offline", retryable=True)
     assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
-    existing_id = MediaThumbnail.get().id
+    assert not MediaThumbnail.select().exists()
     reporter = SimpleNamespace(emit=lambda **_kwargs: None)
     assert MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)["pending_media"] == 0
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
     storage.failure = None
     assert MediaThumbnailTaskService.reset_terminal_media([media.id]) == 1
     assert MediaThumbnailTaskService.count_pending_media() == 1
     assert MediaThumbnailTaskService.generate_pending_thumbnails(reporter=reporter)["successful_media"] == 1
-    assert len(storage.attempts) == 3
-    assert MediaThumbnail.get(MediaThumbnail.offset == 3).id == existing_id
+    assert len(storage.attempts) == 2
+    assert MediaThumbnail.get(MediaThumbnail.offset == 3).id is not None
     assert MediaThumbnail.select().count() == 2
     assert Media.get_by_id(media.id).thumbnail_generation_state == Media.THUMBNAIL_STATE_SUCCEEDED
 
@@ -161,9 +185,9 @@ def test_missing_partial_batch_is_not_treated_as_complete(publication, monkeypat
     result = MediaThumbnailTaskService.generate_requested_media(media.id)
     assert result.state == "terminal_failed"
     assert result.error_code == ThumbnailPublicationIncomplete.ERROR_CODE
-    assert result.generated_count == 1
-    assert len(storage.attempts) == 2
-    assert MediaThumbnail.select().count() == 1
+    assert result.generated_count == 0
+    assert len(storage.attempts) == 1
+    assert MediaThumbnail.select().count() == 0
     assert "清单缺失" in Media.get_by_id(media.id).thumbnail_last_error
 
 
@@ -175,16 +199,16 @@ def test_partial_marker_survives_local_failure_and_missing_manifest(publication,
     storage.failure = StorageUnavailable("offline", retryable=True)
     assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
     batch = store.load()
-    batch.source(batch.entries[1]).write_bytes(b"corrupt")
+    batch.pack_file.write_bytes(b"corrupt")
     failed = MediaThumbnailTaskService.generate_requested_media(media.id)
     assert failed.state == "terminal_failed" and failed.error_code == ThumbnailPublicationIncomplete.ERROR_CODE
     refreshed = Media.get_by_id(media.id)
     assert refreshed.thumbnail_last_error_code == ThumbnailPublicationIncomplete.ERROR_CODE
-    assert "thumbnail_batch_file_invalid" in refreshed.thumbnail_last_error
+    assert "thumbnail_batch_pack_invalid" in refreshed.thumbnail_last_error
     store.manifest_path.unlink()
     assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "terminal_failed"
-    assert MediaThumbnail.select().count() == 1
-    assert len(storage.attempts) == 2
+    assert MediaThumbnail.select().count() == 0
+    assert len(storage.attempts) == 1
 
 
 def test_database_failure_retries_only_commit(publication, monkeypatch):
@@ -199,9 +223,10 @@ def test_database_failure_retries_only_commit(publication, monkeypatch):
         ThumbnailArtifactService.persist(media, artifacts)
     assert not Image.select().exists()
     assert ThumbnailBatchStore(media).load() is not None
+    assert not ThumbnailBatchStore(media).load().pack_file.exists()
     monkeypatch.setattr(MediaThumbnail, "create", create)
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
 
 
 def test_commit_response_loss_is_reconciled_on_next_request(publication, monkeypatch, test_db):
@@ -222,13 +247,13 @@ def test_commit_response_loss_is_reconciled_on_next_request(publication, monkeyp
             ThumbnailArtifactService.persist(media, artifacts)
     batch = ThumbnailBatchStore(media).load()
     assert batch is not None
-    assert MediaThumbnail.select().count() == 1
-    # A committed file is no longer needed locally to finish the remaining batch.
+    assert MediaThumbnail.select().count() == 2
+    # All rows committed despite the lost response; only local cleanup remains.
     batch.source(batch.entries[0]).unlink()
-    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "succeeded"
+    assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "already_exists"
     assert not batch.workspace.exists()
     assert ThumbnailBatchStore(media).load() is None
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
     assert MediaThumbnail.select().count() == Image.select().count() == 2
 
 
@@ -240,28 +265,30 @@ def test_cleanup_failure_keeps_success_and_can_retry_cleanup(publication, monkey
     assert ThumbnailBatchStore(media).load() is not None
     ThumbnailArtifactService.cleanup_committed(media)
     assert ThumbnailBatchStore(media).load() is None
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
 
 
-def test_remote_success_without_checkpoint_is_reconciled(publication, monkeypatch):
+def test_remote_success_without_checkpoint_retries_saved_zip(publication, monkeypatch):
     media, artifacts, storage = publication
-    checkpoint = ThumbnailBatch.checkpoint
+    checkpoint = ThumbnailBatch.checkpoint_pack
 
-    def fail_checkpoint(self, entry, state):
+    def fail_checkpoint(self, state):
         if state == "uploaded":
             raise OSError("disk full")
-        checkpoint(self, entry, state)
+        checkpoint(self, state)
 
     with monkeypatch.context() as patch:
-        patch.setattr(ThumbnailBatch, "checkpoint", fail_checkpoint)
+        patch.setattr(ThumbnailBatch, "checkpoint_pack", fail_checkpoint)
         with pytest.raises(OSError, match="disk full"):
             ThumbnailArtifactService.persist(media, artifacts)
     assert len(storage.attempts) == 1
+    assert ThumbnailBatchStore(media).load().pack_file.is_file()
+    assert SystemNotification.select().where(SystemNotification.event_type == "thumbnail_zip_upload_failed").count() == 1
     assert ThumbnailArtifactService.persist(media, []) == 2
     assert len(storage.attempts) == 2
 
 
-def test_remote_uncertainty_does_not_turn_read_failure_into_missing(publication, monkeypatch):
+def test_remote_read_failure_keeps_zip_after_reupload(publication, monkeypatch):
     media, artifacts, storage = publication
     storage.failure = StorageUnavailable("offline", retryable=True)
     storage.unknown = True
@@ -274,12 +301,13 @@ def test_remote_uncertainty_does_not_turn_read_failure_into_missing(publication,
             ThumbnailArtifactService.persist(media, [])
         assert str(caught.value.__cause__) == "read offline"
     assert len(storage.attempts) == 2
+    assert ThumbnailBatchStore(media).load().pack_file.is_file()
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 3
 
 
 @pytest.mark.parametrize("damage", ["missing", "changed", "outside"])
-def test_damaged_local_batch_is_retained_without_upload(publication, damage, tmp_path):
+def test_saved_zip_is_reused_even_if_loose_sources_are_unavailable(publication, damage, tmp_path):
     media, artifacts, storage = publication
     with ThumbnailBatchStore(media).locked() as store:
         batch = store.prepare(artifacts)
@@ -291,10 +319,9 @@ def test_damaged_local_batch_is_retained_without_upload(publication, damage, tmp
     else:
         source.unlink()
         source.symlink_to(artifacts[0][1])
-    with pytest.raises(ValueError, match="thumbnail_batch_"):
-        ThumbnailArtifactService.persist(media, [])
-    assert store.manifest_path.exists()
-    assert not storage.attempts
+    assert ThumbnailArtifactService.persist(media, []) == 2
+    assert not store.manifest_path.exists()
+    assert len(storage.attempts) == 1
 
 
 @pytest.mark.parametrize("field,value", [("generation", "../outside"), ("version", 999), ("images", []), ("media_id", 999)])
@@ -416,7 +443,7 @@ def test_outer_transaction_rollback_keeps_local_batch(publication, test_db):
         raise RuntimeError("outer rollback")
     assert not MediaThumbnail.select().exists()
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert len(storage.attempts) == 2
+    assert len(storage.attempts) == 1
 
 
 def test_local_lock_excludes_other_process(publication):
@@ -469,7 +496,7 @@ print(json.dumps([entry['state'] for entry in batch.entries]))
         capture_output=True, text=True, timeout=30, check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout.splitlines()[-1]) == ["uploaded", "uploading"]
+    assert json.loads(result.stdout.splitlines()[-1]) == ["pending", "pending"]
 
 
 def test_provider_output_names_cannot_overwrite_other_staged_sources(publication, monkeypatch):
@@ -490,4 +517,87 @@ def test_provider_output_names_cannot_overwrite_other_staged_sources(publication
     assert MediaThumbnailTaskService.generate_requested_media(media.id).state == "succeeded"
     assert originals[3] != originals[6]
     for row in MediaThumbnail.select():
-        assert storage.local_path(row.image.origin).read_bytes() == originals[row.offset]
+        from src.common.image_store import read_image_bytes
+        assert read_image_bytes(row.image.origin, storage=storage) == originals[row.offset]
+
+
+def test_pack_checkpoint_failure_keeps_durable_upload_state(publication, monkeypatch):
+    media, artifacts, _ = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        batch = store.prepare(artifacts)
+        batch.checkpoint_pack("uploading")
+        monkeypatch.setattr(store, "save", lambda *_: (_ for _ in ()).throw(OSError("disk full")))
+        with pytest.raises(OSError, match="disk full"):
+            batch.checkpoint_pack("uploaded")
+        assert all(entry["state"] == "uploading" for entry in batch.entries)
+        assert all(entry["state"] == "uploading" for entry in store.load().entries)
+
+
+def test_corrupt_staged_zip_is_not_published(publication):
+    media, artifacts, storage = publication
+    storage.failure = StorageUnavailable("offline")
+    with pytest.raises(ThumbnailPublicationIncomplete):
+        ThumbnailArtifactService.persist(media, artifacts)
+    batch = ThumbnailBatchStore(media).load()
+    (batch.workspace / "thumbnails.zip").write_bytes(b"corrupt archive")
+    storage.failure = None
+    with pytest.raises(ValueError, match="thumbnail_batch_pack_invalid"):
+        ThumbnailArtifactService.persist(media, [])
+    assert len(storage.attempts) == 1
+    assert not MediaThumbnail.select().exists()
+    assert batch.workspace.exists()
+
+
+def test_zip_failure_notification_is_deduplicated_and_keeps_archive(publication):
+    media, artifacts, storage = publication
+    storage.failure = StorageUnavailable("upload offline")
+    with pytest.raises(ThumbnailPublicationIncomplete):
+        ThumbnailArtifactService.persist(media, artifacts)
+    batch = ThumbnailBatchStore(media).load()
+    original = batch.pack_file.read_bytes()
+    with pytest.raises(ThumbnailPublicationIncomplete):
+        ThumbnailArtifactService.persist(media, [])
+    notices = list(SystemNotification.select().where(SystemNotification.event_type == "thumbnail_zip_upload_failed"))
+    assert len(notices) == 1
+    assert notices[0].category == "error"
+    assert notices[0].resource_id == media.id
+    assert "本地 ZIP 已保留" in notices[0].content
+    assert batch.pack_file.read_bytes() == original
+    storage.failure = None
+    assert ThumbnailArtifactService.persist(media, []) == 2
+    assert not batch.pack_file.exists()
+
+
+def test_notification_failure_does_not_hide_upload_failure(publication, monkeypatch):
+    media, artifacts, storage = publication
+    storage.failure = StorageUnavailable("original upload error")
+    monkeypatch.setattr("src.service.playback.thumbnails.artifacts.NotificationService.create_once",
+                        lambda *_: (_ for _ in ()).throw(RuntimeError("notification offline")))
+    with pytest.raises(ThumbnailPublicationIncomplete) as caught:
+        ThumbnailArtifactService.persist(media, artifacts)
+    assert str(caught.value.__cause__) == "original upload error"
+    assert ThumbnailBatchStore(media).load().pack_file.is_file()
+
+
+def test_old_ready_batch_without_zip_builds_archive_from_saved_images(publication):
+    media, artifacts, storage = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        batch = store.prepare(artifacts)
+        batch.pack_file.unlink()
+    artifacts[0][1].unlink()
+    assert ThumbnailArtifactService.persist(media, []) == 2
+    assert len(storage.attempts) == 1
+
+
+def test_zip_symlink_is_rejected_before_upload(publication, tmp_path):
+    media, artifacts, storage = publication
+    with ThumbnailBatchStore(media).locked() as store:
+        batch = store.prepare(artifacts)
+        outside = tmp_path / "outside.zip"
+        outside.write_bytes(batch.pack_file.read_bytes())
+        batch.pack_file.unlink()
+        batch.pack_file.symlink_to(outside)
+    with pytest.raises(ValueError, match="thumbnail_batch_path_invalid"):
+        ThumbnailArtifactService.persist(media, [])
+    assert outside.is_file()
+    assert not storage.attempts

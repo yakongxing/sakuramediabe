@@ -643,6 +643,31 @@ class WebDAVStorageBackend:
             finally:
                 _budget.reset(token)
 
+    def put_zip(self, key: str, source: Path, *, size: int, sha256: str) -> PublicationResult:
+        """Upload a generation ZIP once, then verify every remote byte.
+
+        The caller retains the local archive on failure and retries the same
+        bytes at the same generation key. No temporary object or MOVE is needed.
+        """
+        key = normalize_storage_key(key)
+        if not key.endswith(".zip"):
+            raise ValueError("ZIP upload requires a .zip key")
+        with self._using():
+            token = _budget.set(PublicationBudget(self._publication_timeout_seconds))
+            try:
+                with path_locks.hold(f"file:{self._lock_identity}:{self._path(key)}", _budget.get()):
+                    self._mkdir_parents(key)
+                    with source.open("rb") as stream, self._network():
+                        self._upload_once(key, stream, size, sha256)
+                    final = self._destination_matches(key, expected_size=size, expected_sha256=sha256)
+                    if final is None:
+                        raise StorageIntegrityError("WebDAV ZIP content mismatch", stage="verify")
+                    return PublicationResult(final.key, final.size, final.is_file, final.etag)
+            except Exception as exc:
+                raise self._error("ZIP upload", exc) from exc
+            finally:
+                _budget.reset(token)
+
     def put_bytes(self, key: str, content: bytes, *, overwrite: bool = True, immutable: bool = False) -> PublicationResult:
         if immutable and overwrite:
             raise ValueError("immutable publication requires overwrite=False")

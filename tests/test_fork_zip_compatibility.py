@@ -51,13 +51,16 @@ class RemoteStorage:
     def put_file(self, key, source, **kwargs):
         assert kwargs == {"overwrite": False, "immutable": True}
         self.uploads.append(key)
-        if self.fail and key.endswith("/6.webp"):
+        if self.fail:
             raise StorageUnavailable("offline")
         self.objects[key] = source.read_bytes()
         return PublicationResult(key, len(self.objects[key]), disposition="created")
 
     def delete(self, *args, **kwargs):
         pytest.fail("remote rollback attempted")
+
+    def put_zip(self, key, source, *, size, sha256):
+        return self.put_file(key, source, overwrite=False, immutable=True)
 
 
 @pytest.fixture
@@ -116,20 +119,23 @@ def test_remote_catalog_pack_hooks_do_not_touch_local_storage(remote, monkeypatc
     assert not Path(settings.media.import_image_root_path).exists()
 
 
-def test_remote_new_batches_remain_loose_and_resume(remote, thumbnails, monkeypatch):
+def test_remote_new_batches_upload_zip_and_resume(remote, thumbnails):
     media, artifacts = thumbnails
-    monkeypatch.setattr(settings.storage, "webdav_publication_max_workers", 1)
     remote.fail = True
     with pytest.raises(StorageUnavailable):
         ThumbnailArtifactService.persist(media, artifacts)
     batch = ThumbnailBatchStore(media).load()
-    assert not batch.packed
-    assert len(remote.objects) == 1
+    assert batch.packed
+    assert len(remote.objects) == 0
+    assert not MediaThumbnail.select().exists()
     remote.fail = False
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert len(remote.uploads) == 3
-    assert all(key.endswith(".webp") for key in remote.uploads)
-    assert not list(Path(settings.media.thumbnail_staging_root_path).rglob("*.zip"))
+    assert len(remote.uploads) == 2
+    assert all(key.endswith(".zip") for key in remote.uploads)
+    assert len(remote.objects) == 1
+    for row in MediaThumbnail.select():
+        assert read_image_bytes(row.image.origin) == artifacts[0][1].read_bytes()
+    assert not batch.workspace.exists()
 
 
 def test_local_new_batches_use_isolated_zip(isolated_local_storage, thumbnails):
@@ -164,18 +170,27 @@ def test_local_zip_database_failure_keeps_batch_for_commit_retry(isolated_local_
     assert not batch.workspace.exists()
 
 
-def test_legacy_local_batch_keeps_loose_format(isolated_local_storage, thumbnails):
+@pytest.mark.parametrize("backend", ["local", "webdav"])
+def test_legacy_batch_resumes_as_zip(isolated_local_storage, thumbnails, monkeypatch, backend):
     media, artifacts = thumbnails
+    storage = asset_storage() if backend == "local" else RemoteStorage()
+    monkeypatch.setattr(settings.storage, "backend", backend)
+    monkeypatch.setattr("src.service.playback.thumbnails.artifacts.asset_storage", lambda: storage)
     with ThumbnailBatchStore(media).locked() as store:
         batch = store.prepare(artifacts)
         batch.manifest["version"] = 1
         del batch.manifest["format"]
         entry = batch.entries[0]
-        asset_storage().put_file(batch.key(ThumbnailArtifactService.thumbnail_prefix(media), entry), batch.source(entry), overwrite=False)
+        key = batch.key(ThumbnailArtifactService.thumbnail_prefix(media), entry)
+        storage.put_file(key, batch.source(entry), overwrite=False, immutable=True)
         batch.checkpoint(entry, "uploaded")
+        ThumbnailArtifactService._commit_entries(media, batch, [entry])
+        batch.source(entry).unlink()  # Restore an already uploaded legacy source.
     assert ThumbnailArtifactService.persist(media, []) == 2
-    assert not list(Path(settings.media.import_image_root_path).rglob("*.zip"))
-    assert len(list(Path(settings.media.import_image_root_path).rglob("*.webp"))) == 2
+    if backend == "webdav":
+        assert len(storage.uploads) == 2 and storage.uploads[-1].endswith(".zip")
+    for row in MediaThumbnail.select():
+        assert read_image_bytes(row.image.origin, storage=storage) == artifacts[0][1].read_bytes()
 
 
 def test_local_zip_cleanup_keeps_other_referenced_entries(isolated_local_storage, thumbnails):
@@ -223,3 +238,28 @@ def test_movie_pack_cleanup_removes_explicitly_obsolete_loose_file(test_db, isol
     assert not orphan.exists()
     assert pending.read_bytes() == b"still uploading"
     assert read_image_bytes(live_origin) == b"live"
+
+
+def test_remote_zip_reads_ignore_local_cache(remote, tmp_path):
+    generation = "a" * 32
+    key = f"movies/aa/ZIP-001/media/1/thumbnails/{generation}/3.webp"
+    local = Path(settings.media.import_image_root_path) / key
+    write_pack(local.parent.with_suffix(".zip"), [("3.webp", b"stale local")])
+    pack = tmp_path / "remote.zip"
+    write_pack(pack, [("3.webp", b"current remote")])
+    remote.objects[local.parent.relative_to(Path(settings.media.import_image_root_path)).as_posix() + ".zip"] = pack.read_bytes()
+    assert read_image_bytes(key) == b"current remote"
+    remote.objects.clear()
+    with pytest.raises(FileNotFoundError):
+        read_image_bytes(key)
+
+
+def test_remote_missing_zip_entry_does_not_serve_loose_file(remote, tmp_path):
+    generation = "b" * 32
+    prefix = f"movies/aa/ZIP-001/media/1/thumbnails/{generation}"
+    pack = tmp_path / "remote.zip"
+    write_pack(pack, [("6.webp", b"other")])
+    remote.objects[prefix + ".zip"] = pack.read_bytes()
+    remote.objects[prefix + "/3.webp"] = b"stale loose"
+    with pytest.raises(FileNotFoundError):
+        read_image_bytes(prefix + "/3.webp")

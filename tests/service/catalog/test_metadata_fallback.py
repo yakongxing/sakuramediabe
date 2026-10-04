@@ -306,7 +306,8 @@ def test_import_zero_statistics_images_and_repeat_lookup(metadata_env, monkeypat
     )
     assert movie.javdb_next_check_at > utc_now_for_db()
     assert asset_bytes(movie.cover_image.origin)
-    assert not (metadata_env.root / "assets" / movie.cover_image.origin).exists()
+    assert movie.cover_image.origin.startswith("local-covers/")
+    assert (metadata_env.root / "assets" / movie.cover_image.origin).is_file()
     assert not list((metadata_env.root / "plugins").rglob("cover.png"))
     assert Tag.select().count() == 1
     resource = MovieService.get_movie_detail(movie.movie_number)
@@ -837,3 +838,18 @@ def test_match_actors_ignores_merged_tombstones(test_db):
 
     assert matched == []
     provider.search_actors.assert_called_once_with("Ghost")
+
+
+def test_plugin_cover_import_in_webdav_mode_uses_local_signed_url(metadata_env, monkeypatch):
+    from src.common.file_signatures import build_signed_image_url
+    from src.service.catalog import movie_image_service as module
+
+    monkeypatch.setattr(settings.storage, "backend", "webdav")
+    monkeypatch.setattr(module, "asset_storage", lambda: pytest.fail("plugin cover reached WebDAV"))
+    movie = import_plugin(metadata_env, monkeypatch)
+    origin = movie.cover_image.origin
+    assert origin.startswith("local-covers/")
+    assert build_signed_image_url(origin).startswith("/files/images/local-covers/")
+    assert asset_bytes(origin)
+    assert (metadata_env.root / "assets" / origin).is_file()
+    assert not list((metadata_env.root / "plugins").rglob("cover.png"))

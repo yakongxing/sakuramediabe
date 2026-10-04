@@ -37,7 +37,7 @@ def test_metadata_compensation_preserves_unknown_publication(test_db, tmp_path, 
     monkeypatch.setattr(module, "asset_storage", lambda: storage)
     monkeypatch.setattr("src.service.catalog.image_cleanup_service.asset_storage", lambda: storage)
     monkeypatch.setattr(module, "media_image_root_path", lambda: tmp_path)
-    monkeypatch.setattr(service, "build_movie_import_image_tasks", lambda *args: (None, [], []))
+    monkeypatch.setattr(service, "build_movie_import_image_tasks", lambda *args, **kwargs: (None, [], []))
     monkeypatch.setattr(service, "collect_image_tasks", lambda *args: tasks)
     monkeypatch.setattr(
         service, "resolve_thin_cover_from_prepared_images",

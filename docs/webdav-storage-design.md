@@ -231,16 +231,18 @@ WebDAV 不具备对象存储式通用条件写，不应声称能提供跨 DB/文
 **`thumbnails/artifacts.py`**
 
 - `validate_artifact()` 继续只读 workspace，保留 WEBP、路径逃逸、尺寸校验。
-- `persist()` 对所有合法产物先上传 `.uploading.<op>`，发布为 final key，完成后再在 DB 事务创建 `Image/MediaThumbnail`。
-- 上传/入库失败保留本批次已发布对象及本地清单；逐图成功立即 checkpoint，未知结果恢复时先核对完整远端内容。只有明确整批提交后才能清理本地文件。
+- 准备批次时先保存本地 ZIP_STORED 文件，`persist()` 复用此 ZIP，直接 PUT 到 `thumbnails/<generation>.zip`；上传后完整回读校验长度和 SHA-256。没有临时对象、MOVE 或未知结果恢复分支，失败时保留 ZIP 并发送去重系统通知，人工重试同一文件覆盖同一 generation key。
+- 完整校验通过后落盘上传成功状态并立即删除本地 ZIP，再在同一个 DB 事务创建全部 `Image/MediaThumbnail`。入库失败保留成功状态清单，下次仅重试入库；确认整批提交后清理其余批次文件。逻辑图片路径仍为 `thumbnails/<generation>/<offset>.webp`。
 - `reset_directory()` 不能先无条件清空远端目录；应先生成新集合并提交 DB，再按 DB 引用差集删除旧对象。
-- `read_dimensions()` 把单张图下载到有 size 上限的临时文件或读取有限 bytes 给 Pillow；可短 TTL 缓存维度。
+- `read_dimensions()` 通过统一图片读取入口从远端 generation ZIP 提取对应条目给 Pillow；历史单文件继续可读。
 
 **图片搜索服务**
 
 - `image_search.py` 的上传路由不改。
 - `image_search_index_service.py`、`movie_plot_image_search_service.py` 及读取 `Image.origin` 的索引路径改用 `assets.get/open`；批处理设置 bounded concurrency 和本地 LRU 临时缓存。
 - WebDAV 故障标记任务 retryable，不能将图片标记为永久缺失；Qdrant 元数据和 PostgreSQL 状态保持原位置。
+
+封面例外：外部封面保留原始 HTTP(S) URL，元数据搜索不下载封面；插件本地封面、薄封面及视频首帧封面使用 `local-covers/` 本地签名访问，不参与 WebDAV 发布。
 
 ### 4.5 片段
 

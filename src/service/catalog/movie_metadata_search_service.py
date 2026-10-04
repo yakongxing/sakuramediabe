@@ -6,7 +6,6 @@ import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlparse
 from uuid import uuid4
 
 from loguru import logger
@@ -17,6 +16,7 @@ from src.common import (
     build_signed_image_url,
     normalize_movie_number,
 )
+from src.common.image_references import validate_external_image_url
 from src.common.media_paths import media_image_root_path
 from src.metadata._providers.models import JavdbMovieDetailResource
 from src.metadata.factory import build_javdb_provider
@@ -28,7 +28,6 @@ from src.schema.transfers.media_import import (
     ImportMetadataSourceErrorResource,
 )
 from src.service.catalog.metadata_source_service import MetadataSourceService
-from src.service.catalog.movie_image_service import MovieImageService
 
 
 class MovieMetadataSearchService:
@@ -46,72 +45,64 @@ class MovieMetadataSearchService:
 
         search_id = uuid4().hex
         search_root = media_image_root_path() / cls.SEARCH_ASSET_DIR / search_id
-        image_service = MovieImageService()
         candidates: list[ImportMetadataCandidateResource] = []
         source_errors: list[ImportMetadataSourceErrorResource] = []
         detail = None
+        provider = build_javdb_provider()
         try:
-            provider = build_javdb_provider()
-            try:
-                detail = provider.get_movie_by_number(normalized_number)
-            except MetadataNotFoundError:
-                detail = None
-            except Exception as exc:
-                source_errors.append(
-                    ImportMetadataSourceErrorResource(
-                        source="javdb",
-                        source_name="JavDB",
-                        reason=type(exc).__name__,
-                        detail=str(exc),
-                    )
+            detail = provider.get_movie_by_number(normalized_number)
+        except MetadataNotFoundError:
+            detail = None
+        except Exception as exc:
+            source_errors.append(
+                ImportMetadataSourceErrorResource(
+                    source="javdb",
+                    source_name="JavDB",
+                    reason=type(exc).__name__,
+                    detail=str(exc),
                 )
-            # JavDB 命中即番号严格相等，视为权威来源，不再查询插件。
-            if detail is not None:
-                candidates.append(
-                    cls._javdb_candidate(
-                        detail,
+            )
+        # JavDB 命中即番号严格相等，视为权威来源，不再查询插件。
+        if detail is not None:
+            candidates.append(
+                cls._javdb_candidate(
+                    detail,
+                    normalized_number,
+                )
+            )
+        else:
+            for plugin_id, plugin_name, _source in MetadataSourceService.enabled_plugin_sources():
+                try:
+                    with MetadataSourceService.fetch_plugin(
+                        plugin_id, normalized_number
+                    ) as (plugin_detail, source):
+                        candidates.append(
+                            cls._plugin_candidate(
+                                plugin_id,
+                                plugin_detail,
+                                source,
+                                normalized_number,
+                                search_root,
+                                len(candidates),
+                            )
+                        )
+                except MetadataNotFoundError:
+                    continue
+                except Exception as exc:
+                    source_errors.append(
+                        ImportMetadataSourceErrorResource(
+                            source=plugin_id,
+                            source_name=plugin_name,
+                            reason=type(exc).__name__,
+                            detail=str(exc),
+                        )
+                    )
+                    logger.warning(
+                        "Manual metadata search plugin failed plugin={} movie_number={} detail={}",
+                        plugin_id,
                         normalized_number,
-                        image_service,
-                        search_root,
-                        len(candidates),
+                        exc,
                     )
-                )
-            else:
-                for plugin_id, plugin_name, _source in MetadataSourceService.enabled_plugin_sources():
-                    try:
-                        with MetadataSourceService.fetch_plugin(
-                            plugin_id, normalized_number
-                        ) as (plugin_detail, source):
-                            candidates.append(
-                                cls._plugin_candidate(
-                                    plugin_id,
-                                    plugin_detail,
-                                    source,
-                                    normalized_number,
-                                    search_root,
-                                    len(candidates),
-                                )
-                            )
-                    except MetadataNotFoundError:
-                        continue
-                    except Exception as exc:
-                        source_errors.append(
-                            ImportMetadataSourceErrorResource(
-                                source=plugin_id,
-                                source_name=plugin_name,
-                                reason=type(exc).__name__,
-                                detail=str(exc),
-                            )
-                        )
-                        logger.warning(
-                            "Manual metadata search plugin failed plugin={} movie_number={} detail={}",
-                            plugin_id,
-                            normalized_number,
-                            exc,
-                        )
-        finally:
-            image_service.http_client.close()
-
         if not candidates:
             shutil.rmtree(search_root, ignore_errors=True)
         return ImportMetadataSearchResponse(
@@ -125,9 +116,6 @@ class MovieMetadataSearchService:
         cls,
         detail: JavdbMovieDetailResource,
         normalized_number: str,
-        image_service: MovieImageService,
-        search_root: Path,
-        index: int,
     ) -> ImportMetadataCandidateResource:
         return ImportMetadataCandidateResource(
             candidate_id=cls._javdb_candidate_id(normalized_number, detail.javdb_id),
@@ -136,12 +124,7 @@ class MovieMetadataSearchService:
             javdb_id=detail.javdb_id,
             movie_number=detail.movie_number,
             title=detail.title,
-            cover_url=cls._cache_remote_cover(
-                image_service,
-                detail.cover_image,
-                search_root,
-                index,
-            ),
+            cover_url=validate_external_image_url(detail.cover_image) if detail.cover_image else None,
             release_date=detail.release_date,
             duration_minutes=detail.duration_minutes,
         )
@@ -171,28 +154,6 @@ class MovieMetadataSearchService:
             release_date=detail.release_date.isoformat(),
             duration_minutes=detail.duration_minutes,
         )
-
-    @classmethod
-    def _cache_remote_cover(
-        cls,
-        image_service: MovieImageService,
-        image_url: str | None,
-        search_root: Path,
-        index: int,
-    ) -> str | None:
-        if not image_url:
-            return None
-        extension = cls._image_extension(urlparse(image_url).path)
-        target = search_root / f"{index}{extension}"
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            image_service.image_downloader(image_url, target)
-            cls._validate_image(target)
-            return cls._signed_asset_url(target)
-        except Exception as exc:
-            target.unlink(missing_ok=True)
-            logger.warning("Manual metadata cover cache failed url={} detail={}", image_url, exc)
-            return None
 
     @classmethod
     def _cache_local_cover(

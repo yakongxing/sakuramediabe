@@ -11,7 +11,68 @@ import pytest
 from webdav4.client import Client
 
 from src.storage import webdav
-from src.storage.types import StoragePublicationUnknown, StorageUnavailable
+from src.storage.types import (
+    StorageIntegrityError,
+    StoragePublicationUnknown,
+    StorageUnavailable,
+)
+
+
+def test_zip_upload_puts_final_key_and_verifies_full_content(dav, tmp_path):
+    backend, server, _ = dav
+    source = tmp_path / "thumbnails.zip"
+    content = b"ZIP bytes" * 10000
+    source.write_bytes(content)
+    result = backend.put_zip("thumbnails/generation.zip", source, size=len(content), sha256=hashlib.sha256(content).hexdigest())
+    assert result.size == len(content)
+    assert server.objects["/dav/assets/thumbnails/generation.zip"] == content
+    methods = [method for method, _, _ in server.requests]
+    assert methods.count("PUT") == methods.count("GET") == 1
+    assert not {"MOVE", "DELETE"}.intersection(methods)
+    assert not any(".uploading-" in path for _, path, _ in server.requests)
+
+
+@pytest.mark.parametrize("fault_kind", ["truncated", "same_size_corrupt", "read_failed", "put_failed", "response_lost"])
+def test_zip_upload_failure_retains_source_and_does_not_retry_internally(dav, tmp_path, fault_kind):
+    backend, server, _ = dav
+    source = tmp_path / "thumbnails.zip"
+    content = b"complete ZIP content"
+    source.write_bytes(content)
+
+    def fault(request):
+        if request.method == "PUT":
+            if fault_kind == "put_failed":
+                return httpx.Response(503)
+            if fault_kind == "response_lost":
+                server.normal(request)
+                raise httpx.ReadTimeout("response lost", request=request)
+        if request.method == "GET":
+            if fault_kind == "truncated":
+                return httpx.Response(200, content=content[:-1])
+            if fault_kind == "same_size_corrupt":
+                return httpx.Response(200, content=b"x" * len(content))
+            if fault_kind == "read_failed":
+                return httpx.Response(503)
+
+    server.fault = fault
+    with pytest.raises(StorageUnavailable):
+        backend.put_zip("thumbnails/generation.zip", source, size=len(content), sha256=hashlib.sha256(content).hexdigest())
+    assert source.read_bytes() == content
+    assert sum(method == "PUT" for method, _, _ in server.requests) == 1
+    assert not any(method in {"MOVE", "DELETE"} for method, _, _ in server.requests)
+    server.fault = lambda request: None
+    backend.put_zip("thumbnails/generation.zip", source, size=len(content), sha256=hashlib.sha256(content).hexdigest())
+    assert server.objects["/dav/assets/thumbnails/generation.zip"] == content
+
+
+def test_zip_upload_rejects_changed_source(dav, tmp_path):
+    backend, server, _ = dav
+    source = tmp_path / "thumbnails.zip"
+    source.write_bytes(b"changed")
+    with pytest.raises(StorageIntegrityError, match="source changed content"):
+        backend.put_zip("thumbnails/generation.zip", source, size=7, sha256=hashlib.sha256(b"initial").hexdigest())
+    assert source.read_bytes() == b"changed"
+    assert not any(method in {"GET", "MOVE", "DELETE"} for method, _, _ in server.requests)
 
 
 class DAVServer:
@@ -757,6 +818,8 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
 
     backend, server, _ = dav
     monkeypatch.setattr("src.service.playback.thumbnails.artifacts.asset_storage", lambda: backend)
+    monkeypatch.setattr(settings.storage, "backend", "webdav")
+    monkeypatch.setattr(settings.storage, "webdav_base_url", "https://dav.test/dav")
     monkeypatch.setattr(settings.storage, "webdav_publication_max_workers", 1)
     movie = Movie.create(movie_number="DAV-001", javdb_id="dav-001", title="movie")
     library = MediaLibrary.create(name="dav", provider_key="fake", provider_config={})
@@ -766,12 +829,12 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
     artifacts = [(ThumbnailArtifact(offset, "source.webp"), source) for offset in (3, 6)]
 
     def fault(request):
-        if unknown and request.method == "MOVE" and "/.6.webp.uploading-" in request.url.path:
+        if unknown and request.method == "PUT" and request.url.path.endswith(".zip"):
             server.normal(request)
             raise httpx.ReadTimeout("response lost", request=request)
-        if unknown and request.method == "PROPFIND" and request.url.path.endswith("/6.webp"):
+        if unknown and request.method == "PROPFIND" and request.url.path.endswith(".zip"):
             return httpx.Response(404)
-        if not unknown and request.method == "PUT" and "/.6.webp.uploading-" in request.url.path:
+        if not unknown and request.method == "PUT" and request.url.path.endswith(".zip"):
             return httpx.Response(503)
 
     server.fault = fault
@@ -779,16 +842,20 @@ def test_thumbnail_batch_resumes_with_real_webdav_client(dav, test_db, tmp_path,
         ThumbnailArtifactService.persist(media, artifacts)
     batch = ThumbnailBatchStore(media).load()
     assert batch is not None
-    finals = {path for path in server.objects if path.endswith(".webp")}
-    assert len(finals) == (2 if unknown else 1)
-    assert [row.offset for row in MediaThumbnail.select()] == [3]
+    saved_zip = batch.pack_file.read_bytes()
+    finals = {path for path in server.objects if path.endswith(".zip")}
+    assert len(finals) == (1 if unknown else 0)
+    assert not MediaThumbnail.select().exists()
     boundary = len(server.requests)
     server.fault = lambda request: None
     backend._uncertain_publications.clear()
+    monkeypatch.setattr("src.service.playback.thumbnails.batches.write_pack", lambda *_: pytest.fail("rebuilt saved ZIP"))
     assert ThumbnailArtifactService.persist(media, []) == 2
     resumed = server.requests[boundary:]
-    assert sum(method == "PUT" for method, _, _ in resumed) == (0 if unknown else 1)
-    assert not any(method == "DELETE" and path.endswith(".webp") for method, path, _ in server.requests)
+    assert sum(method == "PUT" for method, _, _ in resumed) == 1
+    assert not any(method == "MOVE" for method, _, _ in server.requests)
+    assert not any(method == "DELETE" and path.endswith(".zip") for method, path, _ in server.requests)
     assert finals.issubset(server.objects)
+    assert next(content for path, content in server.objects.items() if path.endswith(".zip")) == saved_zip
     assert not batch.workspace.exists()
     assert MediaThumbnail.select().count() == 2

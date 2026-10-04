@@ -1,4 +1,3 @@
-import hashlib
 import os
 from collections.abc import Callable
 from io import BytesIO
@@ -8,7 +7,7 @@ from loguru import logger
 from PIL import Image as PILImage
 
 from src.common.image_references import is_nonlocal_image_reference
-from src.common.image_store import read_image_bytes, write_pack
+from src.common.image_store import read_image_bytes
 from src.common.media_paths import (
     MOVIE_MEDIA_SUBDIR,
     media_image_root_path,
@@ -20,12 +19,18 @@ from src.model import Image, Media, MediaThumbnail, get_database
 from src.plugins.provider_protocol import ThumbnailArtifact
 from src.schema.catalog.actors import ImageResource
 from src.schema.playback.media import MediaThumbnailResource
-from src.service.playback.thumbnails.batches import ThumbnailBatch, ThumbnailBatchStore
+from src.service.playback.thumbnails.batches import (
+    ThumbnailBatch,
+    ThumbnailBatchStore,
+    file_digest,
+)
 from src.service.playback.thumbnails.contracts import ThumbnailPublicationIncomplete
+from src.service.system.activity.notifications import (
+    NotificationDraft,
+    NotificationService,
+)
 from src.storage import asset_storage
-from src.storage.batch import publish_batch
-from src.storage.local import LocalStorageBackend
-from src.storage.types import StorageConflict, StorageError, StorageNotFound
+from src.storage.types import StorageConflict, StorageError
 
 
 class ThumbnailArtifactService:
@@ -50,8 +55,7 @@ class ThumbnailArtifactService:
 
     @staticmethod
     def prepare_batch(store, artifacts, workspace=None) -> ThumbnailBatch:
-        packed = settings.storage.backend == "local" and isinstance(asset_storage(), LocalStorageBackend)
-        return store.prepare(artifacts, workspace, packed=packed)
+        return store.prepare(artifacts, workspace)
 
     @staticmethod
     def _workspace_file(workspace: Path, relative_path: str) -> Path:
@@ -168,22 +172,17 @@ class ThumbnailArtifactService:
             logger.warning("Thumbnail committed batch cleanup deferred media_id={} detail={}", media.id, exc)
 
     @staticmethod
-    def _remote_matches(storage, key: str, entry) -> bool:
+    def _notify_upload_failure(media: Media, batch: ThumbnailBatch) -> None:
         try:
-            stat = storage.stat(key)
-        except StorageNotFound:
-            return False
-        if not stat.is_file or stat.size != entry["size"]:
-            raise StorageConflict("thumbnail_batch_remote_content_conflict")
-        digest = hashlib.sha256()
-        size = 0
-        with storage.open(key) as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                size += len(chunk)
-                digest.update(chunk)
-        if size != entry["size"] or digest.hexdigest() != entry["sha256"]:
-            raise StorageConflict("thumbnail_batch_remote_content_conflict")
-        return True
+            NotificationService.create_once(NotificationDraft(
+                category="error", title="缩略图 ZIP 上传失败",
+                content=f"媒体 {media.id} 的缩略图 ZIP 上传或完整校验失败，本地 ZIP 已保留；请重试该媒体的缩略图任务。",
+                event_type="thumbnail_zip_upload_failed",
+                dedupe_key=f"thumbnail_zip_upload_failed:{media.id}:{batch.manifest['generation']}",
+                resource_type="media", resource_id=media.id,
+            ))
+        except Exception as exc:
+            logger.warning("Thumbnail ZIP failure notification failed media_id={} detail={}", media.id, exc)
 
     @classmethod
     def persist_batch(cls, media: Media, batch: ThumbnailBatch, *, check_connection=None, progress_callback=None) -> int:
@@ -193,91 +192,75 @@ class ThumbnailArtifactService:
         if len(committed) == len(batch.entries):
             cls._cleanup_after_commit(batch)
             return len(batch.entries)
-        for entry in batch.entries:
-            if entry["offset"] in committed and entry["state"] != "uploaded":
-                batch.checkpoint(entry, "uploaded")
-        pending = [entry for entry in batch.entries if entry["state"] != "uploaded"]
-        batch.validate_files(pending)
-        # An upload checkpoint may survive a failed or unacknowledged DB commit.
-        ready = [entry for entry in batch.entries if entry["state"] == "uploaded" and entry["offset"] not in committed]
-        cls._commit_entries(media, batch, ready, check_connection=check_connection)
-        committed.update(entry["offset"] for entry in ready)
         prefix = cls.thumbnail_prefix(media)
         storage = asset_storage()
-        failed = 0
+        # Older loose batches retain their generation and database image keys.
+        # Publish their complete ZIP before committing any remaining entries.
+        if not batch.packed:
+            for entry in batch.entries:
+                source = batch.source(entry)
+                if not source.is_file() and entry["state"] == "uploaded":
+                    with storage.open(batch.key(prefix, entry)) as stream:
+                        source.write_bytes(stream.read())
+                    with source.open("rb") as stream:
+                        os.fsync(stream.fileno())
+            batch.validate_files()
+            manifest = {**batch.manifest, "version": 2, "format": "zip",
+                        "images": [{**entry, "state": "pending"} for entry in batch.entries]}
+            batch.store.save(manifest)
+            batch.manifest = manifest
+        pending = [entry for entry in batch.entries if entry["state"] != "uploaded"]
 
         def report():
             if progress_callback:
-                progress_callback(f"正在上传缩略图，已有 {len(committed)}/{len(batch.entries)} 张可用，失败 {failed} 张")
-
-        def publish(entry):
-            key = batch.key(prefix, entry)
-            reconcile = entry["state"] == "uploading"
-            batch.checkpoint(entry, "uploading")
-            if not reconcile or not cls._remote_matches(storage, key, entry):
-                storage.put_file(key, batch.source(entry), overwrite=False, immutable=True)
-            batch.checkpoint(entry, "uploaded")
-
-        def completed(entry, _result, error):
-            nonlocal failed
-            if error is not None:
-                if check_connection is not None:
-                    check_connection()
-                # A broken local checkpoint is not a recoverable network failure.
-                if not isinstance(error, (StorageError, StorageConflict)):
-                    raise error
-                batch.checkpoint(entry, entry["state"], error=error)
-                failed += 1
-                logger.warning(
-                    "Thumbnail publication failed media_id={} key={} stage={} status={} publication_possible={} detail={}",
-                    media.id, batch.key(prefix, entry), getattr(error, "stage", None),
-                    getattr(error, "status_code", None), getattr(error, "publication_possible", False), error,
-                )
-            else:
-                cls._commit_entries(media, batch, [entry], check_connection=check_connection)
-                committed.add(entry["offset"])
-            report()
+                progress_callback(f"正在上传缩略图 ZIP，已有 {len(committed)}/{len(batch.entries)} 张可用")
 
         report()
-        if pending and batch.packed:
-            if settings.storage.backend != "local" or not isinstance(storage, LocalStorageBackend):
-                raise RuntimeError("image_pack_requires_local_storage")
-            pack = batch.workspace / "thumbnails.zip"
-            if not pack.is_file():
-                temporary = pack.with_suffix(".zip.tmp")
-                try:
-                    write_pack(temporary, [(f"{entry['offset']}.webp", batch.source(entry)) for entry in batch.entries])
-                    os.replace(temporary, pack)
-                finally:
-                    temporary.unlink(missing_ok=True)
-            storage.put_file(f"{prefix}/{batch.manifest['generation']}.zip", pack, overwrite=False, immutable=True)
-            for entry in pending:
-                batch.checkpoint(entry, "uploaded")
-            cls._commit_entries(media, batch, pending, check_connection=check_connection)
-            committed.update(entry["offset"] for entry in pending)
-            pending = []
-            report()
         if pending:
-            result = publish_batch(
-                pending, publish,
-                max_workers=min(settings.storage.webdav_publication_max_workers, len(pending)),
-                thread_name_prefix="thumbnail-publication",
-                stop_on_error=False, on_complete=completed,
-            )
             try:
-                result.raise_for_errors()
-            except Exception as exc:
+                pack = batch.prepare_pack()
+            except (ValueError, OSError):
+                if check_connection is not None:
+                    check_connection()
+                cls._notify_upload_failure(media, batch)
+                raise
+            key = f"{prefix}/{batch.manifest['generation']}.zip"
+            size, digest = file_digest(pack)
+            if check_connection is not None:
+                check_connection()
+            try:
+                if settings.storage.backend == "webdav":
+                    storage.put_zip(key, pack, size=size, sha256=digest)
+                else:
+                    storage.put_file(key, pack, overwrite=False, immutable=True)
+            except (StorageError, StorageConflict) as exc:
+                if check_connection is not None:
+                    check_connection()
+                cls._notify_upload_failure(media, batch)
+                logger.warning("Thumbnail ZIP publication failed media_id={} key={} detail={}", media.id, key, exc)
                 raise ThumbnailPublicationIncomplete(
-                    len(committed), len(result.errors),
-                    publication_possible=any(getattr(error, "publication_possible", False) for _, error in result.errors),
+                    len(committed), len(batch.entries) - len(committed),
+                    publication_possible=getattr(exc, "publication_possible", False),
                 ) from exc
+            try:
+                batch.checkpoint_pack("uploaded")
+            except OSError:
+                if check_connection is not None:
+                    check_connection()
+                cls._notify_upload_failure(media, batch)
+                raise
+        if settings.storage.backend == "webdav":
+            # Preserve the uploaded checkpoint for DB-only retries, but release
+            # the local ZIP as soon as the upload and full verification succeed.
+            batch.pack_file.unlink(missing_ok=True)
+        # One archive publishes the entire generation; commit all rows together.
+        cls._commit_entries(media, batch, batch.entries, check_connection=check_connection)
+        committed = cls._committed_offsets(media, batch)
+        report()
         if check_connection is not None:
             check_connection()
-        # Each successful file is already committed; only a complete set can
-        # discard the durable batch used to resume the remaining files.
-        available = len(cls._committed_offsets(media, batch))
-        if available != len(batch.entries):
-            raise ThumbnailPublicationIncomplete(available, len(batch.entries) - available)
+        if len(committed) != len(batch.entries):
+            raise ThumbnailPublicationIncomplete(len(committed), len(batch.entries) - len(committed))
         cls._cleanup_after_commit(batch)
         return len(batch.entries)
 
