@@ -189,7 +189,7 @@ Host API 7 新增 `context.downloads.list_targets()`，按下载器 ID 升序返
 省略下载器 ID 时沿用宿主路由：搜索有下载器绑定的索引器，每个索引器使用其绑定顺序
 中的首个下载器。显式指定 ID 时仍只搜索绑定到该下载器的索引器。
 每条候选保留自己的下载器和媒体库目标，提交时继续校验目标是否发生变化。
-该接口自 Host API 7 提供；当前 Host API 为 9，旧版插件的显式 ID 调用保持兼容。
+该接口自 Host API 7 提供；当前 Host API 为 10，旧版插件的显式 ID 调用保持兼容。
 
 ## 插件缩略图接口
 
@@ -204,6 +204,18 @@ Host API 9 新增 `context.thumbnails`，插件无需导入宿主内部服务即
   `backend_unavailable`、`retryable_failed`、`terminal_failed`。
 
 使用该接口的插件应在 manifest 声明 Host API 9，使旧后端在加载阶段拒绝插件。
+
+## 插件播放列表追加接口
+
+Host API 10 新增 `context.collections.ensure_playlist_by_name(name, description=None)`，
+按名称复用普通用户列表或当前插件的列表，缺失则创建无插件归属的普通列表。
+复用时不改写原描述、归属或成员；返回只读 `PluginCollection`，普通列表的 `key` 为空字符串。
+
+`context.collections.add_playlist_movies(collection, movie_numbers)` 接受列表 ID 或名称，
+按宿主番号匹配规则解析已有影片，事务内幂等追加成员，保留原成员和加入时间。
+任意番号不存在则整批不写入。两接口均拒绝系统列表或其他插件拥有的列表。
+原有按插件 key 创建及整表替换接口保持原契约。调用新接口的插件须声明 Host API 10。
+
 ## 插件接口约定
 
 - 插件能力随 Host API 版本递增；接口细节以 `src/plugins` 公开契约为准，本文不逐接口展开。

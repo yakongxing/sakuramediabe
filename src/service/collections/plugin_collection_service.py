@@ -1,4 +1,4 @@
-"""插件合集的归属校验与批量成员替换。"""
+"""插件合集的归属校验、成员替换与普通播放列表复用。"""
 
 from collections.abc import Collection
 
@@ -24,7 +24,7 @@ from src.service.collections.moment_collection_service import (
 
 
 class PluginCollectionService:
-    """只给插件 facade 提供按 ``plugin_id + key`` 定位的合集操作。"""
+    """向插件 facade 提供有归属校验的合集操作和普通列表追加。"""
 
     @staticmethod
     def _validate_key(plugin_key: str) -> str:
@@ -125,6 +125,78 @@ class PluginCollectionService:
             description=description,
             kind=PLAYLIST_KIND_CUSTOM,
         )
+
+    @staticmethod
+    def _check_appendable_playlist(plugin_id: str, playlist: Playlist) -> Playlist:
+        if playlist.kind != PLAYLIST_KIND_CUSTOM:
+            raise ApiError(409, "playlist_managed_by_system", "不能修改系统播放列表")
+        if playlist.owner_plugin_id not in (None, plugin_id):
+            raise ApiError(
+                409, "plugin_collection_conflict", "播放列表归其他插件管理",
+                {"playlist_id": playlist.id},
+            )
+        return playlist
+
+    @classmethod
+    def ensure_playlist_by_name(
+        cls, plugin_id: str, name: str, description: str | None = None
+    ) -> Playlist:
+        from src.service.collections.playlist_service import PlaylistService
+
+        name = cls._normalize_name(name)
+        PlaylistService._ensure_name_not_reserved(name)
+        # get_or_create 使用事务并恢复并发创建的唯一键冲突。
+        playlist, _created = Playlist.get_or_create(
+            name=name,
+            defaults={
+                "kind": PLAYLIST_KIND_CUSTOM,
+                "description": cls._normalize_description(description),
+            },
+        )
+        return cls._check_appendable_playlist(plugin_id, playlist)
+
+    @classmethod
+    def add_playlist_movies(
+        cls, plugin_id: str, collection: int | str, movie_numbers: Collection[str]
+    ) -> Playlist:
+        if type(collection) is int and collection > 0:
+            condition = Playlist.id == collection
+        elif isinstance(collection, str):
+            condition = Playlist.name == cls._normalize_name(collection)
+        else:
+            raise ValueError("collection 必须是正整数 ID 或非空列表名称")
+        if isinstance(movie_numbers, (str, bytes)):
+            raise TypeError("movie_numbers 必须是番号集合")
+
+        with get_database().atomic():
+            playlist = Playlist.select().where(condition).for_update().first()
+            if playlist is None:
+                raise ApiError(404, "playlist_not_found", "播放列表不存在")
+            cls._check_appendable_playlist(plugin_id, playlist)
+            movie_ids = set()
+            for raw_number in movie_numbers:
+                if not isinstance(raw_number, str) or not raw_number.strip():
+                    raise ValueError("movie_number 必须是非空字符串")
+                movie = find_movie_by_number(raw_number.strip())
+                if movie is None:
+                    raise ApiError(
+                        404, "movie_not_found", "影片不存在",
+                        {"movie_number": raw_number},
+                    )
+                movie_ids.add(movie.id)
+            if movie_ids:
+                touched_at = utc_now_for_db()
+                inserted = list(
+                    PlaylistMovie.insert_many([
+                        {"playlist": playlist.id, "movie": movie_id,
+                         "created_at": touched_at, "updated_at": touched_at}
+                        for movie_id in sorted(movie_ids)
+                    ]).on_conflict_ignore().returning(PlaylistMovie.id).execute()
+                )
+                if inserted:
+                    playlist.updated_at = touched_at
+                    playlist.save(only=[Playlist.updated_at])
+        return playlist
 
     @classmethod
     def set_playlist_movies(

@@ -1050,7 +1050,7 @@ class NotificationApi:
 
 
 class CollectionApi:
-    """``context.collections``：插件按 key 管理自己创建的三类合集，并可复用任意视频合集。"""
+    """插件管理自己的合集，并可复用普通播放列表及视频合集。"""
 
     def __init__(self, plugin_id: str):
         self._plugin_id = plugin_id
@@ -1091,7 +1091,7 @@ class CollectionApi:
         return PluginCollection(
             collection_type=collection_type,
             collection_id=collection.id,
-            key=collection.plugin_key,
+            key=collection.plugin_key or "",
             name=collection.name,
             description=collection.description,
             member_count=member_count,
@@ -1108,6 +1108,36 @@ class CollectionApi:
             "playlist",
             PluginCollectionService.ensure_playlist(
                 self._plugin_id, key, name, description
+            ),
+        )
+
+    def ensure_playlist_by_name(
+        self, name: str, description: str | None = None
+    ) -> PluginCollection:
+        """按名称复用自定义列表；缺失时创建普通列表，不接管已有列表。"""
+        from src.service.collections.plugin_collection_service import (
+            PluginCollectionService,
+        )
+
+        return self._to_collection(
+            "playlist",
+            PluginCollectionService.ensure_playlist_by_name(
+                self._plugin_id, name, description
+            ),
+        )
+
+    def add_playlist_movies(
+        self, collection: int | str, movie_numbers: Collection[str]
+    ) -> PluginCollection:
+        """幂等追加成员，保留其他成员及已有成员的加入时间。"""
+        from src.service.collections.plugin_collection_service import (
+            PluginCollectionService,
+        )
+
+        return self._to_collection(
+            "playlist",
+            PluginCollectionService.add_playlist_movies(
+                self._plugin_id, collection, movie_numbers
             ),
         )
 

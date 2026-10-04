@@ -1,0 +1,8 @@
+{
+  "plugin_id": "javguru_updates",
+  "display_name": "Javguru 频道采集",
+  "version": "1.0.0",
+  "host_api_version": 10,
+  "requires_python": ">=3.10,<3.11",
+  "dependencies": []
+}

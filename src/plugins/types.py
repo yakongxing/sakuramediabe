@@ -174,7 +174,7 @@ class PluginNotification:
 
 @dataclass(frozen=True)
 class PluginCollection:
-    """插件可见的影片、时刻、片段或视频合集；视频合集没有 key。"""
+    """插件可见的合集；普通用户列表和视频合集的 key 为空字符串。"""
 
     collection_type: str
     collection_id: int
