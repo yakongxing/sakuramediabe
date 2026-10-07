@@ -26,6 +26,7 @@ from src.common.media_import_status import (
     FAILURE_REASON_METADATA_FETCH_FAILED,
     FAILURE_REASON_METADATA_UPSERT_FAILED,
     FAILURE_REASON_MOVIE_NUMBER_NOT_FOUND,
+    FAILURE_REASON_TARGET_MOVIE_NUMBER_MISMATCH,
     FAILURE_REASON_UNSUPPORTED_FORMAT,
     make_failure_item,
 )
@@ -97,6 +98,11 @@ class MediaImportService:
             ) from exc
         except ProviderOperationError as exc:
             raise self._provider_error(exc) from exc
+
+    def _supports_in_place_import(self, library: MediaLibrary, storage: Any) -> bool:
+        if self._provider_override is not None:
+            return bool(getattr(storage, "supports_in_place_import", False))
+        return MEDIA_PROVIDER_REGISTRY.supports_in_place_import(library.provider_key)
 
     def _metadata_max_workers(self, total_movies: int) -> int:
         from src.config.config import settings
@@ -180,7 +186,7 @@ class MediaImportService:
     ) -> ImportResult:
         if not isinstance(source_ref, dict) or not source_ref:
             raise ApiError(422, "invalid_import_source", "source_ref must be an object")
-        if source_disposition not in {"keep", "delete_after_commit"}:
+        if source_disposition not in {"keep", "delete_after_commit", "in_place"}:
             raise ApiError(422, "invalid_source_disposition", "无效的源处置方式")
         library = MediaLibrary.get_or_none(MediaLibrary.id == library_id)
         if library is None:
@@ -190,6 +196,10 @@ class MediaImportService:
         if media_kind == "jav" and collection_id is not None:
             raise ApiError(422, "invalid_collection", "jav import does not support collection_id")
         storage = self._storage(library)
+        if source_disposition == "in_place" and not self._supports_in_place_import(
+            library, storage
+        ):
+            raise ApiError(422, "in_place_import_unsupported", "该媒体库不支持原地导入")
         try:
             if progress_callback is not None and MEDIA_PROVIDER_REGISTRY.supports_scan_progress(library.provider_key):
                 scanned_files = tuple(storage.scan_import_source(
@@ -204,9 +214,14 @@ class MediaImportService:
             raise ApiError(502, "provider_scan_failed", "媒体提供方扫描失败") from exc
         for source in scanned_files:
             self._validate_import_file(source)
+        from src.config.config import settings
+
+        minimum_video_file_size = settings.media.allowed_min_video_file_size
+        failure_items: list[dict[str, Any]] = []
+        imported_count = skipped_count = failed_count = 0
         if target_movie_number:
             # 下载任务导入只认准目标番号：资源包里解析出的其它番号（合集/捆绑）一律忽略，
-            # 避免把用户没有订阅的影片建库并强制订阅。解析不出番号的文件保持原有处理。
+            # 避免把用户没有订阅的影片建库并强制订阅；解析不出番号的文件按目标番号导入。
             target_key = normalize_movie_number(target_movie_number)
             kept_sources: list[ImportFile] = []
             for source in scanned_files:
@@ -222,22 +237,31 @@ class MediaImportService:
                         parsed,
                         target_key,
                     )
+                    if (
+                        is_supported_video_file_name(source.name)
+                        and source.size_bytes >= minimum_video_file_size
+                    ):
+                        skipped_count += 1
+                        failure_items.append(
+                            self._make_failure_item(
+                                source,
+                                reason=FAILURE_REASON_TARGET_MOVIE_NUMBER_MISMATCH,
+                                detail=f"文件名解析为 {parsed}，与目标 {target_movie_number} 不一致",
+                                library_id=library_id,
+                                media_kind=media_kind,
+                                source_disposition=source_disposition,
+                            )
+                        )
                     continue
                 kept_sources.append(source)
             scanned_files = tuple(kept_sources)
-        from src.config.config import settings
-
-        minimum_video_file_size = settings.media.allowed_min_video_file_size
-
-        failure_items: list[dict[str, Any]] = []
-        imported_count = skipped_count = failed_count = 0
         created_video_ids: list[int] = []
         new_playable_movies: list[dict[str, object]] = []
         imported_subtitle_paths: set[str] = set()
         finalize_error: Exception | None = None
         import_source_identities: dict[str, str] = {}
         get_import_source_identity = getattr(storage, "get_import_source_identity", None)
-        if source_disposition == "keep" and callable(get_import_source_identity):
+        if source_disposition in {"keep", "in_place"} and callable(get_import_source_identity):
             for source in scanned_files:
                 if not is_supported_video_file_name(source.name):
                     continue
@@ -345,6 +369,7 @@ class MediaImportService:
                 number := parse_movie_number_from_text(
                     f"{item.name} {item.relative_path}"
                 )
+                or target_movie_number
             )
         }
         with self.metadata_import_batch(sorted(metadata_numbers)) as metadata_futures:
@@ -387,6 +412,9 @@ class MediaImportService:
                     )
                     continue
                 movie_number = parse_movie_number_from_text(f"{source.name} {source.relative_path}")
+                if media_kind == "jav" and not movie_number and target_movie_number:
+                    # 目标番号是权威身份：启发式解析失败时直接采用，避免解析问题导致丢片。
+                    movie_number = target_movie_number
                 if media_kind == "jav" and not movie_number:
                     failed_count += 1
                     failure_items.append(
@@ -617,12 +645,16 @@ class MediaImportService:
         self._validate_import_file(source)
         library_id = int(failure_item["library_id"])
         source_disposition = failure_item.get("source_disposition", "keep")
-        if source_disposition not in {"keep", "delete_after_commit"}:
+        if source_disposition not in {"keep", "delete_after_commit", "in_place"}:
             raise ApiError(422, "invalid_source_disposition", "无效的源处置方式")
         library = MediaLibrary.get_or_none(MediaLibrary.id == library_id)
         if library is None:
             raise ApiError(404, "media_library_not_found", "媒体库不存在")
         storage = self._storage(library)
+        if source_disposition == "in_place" and not self._supports_in_place_import(
+            library, storage
+        ):
+            raise ApiError(422, "in_place_import_unsupported", "该媒体库不支持原地导入")
 
         from src.service.catalog.movie_metadata_search_service import (
             MovieMetadataSearchService,
@@ -684,7 +716,7 @@ class MediaImportService:
                 raise self._provider_error(exc) from exc
 
             get_import_source_identity = getattr(storage, "get_import_source_identity", None)
-            if source_disposition == "keep" and callable(get_import_source_identity):
+            if source_disposition in {"keep", "in_place"} and callable(get_import_source_identity):
                 try:
                     identity = get_import_source_identity(source=source)
                 except Exception:

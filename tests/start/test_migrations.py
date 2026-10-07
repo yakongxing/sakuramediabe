@@ -9,7 +9,9 @@ from src.model import (
     Actor,
     BackgroundTaskRun,
     DownloadClient,
+    DownloadSubmissionRecord,
     DownloadTask,
+    Image,
     Media,
     MediaLibrary,
     Movie,
@@ -24,11 +26,15 @@ from src.start.migrations.runner import (
     ACTOR_LOCAL_PROFILE_MIGRATION_NAME,
     ACTOR_MERGED_INTO_MIGRATION_NAME,
     ACTOR_METADATA_MIGRATION_NAME,
+    API_KEYS_MIGRATION_NAME,
     CONSOLIDATED_MIGRATION_NAME,
     DOWNLOAD_RESOURCE_HISTORY_MIGRATION_NAME,
+    DOWNLOAD_SUBMISSION_INDEXES_MIGRATION_NAME,
+    DOWNLOAD_TASK_REMOTE_SEEN_MIGRATION_NAME,
     DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME,
     DROP_MOVIE_EXTRA_MIGRATION_NAME,
     HOT_REVIEW_ITEM_REMOVAL_MIGRATION_NAME,
+    IMAGE_ORIGIN_PATTERN_INDEX_MIGRATION_NAME,
     IMAGE_REFERENCES_MIGRATION_NAME,
     IMAGE_SEARCH_INDEX_SPACE_STATE_MIGRATION_NAME,
     IMAGE_SEARCH_QUEUE_INDEXES_MIGRATION_NAME,
@@ -40,7 +46,9 @@ from src.start.migrations.runner import (
     MOVIE_COLLECTION_OWNER_MIGRATION_NAME,
     PLUGIN_COLLECTION_OWNERSHIP_MIGRATION_NAME,
     PLUGIN_MOVIE_METADATA_MIGRATION_NAME,
+    REMOVE_GENERATED_THIN_COVER_MIGRATION_NAME,
     REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME,
+    WIDEN_DOWNLOAD_TITLE_COLUMNS_MIGRATION_NAME,
     MigrationExecution,
     MigrationRunSummary,
     _list_migration_modules,
@@ -126,6 +134,12 @@ def test_current_migrations_are_discoverable_in_order():
         REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME,
         ACTOR_MERGED_INTO_MIGRATION_NAME,
         DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME,
+        IMAGE_ORIGIN_PATTERN_INDEX_MIGRATION_NAME,
+        REMOVE_GENERATED_THIN_COVER_MIGRATION_NAME,
+        WIDEN_DOWNLOAD_TITLE_COLUMNS_MIGRATION_NAME,
+        DOWNLOAD_TASK_REMOTE_SEEN_MIGRATION_NAME,
+        DOWNLOAD_SUBMISSION_INDEXES_MIGRATION_NAME,
+        API_KEYS_MIGRATION_NAME,
     ]
 
 
@@ -239,6 +253,12 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         MigrationExecution(name=REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME, applied=True),
         MigrationExecution(name=ACTOR_MERGED_INTO_MIGRATION_NAME, applied=True),
         MigrationExecution(name=DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=IMAGE_ORIGIN_PATTERN_INDEX_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=REMOVE_GENERATED_THIN_COVER_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=WIDEN_DOWNLOAD_TITLE_COLUMNS_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=DOWNLOAD_TASK_REMOTE_SEEN_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=DOWNLOAD_SUBMISSION_INDEXES_MIGRATION_NAME, applied=True),
+        MigrationExecution(name=API_KEYS_MIGRATION_NAME, applied=True),
     ]
     assert _schema_migration_names(clean_db) == [
         CONSOLIDATED_MIGRATION_NAME,
@@ -262,7 +282,84 @@ def test_run_pending_migrations_completes_fresh_current_schema_after_model_creat
         REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME,
         ACTOR_MERGED_INTO_MIGRATION_NAME,
         DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME,
+        IMAGE_ORIGIN_PATTERN_INDEX_MIGRATION_NAME,
+        REMOVE_GENERATED_THIN_COVER_MIGRATION_NAME,
+        WIDEN_DOWNLOAD_TITLE_COLUMNS_MIGRATION_NAME,
+        DOWNLOAD_TASK_REMOTE_SEEN_MIGRATION_NAME,
+        DOWNLOAD_SUBMISSION_INDEXES_MIGRATION_NAME,
+        API_KEYS_MIGRATION_NAME,
     ]
+
+
+def test_download_task_remote_seen_migration_backfills_existing_rows(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    # 模拟加列之前的结构：删掉新列后写入一行存量任务。
+    _drop_columns(clean_db, "download_task", ("remote_seen_at",))
+    library = MediaLibrary.create(
+        name="remote-seen-migration",
+        provider_key="test",
+        provider_config={},
+    )
+    client = DownloadClient.create(
+        name="remote-seen-migration-client",
+        library=library,
+        provider_config={},
+    )
+    task = DownloadTask.create(
+        client=client,
+        remote_id="legacy",
+        name="legacy",
+        state="downloading",
+        progress=0,
+        import_status="pending",
+    )
+
+    migration = _load_migration_module(
+        Path(f"{DOWNLOAD_TASK_REMOTE_SEEN_MIGRATION_NAME}.py")
+    )
+    migration.migrate(clean_db)
+    backfilled = DownloadTask.get_by_id(task.id)
+    assert backfilled.remote_seen_at is not None
+    assert "remote_seen_at" in _column_names(clean_db, "download_task")
+
+    # 幂等：重复执行不报错，也不覆盖已有的可见时间。
+    sentinel = datetime(2020, 1, 1)
+    DownloadTask.update(remote_seen_at=sentinel).where(
+        DownloadTask.id == task.id
+    ).execute()
+    migration.migrate(clean_db)
+    assert DownloadTask.get_by_id(task.id).remote_seen_at == sentinel
+
+
+def test_download_submission_indexes_migration_adds_query_indexes(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    # 模拟旧结构：提交历史表只有 task_id 索引。
+    for name in (
+        "downloadsubmissionrecord_client_id_remote_id",
+        "downloadsubmissionrecord_client_id_info_hash",
+        "downloadsubmissionrecord_updated_at",
+    ):
+        clean_db.execute_sql(f'DROP INDEX IF EXISTS "{name}"')
+
+    migration = _load_migration_module(
+        Path(f"{DOWNLOAD_SUBMISSION_INDEXES_MIGRATION_NAME}.py")
+    )
+    migration.migrate(clean_db)
+
+    columns = {
+        tuple(index.columns)
+        for index in clean_db.get_indexes("download_submission_record")
+    }
+    assert ("client_id", "remote_id") in columns
+    assert ("client_id", "info_hash") in columns
+    assert ("updated_at",) in columns
+
+    # 幂等：重复执行不报错，也不重复建索引。
+    before = len(clean_db.get_indexes("download_submission_record"))
+    migration.migrate(clean_db)
+    assert len(clean_db.get_indexes("download_submission_record")) == before
 
 
 def test_run_pending_migrations_rejects_current_schema_without_base_marker(clean_db):
@@ -271,6 +368,63 @@ def test_run_pending_migrations_rejects_current_schema_without_base_marker(clean
 
     with pytest.raises(ValueError, match="unsupported_migration_source"):
         run_pending_migrations(clean_db)
+
+
+def test_widen_download_title_migration_allows_long_titles(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    # 模拟旧结构：两列仍是 varchar(255)，超过 255 字符的种子标题无法入库。
+    clean_db.execute_sql(
+        "ALTER TABLE download_submission_record ALTER COLUMN title TYPE VARCHAR(255)"
+    )
+    clean_db.execute_sql(
+        "ALTER TABLE download_task ALTER COLUMN name TYPE VARCHAR(255)"
+    )
+    # 模拟用户已按 issue 临时方案自行把 title 改成 text，迁移应跳过该列。
+    clean_db.execute_sql(
+        "ALTER TABLE download_submission_record ALTER COLUMN title TYPE TEXT"
+    )
+    long_title = "T" * 321
+
+    migration = _load_migration_module(
+        Path(f"{WIDEN_DOWNLOAD_TITLE_COLUMNS_MIGRATION_NAME}.py")
+    )
+    migration.migrate(clean_db)
+
+    record = DownloadSubmissionRecord.create(
+        client_id=1,
+        movie_number="TEST-001",
+        indexer_name="indexer",
+        title=long_title,
+        source_uri=f"magnet:?xt=urn:btih:{'0' * 40}",
+        info_hash="0" * 40,
+    )
+    library = MediaLibrary.create(
+        name="widen-download-title",
+        provider_key="test",
+        provider_config={},
+    )
+    client = DownloadClient.create(
+        name="widen-download-title-client",
+        library=library,
+        provider_config={},
+    )
+    task = DownloadTask.create(
+        client=client,
+        movie="TEST-001",
+        remote_id="widen-download-title-remote",
+        name=long_title,
+        state="queued",
+        progress=0,
+        import_status="pending",
+    )
+    assert DownloadSubmissionRecord.get_by_id(record.id).title == long_title
+    assert DownloadTask.get_by_id(task.id).name == long_title
+
+    # 用户已自行改成 text 的库：重跑不报错、数据保留。
+    migration.migrate(clean_db)
+    assert DownloadSubmissionRecord.get_by_id(record.id).title == long_title
+    assert DownloadTask.get_by_id(task.id).name == long_title
 
 
 def test_consolidated_migration_upgrades_v0421_schema_and_preserves_required_memory(clean_db):
@@ -559,6 +713,20 @@ def test_media_import_source_identity_migration_adds_column_and_index(clean_db):
     }
 
 
+def test_image_origin_pattern_index_migration_creates_index(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    clean_db.execute_sql("DROP INDEX IF EXISTS image_origin_pattern")
+
+    _load_migration_module(
+        Path(f"{IMAGE_ORIGIN_PATTERN_INDEX_MIGRATION_NAME}.py")
+    ).migrate(clean_db)
+
+    assert "image_origin_pattern" in {
+        index.name for index in clean_db.get_indexes("image")
+    }
+
+
 def test_local_profile_and_moment_collection_migrations_add_runtime_indexes(clean_db):
     clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
     clean_db.create_tables(TEST_MODELS)
@@ -583,6 +751,19 @@ def test_local_profile_and_moment_collection_migrations_add_runtime_indexes(clea
     assert "actor_profile_image_override_id" in {
         index.name for index in clean_db.get_indexes("actor")
     }
+
+
+def test_api_keys_migration_creates_table(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    clean_db.execute_sql("DROP TABLE api_keys")
+
+    _load_migration_module(Path(f"{API_KEYS_MIGRATION_NAME}.py")).migrate(clean_db)
+
+    assert clean_db.table_exists("api_keys")
+    assert {"name", "key_hint", "key_hash", "last_used_at"} <= _column_names(
+        clean_db, "api_keys"
+    )
 
 
 def _set_movie_extra(database, movie_id: int, extra) -> None:
@@ -854,3 +1035,92 @@ def test_remove_orphan_video_items_migration_deletes_empty_videos_and_membership
     # 重复执行幂等：有效条目与成员不受影响。
     migration.migrate(clean_db)
     assert VideoCollectionItem.get_by_id(kept_link.id).video_item_id == kept.id
+
+
+def test_remove_generated_thin_cover_migration_clears_only_skipped_movies(clean_db, monkeypatch, tmp_path):
+    import zipfile
+
+    from src.common.media_paths import (
+        movie_asset_relative_dir,
+        normalize_asset_dir_name,
+    )
+    from src.config.config import settings
+
+    clean_db.create_tables(TEST_MODELS)
+    image_root = tmp_path / "assets"
+    monkeypatch.setattr(settings.media, "import_image_root_path", str(image_root))
+
+    def relative_dir(movie_number: str) -> str:
+        return movie_asset_relative_dir(normalize_asset_dir_name(movie_number)).as_posix()
+
+    def create_movie(movie_number: str, thin_name: str):
+        directory = relative_dir(movie_number)
+        cover = Image.create(origin=f"{directory}/cover.jpg")
+        thin = Image.create(origin=f"{directory}/{thin_name}")
+        movie = Movie.create(
+            movie_number=movie_number,
+            title=movie_number,
+            cover_image=cover,
+            thin_cover_image=thin,
+        )
+        return movie, thin
+
+    def write_pack(movie_number: str, entry_names: list[str]) -> Path:
+        directory = image_root / relative_dir(movie_number)
+        directory.mkdir(parents=True, exist_ok=True)
+        pack_path = directory / "assets.zip"
+        with zipfile.ZipFile(pack_path, "w", zipfile.ZIP_STORED) as archive:
+            for entry_name in entry_names:
+                archive.writestr(entry_name, f"bytes:{entry_name}".encode())
+        return pack_path
+
+    def pack_entries(pack_path: Path) -> list[str]:
+        with zipfile.ZipFile(pack_path) as archive:
+            return archive.namelist()
+
+    packed_movie, packed_thin = create_movie("FC2-4811064", "thin-cover.jpg")
+    packed_path = write_pack("FC2-4811064", ["cover.jpg", "thin-cover.jpg"])
+    loose_movie, loose_thin = create_movie("HEYZO-0733", "thin-cover.webp")
+    loose_dir = image_root / relative_dir("HEYZO-0733")
+    loose_dir.mkdir(parents=True, exist_ok=True)
+    (loose_dir / "cover.webp").write_bytes(b"cover")
+    (loose_dir / "thin-cover.webp").write_bytes(b"thin")
+    western_movie, western_thin = create_movie("blacked.16.12.16", "thin-cover.jpg")
+    western_path = write_pack("blacked.16.12.16", ["cover.jpg", "thin-cover.jpg"])
+    numeric_movie, numeric_thin = create_movie("051325_100", "thin-cover.jpg")
+    numeric_path = write_pack("051325_100", ["cover.jpg", "thin-cover.jpg"])
+    kept_movie, kept_thin = create_movie("SSIS-001", "thin-cover.jpg")
+    kept_path = write_pack("SSIS-001", ["cover.jpg", "thin-cover.jpg"])
+    plot_movie, plot_thin = create_movie("FC2-999999", "plot-0.jpg")
+
+    migration = _load_migration_module(
+        Path(f"{REMOVE_GENERATED_THIN_COVER_MIGRATION_NAME}.py")
+    )
+    migration.migrate(clean_db)
+
+    for movie, thin in (
+        (packed_movie, packed_thin),
+        (loose_movie, loose_thin),
+        (western_movie, western_thin),
+        (numeric_movie, numeric_thin),
+    ):
+        assert Movie.get_by_id(movie.id).thin_cover_image_id is None
+        assert Image.get_or_none(Image.id == thin.id) is None
+
+    assert pack_entries(packed_path) == ["cover.jpg"]
+    assert not (loose_dir / "thin-cover.webp").exists()
+    assert (loose_dir / "cover.webp").exists()
+    assert pack_entries(western_path) == ["cover.jpg"]
+    assert pack_entries(numeric_path) == ["cover.jpg"]
+
+    assert Movie.get_by_id(kept_movie.id).thin_cover_image_id == kept_thin.id
+    assert Image.get_or_none(Image.id == kept_thin.id) is not None
+    assert sorted(pack_entries(kept_path)) == ["cover.jpg", "thin-cover.jpg"]
+
+    assert Movie.get_by_id(plot_movie.id).thin_cover_image_id == plot_thin.id
+    assert Image.get_or_none(Image.id == plot_thin.id) is not None
+
+    # 幂等：重跑不改变任何状态。
+    migration.migrate(clean_db)
+    assert Movie.get_by_id(packed_movie.id).thin_cover_image_id is None
+    assert Movie.get_by_id(kept_movie.id).thin_cover_image_id == kept_thin.id

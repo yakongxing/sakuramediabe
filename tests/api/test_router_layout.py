@@ -91,6 +91,7 @@ def test_create_app_registers_videos_routes():
     assert "/video-collections/{collection_id}/items" in paths
     assert "/video-collections/{collection_id}/items/{item_id}" in paths
     assert "/video-collections/{collection_id}/items/reorder" in paths
+    assert "/video-collections/{collection_id}/videos/{video_item_id}" in paths
     assert "/video-imports" not in paths
 
 
@@ -287,7 +288,9 @@ def test_create_app_registers_download_task_center_routes():
     assert ("/download-clients/test", "POST") in route_methods
     assert ("/download-tasks", "GET") in route_methods
     assert ("/download-tasks/stream", "GET") not in route_methods
+    assert ("/download-tasks/imports", "POST") in route_methods
     assert ("/download-tasks/{task_id}", "DELETE") in route_methods
+    assert ("/download-tasks/{task_id}/files", "GET") in route_methods
     assert ("/download-tasks/{task_id}/import", "POST") in route_methods
 
 

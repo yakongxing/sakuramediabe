@@ -14,6 +14,10 @@ PostgreSQL 重启后，API 和后台工作线程会在后续数据库操作时�
 
 独立 PostgreSQL 停库、启库测试可通过 `SAKURAMEDIA_TEST_PG_BIN=/usr/lib/postgresql/15/bin .venv/bin/pytest -q -n0 --no-testmon tests/common/test_database_restart.py` 运行；测试会自行创建并清理临时数据库实例，不操作已有实例。
 
+## 致谢
+
+番号解析的实现与回归测试参考了以下开源项目，在此表示感谢：[JavSP](https://github.com/Yuukiy/JavSP)、[JavBoss](https://github.com/Solr159/JavBoss)、[Emby.Plugins.JavScraper](https://github.com/JavScraper/Emby.Plugins.JavScraper)、[JAVOneStop](https://github.com/ddd354/JAVOneStop)、[metatube-sdk-go](https://github.com/metatube-community/metatube-sdk-go)、[Movie_Data_Capture](https://github.com/mvdctop/Movie_Data_Capture)、[mdcz](https://github.com/ShotHeadman/mdcz)、[javinizer-go](https://github.com/javinizer/javinizer-go)。
+
 ## 风险声明
 
 * 本项目仅用于技术交流

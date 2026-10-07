@@ -1,6 +1,15 @@
 """下载任务列表筛选与手动触发导入接口的回归测试。"""
 
-from src.model import DownloadClient, DownloadTask, Image, MediaLibrary, Movie
+from src.model import (
+    BackgroundTaskRun,
+    DownloadClient,
+    DownloadTask,
+    Image,
+    MediaLibrary,
+    Movie,
+)
+from src.plugins.provider_protocol import ImportFile, ProviderUnavailableError
+from src.service.transfers.downloads import task_service
 
 
 def _login(client, username: str) -> str:
@@ -203,3 +212,221 @@ def test_trigger_import_missing_task_returns_not_found(client, account_user):
 
     assert response.status_code == 404, response.text
     assert response.json()["error"]["code"] == "download_task_not_found"
+
+
+def test_list_task_files_returns_scanned_files(client, account_user, monkeypatch):
+    token = _login(client, account_user.username)
+    task = _seed_importable_task()
+    captured: dict = {}
+
+    class FakeStorage:
+        def scan_import_source(self, *, source_ref):
+            captured["source_ref"] = source_ref
+            return (
+                ImportFile({}, "SSIS-801.nfo", "SSIS-801/SSIS-801.nfo", 1024, False),
+                ImportFile({}, "SSIS-801.mkv", "SSIS-801/SSIS-801.mkv", 5, True),
+            )
+
+    monkeypatch.setattr(
+        task_service.MEDIA_PROVIDER_REGISTRY,
+        "storage_for",
+        lambda _library: FakeStorage(),
+    )
+
+    response = client.get(f"/download-tasks/{task.id}/files", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    files = response.json()
+    assert [item["relative_path"] for item in files] == [
+        "SSIS-801/SSIS-801.mkv",
+        "SSIS-801/SSIS-801.nfo",
+    ]
+    assert files[0]["is_video"] is True
+    assert files[1]["is_video"] is False
+    assert captured["source_ref"] == {"version": 1, "kind": "cloud115_dir", "cid": "1"}
+
+
+def test_list_task_files_rejects_sourceless_task(client, account_user):
+    token = _login(client, account_user.username)
+    task = _seed_importable_task(with_source_ref=False)
+
+    response = client.get(f"/download-tasks/{task.id}/files", headers=_auth(token))
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "download_task_files_unavailable"
+
+
+def test_list_task_files_missing_task_returns_not_found(client, account_user):
+    token = _login(client, account_user.username)
+
+    response = client.get("/download-tasks/99999/files", headers=_auth(token))
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "download_task_not_found"
+
+
+def test_list_task_files_reports_provider_not_installed(
+    client, account_user, monkeypatch
+):
+    token = _login(client, account_user.username)
+    task = _seed_importable_task()
+
+    def _raise(_library):
+        raise ProviderUnavailableError("test")
+
+    monkeypatch.setattr(
+        task_service.MEDIA_PROVIDER_REGISTRY, "storage_for", _raise
+    )
+
+    response = client.get(f"/download-tasks/{task.id}/files", headers=_auth(token))
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "provider_not_installed"
+
+
+def _seed_batch_client(name: str) -> DownloadClient:
+    library = MediaLibrary.create(name=name, provider_key="test", provider_config={})
+    return DownloadClient.create(
+        name=f"client-{name}", library=library, provider_config={}
+    )
+
+
+def _seed_batch_task(
+    download_client: DownloadClient,
+    *,
+    index: int,
+    import_status: str = "failed",
+    state: str = "completed",
+    with_source_ref: bool = True,
+) -> DownloadTask:
+    return DownloadTask.create(
+        client=download_client,
+        movie=f"SSIS-9{index:02d}",
+        name=f"SSIS-9{index:02d}.mkv",
+        remote_id=f"remote-batch-{index}",
+        progress=1.0,
+        state=state,
+        completed_source_ref=(
+            {"version": 1, "kind": "cloud115_dir", "cid": str(index)}
+            if with_source_ref
+            else None
+        ),
+        import_status=import_status,
+    )
+
+
+def test_batch_import_accepts_failed_tasks_and_marks_running(client, account_user):
+    token = _login(client, account_user.username)
+    download_client = _seed_batch_client("batch-lib")
+    tasks = [_seed_batch_task(download_client, index=i) for i in (1, 2)]
+
+    response = client.post(
+        "/download-tasks/imports",
+        json={"task_ids": [task.id for task in tasks]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["accepted_count"] == 2
+    assert body["skipped_task_ids"] == []
+    listing = client.get(
+        "/download-tasks",
+        params={"page": 1, "page_size": 20, "state": "completed"},
+        headers=_auth(token),
+    ).json()
+    assert {item["import_status"] for item in listing["items"]} == {"running"}
+
+
+def test_batch_import_groups_tasks_by_library(client, account_user):
+    token = _login(client, account_user.username)
+    first_client = _seed_batch_client("batch-lib-a")
+    second_client = _seed_batch_client("batch-lib-b")
+    first = _seed_batch_task(first_client, index=1)
+    second = _seed_batch_task(second_client, index=2)
+
+    response = client.post(
+        "/download-tasks/imports",
+        json={"task_ids": [first.id, second.id]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["accepted_count"] == 2
+    # 每个媒体库各自一个批量任务运行；跨库分组失败会在入队时报错而不是静默合并。
+    runs = list(
+        BackgroundTaskRun.select().where(BackgroundTaskRun.mutex_key.is_null(False))
+    )
+    assert {run.mutex_key for run in runs} == {
+        f"library_import:{first_client.library_id}",
+        f"library_import:{second_client.library_id}",
+    }
+
+
+def test_batch_import_skips_invalid_tasks(client, account_user):
+    token = _login(client, account_user.username)
+    download_client = _seed_batch_client("batch-skip-lib")
+    valid = _seed_batch_task(download_client, index=1, import_status="skipped")
+    no_source = _seed_batch_task(download_client, index=2, with_source_ref=False)
+    already_done = _seed_batch_task(
+        download_client, index=3, import_status="completed"
+    )
+
+    response = client.post(
+        "/download-tasks/imports",
+        json={"task_ids": [valid.id, no_source.id, already_done.id, 99999]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["accepted_count"] == 1
+    assert body["skipped_task_ids"] == [no_source.id, already_done.id, 99999]
+
+
+def test_batch_import_returns_zero_when_nothing_retryable(client, account_user):
+    token = _login(client, account_user.username)
+    download_client = _seed_batch_client("batch-empty-lib")
+    done = _seed_batch_task(download_client, index=1, import_status="completed")
+
+    response = client.post(
+        "/download-tasks/imports",
+        json={"task_ids": [done.id]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["accepted_count"] == 0
+    assert body["skipped_task_ids"] == [done.id]
+
+
+def test_batch_import_conflicts_when_library_busy(client, account_user):
+    token = _login(client, account_user.username)
+    download_client = _seed_batch_client("batch-busy-lib")
+    first = _seed_batch_task(download_client, index=1)
+    second = _seed_batch_task(download_client, index=2)
+
+    accepted = client.post(f"/download-tasks/{first.id}/import", headers=_auth(token))
+    assert accepted.status_code == 202, accepted.text
+
+    response = client.post(
+        "/download-tasks/imports",
+        json={"task_ids": [second.id]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "import_task_conflict"
+
+
+def test_batch_import_rejects_empty_task_ids(client, account_user):
+    token = _login(client, account_user.username)
+
+    response = client.post(
+        "/download-tasks/imports",
+        json={"task_ids": []},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 422, response.text

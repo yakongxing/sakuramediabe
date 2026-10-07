@@ -51,9 +51,11 @@ router = APIRouter(
 @router.get("", response_model=PageResponse[MovieListItemResource])
 def list_movies(
     actor_id: int | None = None,
+    actor_age_min: int | None = Query(default=None, ge=0),
+    actor_age_max: int | None = Query(default=None, ge=0),
     tag_ids: str | None = Query(default=None),
     tag_match: TagMatchMode = Query(default=TagMatchMode.OR),
-    year: int | None = Query(default=None, ge=1),
+    year: str | None = Query(default=None),
     status: MovieListStatus = MovieListStatus.ALL,
     collection_type: MovieCollectionType = MovieCollectionType.ALL,
     number_source: MovieNumberSource = MovieNumberSource.ALL,
@@ -70,9 +72,11 @@ def list_movies(
 ):
     return MovieService.list_movies(
         actor_id=actor_id,
+        actor_age_min=actor_age_min,
+        actor_age_max=actor_age_max,
         tag_ids=parse_csv_positive_ints(tag_ids, "tag_ids", error_code="invalid_movie_filter"),
         tag_match=tag_match,
-        year=year,
+        years=parse_csv_positive_ints(year, "year", error_code="invalid_movie_filter"),
         status=status,
         collection_type=collection_type,
         number_source=number_source,

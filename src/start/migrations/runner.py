@@ -32,6 +32,20 @@ DROP_MOVIE_EXTRA_MIGRATION_NAME = "20260925_01_drop_movie_extra"
 REMOVE_ORPHAN_VIDEO_ITEMS_MIGRATION_NAME = "20260927_01_remove_orphan_video_items"
 ACTOR_MERGED_INTO_MIGRATION_NAME = "20260929_01_add_actor_merged_into"
 DROP_IMAGE_DERIVED_SIZES_MIGRATION_NAME = "20260930_01_drop_image_derived_sizes"
+IMAGE_ORIGIN_PATTERN_INDEX_MIGRATION_NAME = "20261001_01_add_image_origin_pattern_index"
+REMOVE_GENERATED_THIN_COVER_MIGRATION_NAME = (
+    "20261006_01_remove_generated_thin_cover_for_skipped_movies"
+)
+WIDEN_DOWNLOAD_TITLE_COLUMNS_MIGRATION_NAME = (
+    "20261007_01_widen_download_title_columns"
+)
+DOWNLOAD_TASK_REMOTE_SEEN_MIGRATION_NAME = (
+    "20261007_02_add_download_task_remote_seen_at"
+)
+DOWNLOAD_SUBMISSION_INDEXES_MIGRATION_NAME = (
+    "20261007_03_add_download_submission_record_indexes"
+)
+API_KEYS_MIGRATION_NAME = "20261007_05_add_api_keys"
 
 
 @dataclass(frozen=True)
