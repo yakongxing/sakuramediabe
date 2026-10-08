@@ -132,7 +132,9 @@ class RankingCatalogService:
                     },
                 )
             return normalized_period
-        if normalized_period:
+        # 客户端对 supported_periods 为空的榜单默认发送 daily。
+        # 无周期榜单仍读写空周期，兼容该默认值而不改变已有数据的归属。
+        if normalized_period not in {"", "daily"}:
             raise ApiError(
                 422,
                 "invalid_ranking_period",
