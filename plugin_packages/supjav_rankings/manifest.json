@@ -1,0 +1,9 @@
+{
+  "plugin_id": "supjav_rankings",
+  "display_name": "Supjav 排行榜",
+  "version": "1.1.1",
+  "host_api_version": 10,
+  "requires_python": ">=3.10,<3.11",
+  "settings_model": "Settings",
+  "dependencies": []
+}
