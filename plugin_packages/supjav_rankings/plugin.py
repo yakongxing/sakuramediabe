@@ -26,7 +26,7 @@ from src.plugins import (
 from src.scheduler.contracts import JobDefinition
 
 PLUGIN_ID = "supjav_rankings"
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 SOURCE_KEY = "supjav"
 TASK_KEY = "supjav_ranking_sync"
 BASE_URL = "https://supjav.com/popular"
@@ -469,7 +469,7 @@ def fetch_numbers(board_key: str, settings: Settings, period: str = "") -> list[
         raise ValueError("Supjav 只支持日、周、月三个当前榜单")
     _, first_url = ranking_page_url(BASE_URL, BASE_URL, board_key)
     page_urls = {1: first_url}
-    numbers = {}
+    numbers: list[str] = []
     signatures = set()
     page_number, last_page = 1, 1
     with RankingPageClient(settings, board_key) as client:
@@ -484,14 +484,15 @@ def fetch_numbers(board_key: str, settings: Settings, period: str = "") -> list[
             if page.post_urls in signatures:
                 raise ValueError("Supjav 不同分页返回了重复内容，未更新榜单")
             signatures.add(page.post_urls)
-            numbers.update(dict.fromkeys(page.numbers))
+            # 同一番号的不同投稿可以占据多个名次；去重会使后续排名偏离网页。
+            numbers.extend(page.numbers)
             page_urls.update(page.pages)
             last_page = max(last_page, *page.pages) if page.pages else last_page
             logger.info("Supjav 排行榜 board={} page={}/{} numbers={}", board_key, page_number, last_page, len(numbers))
             page_number += 1
     if not numbers:
         raise ValueError("Supjav 全部页面未提取到番号，未更新榜单")
-    return list(numbers)
+    return numbers
 
 
 def run_sync(context: PluginContext, reporter, params: dict):

@@ -94,13 +94,48 @@ def test_fetches_every_page_including_ellipsis_and_preserves_sort(monkeypatch, b
         current = int(query.get(pagination, [path_number if path_number.isdecimal() else "1"])[0])
         calls.append((current, query.get("sort")))
         href = "/popular/page/4/" if pagination == "path" else f"/popular?{pagination}=4"
-        # 第 2 页没有番号，仍须继续抓取后续页；跨页重复番号保留首个位置。
+        # 第 2 页没有番号，仍须继续抓取后续页；同番号的不同投稿保留网页位置。
         titles = {1: ("ABC-001",), 2: ("Amateur",), 3: ("ABC-001", "ABC-003"), 4: ("ABC-004",)}
         return httpx.Response(200, text=page(*titles[current], links=link(4, href), start=current * 10))
 
     mock_client(monkeypatch, handler)
-    assert plugin.fetch_numbers(board, plugin.Settings()) == ["ABC-001", "ABC-003", "ABC-004"]
+    assert plugin.fetch_numbers(board, plugin.Settings()) == ["ABC-001", "ABC-001", "ABC-003", "ABC-004"]
     assert calls == [(i, None if board == "day" else [board]) for i in range(1, 5)]
+
+
+@pytest.mark.parametrize("mode", ["direct", "auto", "flaresolverr"])
+def test_preserves_same_number_at_multiple_website_ranks(monkeypatch, mode):
+    # 实际月榜第 3、17 项是 MIDA-812 的不同投稿；不能因番号相同而移动后续名次。
+    titles = [f"ABC-{i:03}" for i in range(1, 27)]
+    for index in (2, 16, 24):
+        titles[index] = "MIDA-812"
+    pages = {
+        1: page(*titles[:24], links=link(2), start=1),
+        2: page(*titles[24:], start=25),
+    }
+    fetched_pages = []
+
+    def handler(request):
+        if request.url.host == "supjav.com":
+            if mode == "auto":
+                return httpx.Response(403)
+            current, _ = plugin.ranking_page_url(str(request.url), plugin.BASE_URL, "month")
+            fetched_pages.append(current)
+            return httpx.Response(200, text=pages[current])
+        payload = json.loads(request.content)
+        if payload["cmd"] == "request.get":
+            current, _ = plugin.ranking_page_url(payload["url"], plugin.BASE_URL, "month")
+            fetched_pages.append(current)
+            return solver_response(payload, html=pages[current])
+        return solver_response(payload)
+
+    mock_client(monkeypatch, handler)
+    numbers = plugin.fetch_numbers("month", plugin.Settings(
+        request_mode=mode, flaresolverr_url="http://solver:8191",
+    ))
+    assert numbers == titles
+    assert [rank for rank, number in enumerate(numbers, 1) if number == "MIDA-812"] == [3, 17, 25]
+    assert fetched_pages == [1, 2]
 
 
 def test_discovers_more_pages_from_next_link(monkeypatch):
@@ -517,6 +552,43 @@ def test_frontend_reads_all_synced_boards_with_default_period(test_db, registere
             next_page = client.get(path, params={**query, "sort": "heat:desc", "page_size": 2, "page": 2})
             assert [item["rank"] for item in next_page.json()["items"]] == [1]
     assert {row.period for row in RankingItem.select()} == {""}
+
+
+def test_frontend_preserves_repeated_movie_ranks_across_pages(test_db, registered_context, monkeypatch):
+    for i in range(1, 4):
+        Movie.create(movie_number=f"ABC-00{i}", javdb_id=f"id{i}", title=f"Movie {i}")
+
+    def handler(request):
+        is_second = "/page/2" in request.url.path
+        html = (page("ABC-002", "ABC-003", start=3) if is_second
+                else page("ABC-002", "ABC-001", links=link(2)))
+        return httpx.Response(200, text=html)
+
+    mock_client(monkeypatch, handler)
+    summary = plugin.run_sync(registered_context, Reporter(), {})
+    assert summary["stored_items"] == summary["fetched_numbers"] == 12
+    assert summary["success_targets"] == 3
+    assert Movie.select().count() == 3
+    app = FastAPI()
+    app.include_router(ranking_router)
+    app.add_exception_handler(ApiError, api_error_handler)
+    app.dependency_overrides[db_deps] = lambda: None
+    app.dependency_overrides[get_current_user] = lambda: object()
+    with TestClient(app) as client:
+        for board, _ in plugin.BOARDS:
+            path = f"/ranking-sources/supjav/boards/{board}/items"
+            for sort in (None, "rank:asc"):
+                params = {"period": "daily", "page_size": 2}
+                if sort:
+                    params["sort"] = sort
+                responses = [client.get(path, params={**params, "page": number}) for number in (1, 2)]
+                assert all(response.status_code == 200 for response in responses)
+                bodies = [response.json() for response in responses]
+                assert [body["total"] for body in bodies] == [4, 4]
+                items = [item for body in bodies for item in body["items"]]
+                assert [(item["rank"], item["movie_number"]) for item in items] == [
+                    (1, "ABC-002"), (2, "ABC-001"), (3, "ABC-002"), (4, "ABC-003"),
+                ]
 
 
 def test_failed_later_page_preserves_old_board_and_other_boards_update(test_db, registered_context, monkeypatch):
